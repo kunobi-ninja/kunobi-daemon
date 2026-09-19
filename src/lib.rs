@@ -8,13 +8,26 @@
 
 #![cfg_attr(feature = "async", doc = include_str!("../README.md"))]
 
+#[cfg(feature = "local")]
+#[allow(unsafe_code)]
+pub mod local;
+
 pub mod admission;
+mod candidate;
+#[cfg(feature = "wire-async")]
+pub mod control;
 mod identity;
+pub use candidate::Candidate;
+#[cfg(feature = "async")]
+pub mod generation;
 #[cfg(feature = "async")]
 mod lifecycle;
 pub mod observation;
 mod ownership;
 mod publication;
+pub mod readiness;
+pub mod replacement;
+pub mod retry;
 pub mod transport;
 #[cfg(feature = "async")]
 mod upgrade;
@@ -23,7 +36,7 @@ pub use identity::{ServiceIdentity, ServicePaths};
 #[cfg(feature = "async")]
 pub use lifecycle::{DrainOutcome, Lifecycle, LifecycleSnapshot, RequestGuard};
 pub use ownership::ProcessLock;
-pub use publication::publish_record;
+pub use publication::{RecordSlot, publish_record};
 #[cfg(feature = "async")]
 pub use upgrade::{UpgradeError, ensure_current};
 

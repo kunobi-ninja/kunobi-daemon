@@ -54,3 +54,16 @@ message Control {
   // Selects the operation namespace. Unknown kinds must be rejected.
   MessageKind kind = 7;
 }
+
+// Payload of HEALTH and DRAIN replies when HEALTH_DETAILS is negotiated.
+// This observation is made in memory, independently of application I/O.
+message Health {
+  uint32 process_id = 1;
+  uint64 generation = 2;
+  string build = 3;
+  // Application-defined monotonically comparable build revision, if used.
+  uint64 revision = 4;
+  bool ready = 5;
+  bool draining = 6;
+  uint64 active = 7;
+}

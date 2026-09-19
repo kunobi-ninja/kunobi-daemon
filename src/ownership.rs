@@ -18,17 +18,33 @@ impl ProcessLock {
     /// Returns `Ok(None)` only for contention; filesystem and locking failures
     /// remain errors. The parent directory must already exist.
     pub fn try_acquire(path: impl AsRef<Path>) -> io::Result<Option<Self>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Self::try_from_file(options.open(path)?)
+    }
+
+    /// Lock an already-open file. This preserves a consumer's secure open policy.
+    pub fn try_from_file(file: File) -> io::Result<Option<Self>> {
         match file.try_lock() {
             Ok(()) => Ok(Some(Self(file))),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error),
         }
+    }
+
+    /// Observe an existing lock without creating a file. Only contention is true.
+    pub fn is_held(path: impl AsRef<Path>) -> io::Result<bool> {
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::try_from_file(file)?.is_none())
     }
 }
 

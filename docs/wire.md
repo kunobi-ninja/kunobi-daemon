@@ -47,6 +47,16 @@ See the [application-message example](../examples/application_messages.rs):
 cargo run --no-default-features --features wire --example application_messages
 ```
 
+## Typed lifecycle replies
+
+`HEALTH_DETAILS` (bit 4) adds the shared `Health` payload to HEALTH and DRAIN
+responses. Require this bit before decoding that payload. Existing peers that
+only advertise HEALTH retain their original consumer-defined reply format.
+`Health` carries process ID, generation, build, revision, readiness, drain state
+and active request count. Validate it against the kernel peer PID as well as the
+request identity. DRAIN acknowledges closed admission immediately; active work
+can continue after that acknowledgement.
+
 ## Keep old clients working
 
 Keep the legacy discovery schema, endpoint key, listener, handshake and message

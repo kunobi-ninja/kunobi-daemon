@@ -16,6 +16,110 @@ use std::{
 use support::{BUDGET, Fixture, connect, read_line, send, wait_file};
 use tokio::time::Instant;
 
+struct ExclusiveReplacement {
+    fixture: Arc<Fixture>,
+    draining: bool,
+    candidate: Option<u32>,
+    proof: Option<support::Identity>,
+}
+impl kunobi_daemon::replacement::AsyncDriver for ExclusiveReplacement {
+    type Error = io::Error;
+    async fn perform(
+        &mut self,
+        step: kunobi_daemon::replacement::Step,
+        _: Option<Instant>,
+    ) -> io::Result<kunobi_daemon::replacement::Progress> {
+        use kunobi_daemon::replacement::{Progress, Step};
+        match step {
+            Step::Recheck | Step::Prepare | Step::Commit => {}
+            Step::Drain => {
+                if !self.draining {
+                    self.fixture.request_drain().await?;
+                    self.draining = true;
+                }
+                if ProcessLock::is_held(self.fixture.root().join("run.lock"))? {
+                    return Ok(Progress::Pending);
+                }
+            }
+            Step::Start => {
+                assert!(self.candidate.is_none(), "candidate spawned twice");
+                self.candidate = Some(self.fixture.spawn("daemon", 2));
+            }
+            Step::Verify | Step::Validate => {
+                if let Some((id, _)) = connect(self.fixture.root()).await?
+                    && Some(id.pid) == self.candidate
+                    && id.build == 2
+                {
+                    self.proof = Some(id);
+                } else if step == Step::Verify {
+                    return Ok(Progress::Pending);
+                } else {
+                    return Err(io::Error::other("candidate lost readiness"));
+                }
+            }
+            Step::Retire => unreachable!("exclusive mode"),
+        }
+        Ok(Progress::Done)
+    }
+}
+
+#[tokio::test]
+async fn exclusive_coordinator_drains_the_reply_before_starting_and_the_same_relay_reconnects() {
+    use kunobi_daemon::replacement::{self, Budgets, Mode, Outcome};
+    let fixture = Fixture::new();
+    let old = fixture.start(1).await;
+    let (relay, mut client) = fixture.relay().await;
+    send(&mut client, "CALL 1 hold").await.unwrap();
+    wait_file(&fixture.root().join("accepted-ready-1")).await;
+    let owner = Arc::clone(&fixture);
+    let upgrade = tokio::spawn(async move {
+        let lock = ProcessLock::try_acquire(owner.root().join("upgrade.lock"))
+            .unwrap()
+            .unwrap();
+        let mut driver = ExclusiveReplacement {
+            fixture: owner,
+            draining: false,
+            candidate: None,
+            proof: None,
+        };
+        let result = replacement::run_async(
+            &lock,
+            Mode::Exclusive,
+            Budgets {
+                setup: BUDGET,
+                drain: None,
+            },
+            &mut driver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Outcome::Complete);
+        driver.proof.unwrap()
+    });
+    wait_file(&fixture.root().join(format!("draining-{}", old.pid))).await;
+    assert!(!upgrade.is_finished());
+    assert!(fixture.alive(old.pid));
+    std::fs::write(fixture.root().join("release-1"), b"").unwrap();
+    assert_eq!(
+        read_line(&mut client).await.unwrap(),
+        format!("OK 1 {} 1", old.pid)
+    );
+    let new = upgrade.await.unwrap();
+    fixture.exited_cleanly(old.pid).await;
+    wait_file(
+        &fixture
+            .root()
+            .join(format!("relay-{relay}-connected-{}", new.pid)),
+    )
+    .await;
+    send(&mut client, "CALL 2 ok").await.unwrap();
+    assert_eq!(
+        read_line(&mut client).await.unwrap(),
+        format!("OK 2 {} 2", new.pid)
+    );
+    assert!(fixture.alive(relay));
+}
+
 #[test]
 #[ignore = "child-process entry point, invoked by the E2E fixtures"]
 fn fixture_process() {

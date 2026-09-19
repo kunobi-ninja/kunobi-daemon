@@ -542,3 +542,207 @@ impl ::buffa::ExtensionSet for Control {
         &mut self.__buffa_unknown_fields
     }
 }
+/// Payload of HEALTH and DRAIN replies when HEALTH_DETAILS is negotiated.
+/// This observation is made in memory, independently of application I/O.
+#[derive(Clone, PartialEq, Default)]
+pub struct Health {
+    /// Field 1: `process_id`
+    pub process_id: u32,
+    /// Field 2: `generation`
+    pub generation: u64,
+    /// Field 3: `build`
+    pub build: ::buffa::alloc::string::String,
+    /// Application-defined monotonically comparable build revision, if used.
+    ///
+    /// Field 4: `revision`
+    pub revision: u64,
+    /// Field 5: `ready`
+    pub ready: bool,
+    /// Field 6: `draining`
+    pub draining: bool,
+    /// Field 7: `active`
+    pub active: u64,
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for Health {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Health")
+            .field("process_id", &self.process_id)
+            .field("generation", &self.generation)
+            .field("build", &self.build)
+            .field("revision", &self.revision)
+            .field("ready", &self.ready)
+            .field("draining", &self.draining)
+            .field("active", &self.active)
+            .finish()
+    }
+}
+impl Health {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/kunobi.daemon.v2.Health";
+}
+::buffa::impl_default_instance!(Health);
+impl ::buffa::MessageName for Health {
+    const PACKAGE: &'static str = "kunobi.daemon.v2";
+    const NAME: &'static str = "Health";
+    const FULL_NAME: &'static str = "kunobi.daemon.v2.Health";
+    const TYPE_URL: &'static str = "type.googleapis.com/kunobi.daemon.v2.Health";
+}
+impl ::buffa::Message for Health {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.process_id != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.process_id) as u64;
+        }
+        if self.generation != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.generation) as u64;
+        }
+        if !self.build.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.build) as u64;
+        }
+        if self.revision != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.revision) as u64;
+        }
+        if self.ready {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.draining {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.active != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.active) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.process_id != 0u32 {
+            ::buffa::types::put_uint32_field(1u32, self.process_id, buf);
+        }
+        if self.generation != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.generation, buf);
+        }
+        if !self.build.is_empty() {
+            ::buffa::types::put_string_field(3u32, &self.build, buf);
+        }
+        if self.revision != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.revision, buf);
+        }
+        if self.ready {
+            ::buffa::types::put_bool_field(5u32, self.ready, buf);
+        }
+        if self.draining {
+            ::buffa::types::put_bool_field(6u32, self.draining, buf);
+        }
+        if self.active != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.active, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.process_id = ::buffa::types::decode_uint32(buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.generation = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.build, buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.revision = ::buffa::types::decode_uint64(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.ready = ::buffa::types::decode_bool(buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.draining = ::buffa::types::decode_bool(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.active = ::buffa::types::decode_uint64(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.process_id = 0u32;
+        self.generation = 0u64;
+        self.build.clear();
+        self.revision = 0u64;
+        self.ready = false;
+        self.draining = false;
+        self.active = 0u64;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for Health {
+    const PROTO_FQN: &'static str = "kunobi.daemon.v2.Health";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}

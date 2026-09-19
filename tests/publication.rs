@@ -4,6 +4,21 @@ use kunobi_daemon::publish_record;
 use std::sync::Arc;
 
 #[test]
+fn old_record_cleanup_preserves_a_new_publication_and_its_lock_inode() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    slot.replace(b"old").unwrap();
+    assert!(!slot.repair(b"old").unwrap());
+    slot.replace(b"new").unwrap();
+    assert!(!slot.remove_if_matches(b"old").unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert!(slot.remove_if_matches(b"new").unwrap());
+    assert!(!slot.remove_if_matches(b"new").unwrap());
+    assert!(root.path().join("selected.record.lock").is_file());
+}
+
+#[test]
 fn concurrent_publishers_and_readers_only_observe_complete_records() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("discovery");

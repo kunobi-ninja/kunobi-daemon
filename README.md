@@ -3,22 +3,28 @@
 Coordinate local daemon upgrades without reporting success from a retiring
 process or deleting the replacement's lock.
 
-This crate provides:
+Use the shared coordinator for ownership, readiness, drain and replacement.
+Applications provide their messages, build policy, launch mechanism and durable
+work. The crate has no MCP, cache database or telemetry exporter dependency.
 
-- `ProcessLock`: exclusive ownership through a persistent OS file lock.
-- `Lifecycle`: close admission on every session and wait for active request guards.
-- `ensure_current`: serialize replacements, recheck after acquiring the upgrade
-  lock, and return only a live response that satisfies the caller's version policy.
-- `publish_record`: publish complete discovery records with an atomic rename.
-- `transport`: the Kunobi relay's bounded byte pumps, replaceable writer and
-  pause boundaries for newline-framed messages.
+- `replacement`: one transition machine for exclusive and overlapping upgrades,
+  with blocking and async drivers.
+- `ProcessLock`, `RecordSlot` and `local::unix_socket`: persistent ownership,
+  atomic publication and cleanup that preserves a successor's endpoint.
+- `Lifecycle` and `generation`: request guards, generation selection, session
+  leases and retirement. `retry` bounds persisted candidate campaigns.
+- `wire` and `control`: Buffa Protobuf negotiation, typed health and drain replies.
+- `local` and `transport`: optional OS peer checks, setup deadlines, half-close,
+  byte pumps and replaceable writers.
+- `admission` and `observation`: independent capacity pools and local telemetry data.
 
-The crate is not yet published on crates.io. Consumer migration is being
-validated separately.
+See [Daemon lifecycle and replacement](docs/architecture.md) for the transition
+ordering, failure boundaries and consumer responsibilities.
 
-Blocking relays can use `default-features = false` to obtain process locks and
-transport and publication primitives with no runtime dependencies. The default `async` feature
-adds Tokio-based draining and upgrade coordination.
+The default `async` feature adds Tokio-based lifecycle and generation support.
+Blocking clients use `default-features = false`; `wire` and `local` do not create
+a runtime. `wire-async` adds the async protocol and control handler.
+`local-async` adds the Tokio Windows listener with an explicit local-owner ACL.
 
 ## Request draining
 
@@ -48,19 +54,18 @@ can abort an upload after persisting enough state to retry it.
 
 ## Upgrade contract
 
-Pass `ensure_current` a persistent upgrade-lock path, one deadline, a live health
-probe, a version predicate, and a replacement callback. The probe returns
-`Ok(None)` while no daemon is available. Probe errors propagate.
+Acquire an upgrade `ProcessLock` and call `replacement::run` or `run_async` with
+an application driver. The coordinator orders recheck, preparation, drain when
+required, start, live verification, validation, commit and retirement. A driver
+performs one requested step; it does not implement another transition loop.
 
-The fast path is one probe. When replacement is needed, the function acquires
-the upgrade lock and probes again: a concurrent client may already have finished
-the upgrade. After replacement, it waits for a fresh accepted response. An old
-response, a successful spawn, or an existing socket is insufficient.
+Choose exclusive replacement when generations cannot share mutable resources.
+Overlap starts and verifies a candidate before selecting it, then preserves the
+incumbent until its session obligations finish. Startup and drain have separate
+budgets. The crate never turns a startup timeout into permission to kill work.
 
-Health should read process identity from memory, independently of storage scans
-and maintenance locks. Callbacks must yield and tolerate cancellation. The shared
-deadline bounds cooperative async work; it cannot interrupt blocking code or
-undo a service-manager command.
+`ensure_current` remains available for existing integrations with an indivisible
+replacement callback. New integrations should use the explicit coordinator.
 
 ## Ownership and integration
 
@@ -70,9 +75,9 @@ or recovers that instance must follow the same locking protocol. Never unlink
 or replace the lock file. Paths belong in a private application-owned directory.
 
 Service-manager integration stays with the caller: a launchd/systemd-managed
-daemon must be replaced through that manager. Transport framing, protocol
-compatibility, process identity verification, durable queues, and rollback to a
-previous binary also remain caller responsibilities.
+daemon must be replaced through that manager. Applications provide message
+schemas, build compatibility policy, durable queues and any rollback policy. Shared wire identity validation and optional OS
+peer checks must run before application dispatch.
 
 Kache and Kunobi share these lifecycle requirements but have different upgrade
 policies. Kache compares build epochs and has persistent upload jobs; the broker
@@ -97,9 +102,8 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 The optional [`wire` and `wire-async` features](docs/wire.md) provide bounded
 Protobuf messages and version/capability negotiation on a separate endpoint.
-Legacy clients retain their listener and message format. Both adapters can use
-the same lifecycle and handoff logic. The protocol is experimental until its
-first consumer release; applications still own peer authorization and deadlines.
+Legacy clients retain their listener and message format. Both decoders feed the same lifecycle and handoff logic. A client that discovers
+a binary endpoint must not downgrade after a failed negotiation.
 
 ## Capacity and local observations
 
@@ -126,7 +130,7 @@ events instead of waiting on a full or busy queue; `lost_events` makes that loss
 visible. No exporter, background task, user callback, payload or token is stored.
 Use a separate observation instance when per-connection progress is needed.
 
-Transport adapters own authentication and setup deadlines for both reads and
-writes. Clear setup deadlines before ordinary application traffic. Long jobs
+The optional `local` adapters provide OS peer checks and absolute setup deadlines
+for both reads and writes. Call authentication before sending protocol bytes. Clear setup deadlines before ordinary application traffic. Long jobs
 and slow readers are application policy; observations never impose a job timeout
 or cancel work.
