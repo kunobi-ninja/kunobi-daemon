@@ -1,5 +1,7 @@
 //! Regression tests for daemon upgrade.
 
+#![cfg(feature = "async")]
+
 use kunobi_daemon::{ProcessLock, UpgradeError, ensure_current};
 use std::{
     convert::Infallible,

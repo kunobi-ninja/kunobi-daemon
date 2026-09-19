@@ -27,6 +27,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
       - run: cargo package --locked
 
   msrv:
@@ -37,3 +38,4 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - run: rustup toolchain install 1.89.0 --profile minimal
       - run: cargo +1.89.0 test --locked
+      - run: cargo +1.89.0 test --locked --no-default-features

@@ -9,9 +9,16 @@ This crate provides:
 - `Lifecycle`: close admission on every session and wait for active request guards.
 - `ensure_current`: serialize replacements, recheck after acquiring the upgrade
   lock, and return only a live response that satisfies the caller's version policy.
+- `publish_record`: publish complete discovery records with an atomic rename.
+- `transport`: the Kunobi relay's bounded byte pumps, replaceable writer and
+  pause boundaries for newline-framed messages.
 
-The initial API is under review. It is not yet published on crates.io or adopted
-by Kache or the Kunobi broker.
+The crate is not yet published on crates.io. Consumer migration is being
+validated separately.
+
+Blocking relays can use `default-features = false` to obtain process locks and
+transport and publication primitives with no runtime dependencies. The default `async` feature
+adds Tokio-based draining and upgrade coordination.
 
 ## Request draining
 
@@ -79,5 +86,9 @@ Rust 1.89 or newer. Run `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, and `cargo test`. CI checks Linux, macOS, Windows, and the minimum Rust
 version. Tests cover concurrent upgraders, stale replies, cancellation, multiple
 drain observers, and file ownership across real child processes.
+
+The [process handoff suite](tests/README.md) also checks that a relay keeps its
+client session through replacement, preserves late replies and never replays
+an ambiguously accepted request. Run it with `cargo test --test process_handoff`.
 
 Apache-2.0. See [LICENSE](LICENSE).
