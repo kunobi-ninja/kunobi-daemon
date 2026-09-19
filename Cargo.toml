@@ -6,6 +6,9 @@ rust-version = "1.89"
 license = "Apache-2.0"
 description = "Process ownership, request draining, and verified upgrades for local daemons"
 repository = "https://github.com/kunobi-ninja/kunobi-daemon"
+readme = "README.md"
+keywords = ["daemon", "ipc", "lifecycle", "protobuf"]
+categories = ["os", "asynchronous"]
 
 [features]
 default = ["async"]

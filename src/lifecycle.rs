@@ -6,6 +6,7 @@ use tokio::time::Instant;
 struct State {
     draining: bool,
     active: usize,
+    drain_started: Option<Instant>,
 }
 
 /// A one-way request admission gate shared by all sessions of a daemon.
@@ -16,6 +17,7 @@ struct State {
 pub struct Lifecycle {
     state: Mutex<State>,
     changes: watch::Sender<()>,
+    observations: Option<Arc<crate::observation::Observations>>,
 }
 
 impl Default for Lifecycle {
@@ -23,11 +25,35 @@ impl Default for Lifecycle {
         Self {
             state: Mutex::new(State::default()),
             changes: watch::channel(()).0,
+            observations: None,
         }
     }
 }
 
 impl Lifecycle {
+    /// Attach local events; the consumer owns their export and retention.
+    pub fn observed(observations: Arc<crate::observation::Observations>) -> Self {
+        Self {
+            observations: Some(observations),
+            ..Self::default()
+        }
+    }
+
+    /// Observe admission without waiting for requests or transport writes.
+    pub fn snapshot(&self) -> LifecycleSnapshot {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        LifecycleSnapshot {
+            active: state.active,
+            draining: state.draining,
+            draining_for: state.drain_started.map(|started| started.elapsed()),
+        }
+    }
+
+    fn record(&self, event: crate::observation::Event) {
+        if let Some(observations) = &self.observations {
+            observations.record(event);
+        }
+    }
     /// Admit an operation unless draining has started.
     pub fn begin(self: &Arc<Self>) -> Option<RequestGuard> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -45,6 +71,11 @@ impl Lifecycle {
             return false;
         }
         state.draining = true;
+        state.drain_started = Some(Instant::now());
+        self.record(crate::observation::Event::DrainStarted);
+        if state.active == 0 {
+            self.record(crate::observation::Event::DrainCompleted);
+        }
         self.changes.send_replace(());
         true
     }
@@ -95,9 +126,21 @@ impl Lifecycle {
         if active == 0 {
             DrainOutcome::Complete
         } else {
+            self.record(crate::observation::Event::DrainTimedOut);
             DrainOutcome::TimedOut { active }
         }
     }
+}
+
+/// Current request admission and drain state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleSnapshot {
+    /// Admitted requests whose guards have not been dropped.
+    pub active: usize,
+    /// Whether admission has closed.
+    pub draining: bool,
+    /// Elapsed time since admission closed, including time after completion.
+    pub draining_for: Option<std::time::Duration>,
 }
 
 /// Result of closing admission and waiting for admitted operations.
@@ -121,6 +164,7 @@ impl Drop for RequestGuard {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active -= 1;
         if state.draining && state.active == 0 {
+            self.0.record(crate::observation::Event::DrainCompleted);
             self.0.changes.send_replace(());
         }
     }
