@@ -92,3 +92,41 @@ client session through replacement, preserves late replies and never replays
 an ambiguously accepted request. Run it with `cargo test --test process_handoff`.
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Binary lifecycle protocol
+
+The optional [`wire` and `wire-async` features](docs/wire.md) provide bounded
+Protobuf messages and version/capability negotiation on a separate endpoint.
+Legacy clients retain their listener and message format. Both adapters can use
+the same lifecycle and handoff logic. The protocol is experimental until its
+first consumer release; applications still own peer authorization and deadlines.
+
+## Capacity and local observations
+
+`admission::Admission` gives handshake, application and control connections
+independent budgets. Defaults are 32 pending handshakes, 256 application sessions
+and 32 control sessions; consumers can configure each with `Limits`. Authenticate
+and classify connections before assigning an application or control permit.
+Never dispatch application work using a control permit. Permits release on drop.
+These defaults are capacity bounds, not measured throughput guarantees.
+
+`observation::Observations` holds local counters and a bounded queue of typed
+events. `ObservedIo` counts blocking I/O; `AsyncObservedIo` does the same with
+`wire-async`. Their snapshots remain readable while a write is pending. They
+report bytes accepted by the transport, pending I/O, continuous busy time, time
+since progress, errors and connection count. An async Pending poll remains
+recorded until completion or transport drop; cancelling its caller does not prove
+that the underlying I/O stopped. Counters are approximate concurrent samples.
+
+`Lifecycle::snapshot` reports active request guards and drain state.
+`Lifecycle::observed` also records drain transitions. Consumers record their own
+rejection and handoff events with `Observations::record`, then decide how to log,
+aggregate or export them. `take_events` consumes the shared queue. Producers drop
+events instead of waiting on a full or busy queue; `lost_events` makes that loss
+visible. No exporter, background task, user callback, payload or token is stored.
+Use a separate observation instance when per-connection progress is needed.
+
+Transport adapters own authentication and setup deadlines for both reads and
+writes. Clear setup deadlines before ordinary application traffic. Long jobs
+and slow readers are application policy; observations never impose a job timeout
+or cancel work.

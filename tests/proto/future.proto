@@ -1,0 +1,9 @@
+syntax = "proto3";
+package fixture.future;
+
+// Future schema used to check old-reader round trips without losing new fields.
+message FutureControl {
+  uint32 operation = 1;
+  uint64 request_id = 2;
+  string optional_trace = 100;
+}

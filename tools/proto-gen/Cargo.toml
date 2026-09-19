@@ -1,0 +1,11 @@
+[package]
+name = "kunobi-daemon-proto-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+buffa-build = "=0.9.2"
+tempfile = "3"

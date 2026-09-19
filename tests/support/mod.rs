@@ -294,6 +294,17 @@ async fn daemon(root: PathBuf, build: u64) -> io::Result<()> {
     publish_record(&record, listener.local_addr()?.to_string().as_bytes())?;
     let lifecycle = Arc::new(Lifecycle::default());
     let mut handlers = tokio::task::JoinSet::new();
+    #[cfg(feature = "wire-async")]
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        publish_record(
+            &root.join("daemon.v2.addr"),
+            listener.local_addr()?.to_string().as_bytes(),
+        )?;
+        let lifecycle = Arc::clone(&lifecycle);
+        let root = root.clone();
+        handlers.spawn(async move { binary_listener(listener, lifecycle, root, build).await });
+    }
     loop {
         tokio::select! {
             biased;
@@ -319,6 +330,8 @@ async fn daemon(root: PathBuf, build: u64) -> io::Result<()> {
     .await?;
     // The run guard remains held through discovery cleanup.
     std::fs::remove_file(record)?;
+    #[cfg(feature = "wire-async")]
+    std::fs::remove_file(root.join("daemon.v2.addr"))?;
     Ok(())
 }
 
@@ -359,20 +372,120 @@ async fn handle(
                 .ok_or_else(invalid)?
                 .parse()
                 .map_err(|_| invalid())?;
-            let Some(_request) = lifecycle.begin() else {
+            let Some((_request, reply)) =
+                call(&root, &lifecycle, id, words.next() == Some("hold"), build).await?
+            else {
                 return Ok(());
             };
-            let mut log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join(format!("accepted-{id}")))?;
-            writeln!(log, "{pid}")?;
-            log.sync_all()?;
-            publish_record(&root.join(format!("accepted-ready-{id}")), b"ready")?;
-            if words.next() == Some("hold") {
-                wait_file(&root.join(format!("release-{id}"))).await;
+            send(&mut peer, &reply).await?;
+        }
+    }
+}
+
+// Both wire adapters hold this same request guard through the response flush.
+async fn call(
+    root: &Path,
+    lifecycle: &Arc<Lifecycle>,
+    id: u64,
+    hold: bool,
+    build: u64,
+) -> io::Result<Option<(kunobi_daemon::RequestGuard, String)>> {
+    let Some(request) = lifecycle.begin() else {
+        return Ok(None);
+    };
+    let pid = std::process::id();
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(format!("accepted-{id}")))?;
+    writeln!(log, "{pid}")?;
+    log.sync_all()?;
+    publish_record(&root.join(format!("accepted-ready-{id}")), b"ready")?;
+    if hold {
+        wait_file(&root.join(format!("release-{id}"))).await;
+    }
+    Ok(Some((request, format!("OK {id} {pid} {build}"))))
+}
+
+#[cfg(feature = "wire-async")]
+async fn binary_listener(
+    listener: TcpListener,
+    lifecycle: Arc<Lifecycle>,
+    root: PathBuf,
+    build: u64,
+) -> io::Result<()> {
+    let mut handlers = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = lifecycle.draining() => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let lifecycle = Arc::clone(&lifecycle);
+                let root = root.clone();
+                handlers.spawn(async move { binary_handle(stream, lifecycle, root, build).await });
             }
-            send(&mut peer, &format!("OK {id} {pid} {build}")).await?;
+        }
+    }
+    drop(listener);
+    while let Some(result) = handlers.join_next().await {
+        result.unwrap()?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wire-async")]
+async fn binary_handle(
+    stream: TcpStream,
+    lifecycle: Arc<Lifecycle>,
+    root: PathBuf,
+    build: u64,
+) -> io::Result<()> {
+    use kunobi_daemon::wire::{AsyncSession, Hello, capability, operation};
+    stream.set_nodelay(true)?;
+    let offer = Hello::new(
+        &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+        capability::APPLICATION | capability::HEALTH,
+        0,
+    );
+    let mut session = timeout(BUDGET, AsyncSession::accept(stream, &offer)).await??;
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = lifecycle.draining() => return Ok(()),
+            message = session.receive() => message?,
+        };
+        if message.kind == kunobi_daemon::wire::MessageKind::Lifecycle
+            && message.operation == operation::HEALTH
+        {
+            session
+                .send(&kunobi_daemon::wire::Control {
+                    payload: format!("IDENTITY {} {build}", std::process::id()).into_bytes(),
+                    ..message
+                })
+                .await?;
+        } else {
+            if message.kind != kunobi_daemon::wire::MessageKind::Application
+                || message.operation != 1
+            {
+                return Err(invalid());
+            }
+            let hold = match message.payload.as_slice() {
+                b"hold" => true,
+                b"ok" => false,
+                _ => return Err(invalid()),
+            };
+            let Some((_request, reply)) =
+                call(&root, &lifecycle, message.request_id, hold, build).await?
+            else {
+                return Ok(());
+            };
+            session
+                .send(&kunobi_daemon::wire::Control {
+                    payload: reply.into_bytes(),
+                    ..message
+                })
+                .await?;
         }
     }
 }

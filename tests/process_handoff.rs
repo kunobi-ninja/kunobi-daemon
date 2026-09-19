@@ -237,3 +237,64 @@ async fn concurrent_clients_create_one_replacement_process() {
     assert_eq!(replacements.load(Ordering::SeqCst), 1);
     fixture.exited_cleanly(old.pid).await;
 }
+
+#[cfg(feature = "wire-async")]
+#[tokio::test]
+async fn legacy_and_binary_endpoints_share_admission_and_preserve_both_inflight_replies() {
+    use kunobi_daemon::wire::{AsyncSession, Control, Hello, capability};
+    let fixture = Fixture::new();
+    let old = fixture.start(1).await;
+    let (_relay_pid, mut legacy) = fixture.relay().await;
+    wait_file(&fixture.root().join("daemon.v2.addr")).await;
+    let address = std::fs::read_to_string(fixture.root().join("daemon.v2.addr")).unwrap();
+    assert_ne!(
+        address,
+        std::fs::read_to_string(fixture.root().join("daemon.addr")).unwrap()
+    );
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket.set_nodelay(true).unwrap();
+    let mut binary = AsyncSession::connect(
+        socket,
+        &Hello::new(
+            &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+            capability::APPLICATION,
+            capability::APPLICATION,
+        ),
+    )
+    .await
+    .unwrap();
+    send(&mut legacy, "CALL 80 hold").await.unwrap();
+    binary
+        .send(&Control {
+            kind: kunobi_daemon::wire::MessageKind::Application.into(),
+            operation: 1,
+            request_id: 81,
+            payload: b"hold".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    wait_file(&fixture.root().join("accepted-ready-80")).await;
+    wait_file(&fixture.root().join("accepted-ready-81")).await;
+    fixture.request_drain().await.unwrap();
+    assert!(fixture.alive(old.pid));
+    std::fs::write(fixture.root().join("release-80"), b"").unwrap();
+    assert_eq!(
+        read_line(&mut legacy).await.unwrap(),
+        format!("OK 80 {} 1", old.pid)
+    );
+    assert!(
+        fixture.alive(old.pid),
+        "binary request was omitted from the common drain count"
+    );
+    std::fs::write(fixture.root().join("release-81"), b"").unwrap();
+    let reply = tokio::time::timeout(BUDGET, binary.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.request_id, 81);
+    assert_eq!(reply.payload, format!("OK 81 {} 1", old.pid).as_bytes());
+    fixture.exited_cleanly(old.pid).await;
+    assert!(!fixture.root().join("daemon.addr").exists());
+    assert!(!fixture.root().join("daemon.v2.addr").exists());
+}
