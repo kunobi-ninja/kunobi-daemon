@@ -80,6 +80,15 @@ impl Lifecycle {
         true
     }
 
+    /// Whether a new operation can still acquire a guard.
+    pub fn accepting_calls(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .draining
+    }
+
     /// Wait until admission has closed, including when it closed before this call.
     pub async fn draining(&self) {
         let mut changes = self.changes.subscribe();

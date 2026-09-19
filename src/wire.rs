@@ -12,7 +12,7 @@ use buffa::Message;
 #[allow(missing_docs, clippy::derivable_impls)]
 mod generated;
 use crate::ServiceIdentity;
-pub use generated::{Control, Hello, MessageKind};
+pub use generated::{Control, Health, Hello, MessageKind};
 use std::io::{self, Read, Write};
 
 /// Identifies the binary transport, independently of application versions.
@@ -36,6 +36,47 @@ pub mod capability {
     pub const HANDOFF: u64 = 4;
     /// Application-defined operations, carried as opaque bounded payloads.
     pub const APPLICATION: u64 = 8;
+    /// Typed in-memory Health payloads on HEALTH and DRAIN replies.
+    pub const HEALTH_DETAILS: u64 = 16;
+}
+
+impl Health {
+    /// Encode a typed observation, preserving the request correlation ID.
+    pub fn response(&self, request: &Control) -> io::Result<Control> {
+        if request.kind != MessageKind::Lifecycle
+            || !matches!(request.operation, operation::HEALTH | operation::DRAIN)
+        {
+            return Err(invalid("not a health or drain request"));
+        }
+        Ok(Control {
+            operation: request.operation,
+            request_id: request.request_id,
+            generation: self.generation,
+            payload: self.encode_to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// Decode a correlated reply. The caller must compare process/build policy.
+    pub fn from_response(reply: &Control, request: &Control) -> io::Result<Self> {
+        if reply.kind != MessageKind::Lifecycle
+            || !matches!(request.operation, operation::HEALTH | operation::DRAIN)
+            || reply.operation != request.operation
+            || reply.request_id != request.request_id
+            || !reply.token.is_empty()
+            || reply.offset.is_some()
+        {
+            return Err(invalid("unexpected health response"));
+        }
+        let health: Self = decode_message(&reply.payload, MAX_FRAME)?;
+        if health.process_id == 0
+            || health.generation != reply.generation
+            || (health.ready && health.draining)
+        {
+            return Err(invalid("invalid health observation"));
+        }
+        Ok(health)
+    }
 }
 
 /// Stable operation numbers. Never reuse retired numbers.

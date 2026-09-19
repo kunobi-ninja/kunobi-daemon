@@ -237,6 +237,27 @@ pub fn pump_downstream<R: Read, W: Write>(sock_r: &mut R, client_out: &mut W) ->
     }
 }
 
+/// Combine independently owned halves for a blocking codec.
+pub struct SplitIo<R, W> {
+    /// Input half.
+    pub read: R,
+    /// Output half.
+    pub write: W,
+}
+impl<R: std::io::Read, W> std::io::Read for SplitIo<R, W> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.read.read(bytes)
+    }
+}
+impl<R, W: std::io::Write> std::io::Write for SplitIo<R, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.write.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.write.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

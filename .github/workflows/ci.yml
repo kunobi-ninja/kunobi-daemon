@@ -27,6 +27,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - run: cargo test --locked --all-features
+      - run: cargo test --locked --no-default-features --features wire,local
       - run: cargo test --locked --no-default-features --features wire
       - run: cargo test --locked --no-default-features
       - run: cargo run --locked --no-default-features --features wire --example application_messages
