@@ -1,0 +1,6 @@
+operation: 5
+request_id: 18446744073709551615
+generation: 4294967296
+token: "\000\377token"
+offset: 0
+payload: "\377\000payload"

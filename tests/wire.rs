@@ -1,7 +1,7 @@
 //! Binary framing, negotiation, and schema compatibility.
 #![cfg(feature = "wire")]
 
-use bilrost::{Message, OwnedMessage};
+use buffa::Message;
 use kunobi_daemon::wire::{
     self, Control, Endpoint, Framed, Hello, Session, capability as c, operation as o,
 };
@@ -12,7 +12,11 @@ use std::{
 };
 
 fn offer() -> Hello {
-    Hello::new("fixture", c::HEALTH | c::DRAIN, c::HEALTH)
+    Hello::new(
+        &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+        c::HEALTH | c::DRAIN,
+        c::HEALTH,
+    )
 }
 fn health() -> Control {
     Control {
@@ -123,7 +127,18 @@ fn negotiation_rejects_incompatible_peers_before_dispatch() {
     let server = std::thread::spawn(move || {
         assert!(Session::accept(server, &offer()).is_err());
     });
-    assert!(Session::connect(client, &Hello::new("wrong-app", c::HEALTH, 0)).is_err());
+    assert!(
+        Session::connect(
+            client,
+            &Hello::new(
+                &kunobi_daemon::ServiceIdentity::new([1; 16], "wrong-app", "stable", "default")
+                    .unwrap(),
+                c::HEALTH,
+                0
+            )
+        )
+        .is_err()
+    );
     server.join().unwrap();
 }
 
@@ -134,7 +149,11 @@ fn operation_support_is_not_inferred_from_decodability() {
         let mut session = Session::accept(server, &offer()).unwrap();
         assert_eq!(session.receive().unwrap(), health());
     });
-    let hello = Hello::new("fixture", c::HEALTH, c::HEALTH);
+    let hello = Hello::new(
+        &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+        c::HEALTH,
+        c::HEALTH,
+    );
     let mut session = Session::connect(client, &hello).unwrap();
     assert!(
         session
@@ -156,15 +175,10 @@ fn operation_support_is_not_inferred_from_decodability() {
     server.join().unwrap();
 }
 
-#[derive(Debug, Default, PartialEq, Message)]
-struct FutureControl {
-    #[bilrost(1)]
-    operation: u32,
-    #[bilrost(2)]
-    request_id: u64,
-    #[bilrost(100)]
-    optional_trace: String,
-}
+#[rustfmt::skip]
+#[allow(clippy::all, dead_code)]
+mod future { include!("fixtures/future.rs"); }
+use future::FutureControl;
 
 #[test]
 fn future_optional_fields_and_old_messages_decode_in_both_directions() {
@@ -172,12 +186,16 @@ fn future_optional_fields_and_old_messages_decode_in_both_directions() {
         operation: o::HEALTH,
         request_id: 42,
         optional_trace: "new-field".into(),
+        ..Default::default()
     };
+    let old_reader = Control::decode_from_slice(&future.encode_to_vec()).unwrap();
+    assert_eq!(old_reader.operation, o::HEALTH);
+    assert_eq!(old_reader.request_id, 42);
     assert_eq!(
-        Control::decode(future.encode_to_vec().as_slice()).unwrap(),
-        health()
+        FutureControl::decode_from_slice(&old_reader.encode_to_vec()).unwrap(),
+        future
     );
-    let old = FutureControl::decode(health().encode_to_vec().as_slice()).unwrap();
+    let old = FutureControl::decode_from_slice(health().encode_to_vec().as_slice()).unwrap();
     assert_eq!(old.optional_trace, "");
     assert_eq!(old.request_id, 42);
 }
@@ -374,7 +392,7 @@ async fn cancelling_a_partial_async_read_prevents_stream_reuse() {
 
 #[test]
 fn first_binary_version_keeps_its_golden_health_frame() {
-    let golden = vec![4, 0, 0, 0, 4, 1, 4, 42];
+    let golden = vec![4, 0, 0, 0, 8, 1, 16, 42];
     let mut io = Memory::default();
     Framed::new(&mut io, 256).unwrap().send(&health()).unwrap();
     assert_eq!(io.output, golden);
@@ -385,4 +403,163 @@ fn first_binary_version_keeps_its_golden_health_frame() {
             .unwrap(),
         health()
     );
+}
+
+#[test]
+fn protoc_golden_bodies_preserve_all_fields_and_explicit_zero() {
+    let hello = Hello {
+        supported: (1 << 63) | c::HEALTH | c::HANDOFF,
+        required: c::HANDOFF,
+        ..offer()
+    };
+    let hello_bytes = include_bytes!("fixtures/wire/hello.bin");
+    assert_eq!(Hello::decode_from_slice(hello_bytes).unwrap(), hello);
+    assert_eq!(hello.encode_to_vec(), hello_bytes);
+    let control = Control {
+        operation: o::READY,
+        request_id: u64::MAX,
+        generation: 1 << 32,
+        token: b"\0\xfftoken".to_vec(),
+        offset: Some(0),
+        payload: b"\xff\0payload".to_vec(),
+        ..Default::default()
+    };
+    let control_bytes = include_bytes!("fixtures/wire/control.bin");
+    assert_eq!(Control::decode_from_slice(control_bytes).unwrap(), control);
+    assert_eq!(control.encode_to_vec(), control_bytes);
+    let absent = Control {
+        offset: None,
+        ..control
+    };
+    assert_ne!(absent.encode_to_vec(), control_bytes);
+    assert_eq!(
+        Control::decode_from_slice(&absent.encode_to_vec())
+            .unwrap()
+            .offset,
+        None
+    );
+}
+
+#[test]
+fn wrong_service_identity_gets_no_server_reply() {
+    let mut mismatches = Vec::new();
+    let mut remote = offer();
+    remote.service_id = vec![2; 16];
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.application = "different.service".into();
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.profile = "dev".into();
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.instance = "other".into();
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.service_id.clear();
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.service_id = vec![0; 16];
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.service_id = vec![1; 15];
+    mismatches.push(remote);
+    let mut remote = offer();
+    remote.service_id = vec![1; 17];
+    mismatches.push(remote);
+    for remote in mismatches {
+        assert!(wire::negotiate(&offer(), &remote).is_err());
+        assert!(wire::negotiate(&remote, &offer()).is_err());
+        let (mut client, server) = sockets();
+        let server =
+            std::thread::spawn(move || assert!(Session::accept(server, &offer()).is_err()));
+        client.write_all(&wire::MAGIC).unwrap();
+        Framed::new(&mut client, 1024)
+            .unwrap()
+            .send(&remote)
+            .unwrap();
+        let mut reply = [0; 1];
+        assert_eq!(
+            client.read(&mut reply).unwrap(),
+            0,
+            "wrong identity received a reply"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn application_operation_one_is_separate_from_lifecycle_operation_one() {
+    use wire::MessageKind;
+    let (client, server) = sockets();
+    let mut hello = offer();
+    hello.supported = c::HEALTH | c::APPLICATION | (1 << 16);
+    hello.required = hello.supported;
+    let server_hello = hello.clone();
+    let server = std::thread::spawn(move || {
+        let mut session = Session::accept(server, &server_hello).unwrap();
+        let lifecycle = session.receive().unwrap();
+        let application = session.receive().unwrap();
+        assert_eq!(lifecycle.operation, 1);
+        assert_eq!(lifecycle.kind, MessageKind::Lifecycle);
+        assert_eq!(application.operation, 1);
+        assert_eq!(application.kind, MessageKind::Application);
+    });
+    let mut session = Session::connect(client, &hello).unwrap();
+    for (kind, operation) in [
+        (99.into(), 1),
+        (MessageKind::Application.into(), 0),
+        (MessageKind::Lifecycle.into(), 1024),
+    ] {
+        assert!(
+            session
+                .send(&Control {
+                    kind,
+                    operation,
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+    session.send(&health()).unwrap();
+    session
+        .send(&Control {
+            kind: MessageKind::Application.into(),
+            ..health()
+        })
+        .unwrap();
+    server.join().unwrap();
+    let mut unsupported = hello.clone();
+    unsupported.supported = c::HEALTH | c::APPLICATION;
+    unsupported.required = c::HEALTH;
+    assert!(
+        wire::negotiate(&hello, &unsupported).is_err(),
+        "generic envelope support must not imply support for application operation 1"
+    );
+}
+
+#[test]
+fn malformed_protobuf_and_excess_unknown_fields_poison_the_session() {
+    for body in [
+        vec![0],          // Invalid field number.
+        vec![8, 0x80],    // Truncated varint.
+        vec![0x22, 5, 1], // Truncated bytes field.
+        [vec![8, 1], [0xa0, 6, 1].repeat(129)].concat(),
+        [vec![8, 1], [0xa3, 6].repeat(33), [0xa4, 6].repeat(33)].concat(),
+    ] {
+        let mut frame = (body.len() as u32).to_le_bytes().to_vec();
+        frame.extend(body);
+        let mut reader = Framed::new(Cursor::new(frame), 1024).unwrap();
+        assert!(reader.receive::<Control>().is_err());
+        assert!(reader.send(&health()).is_err());
+    }
+}
+
+#[test]
+fn the_unreleased_non_protobuf_preamble_is_rejected() {
+    let (mut client, server) = sockets();
+    let server = std::thread::spawn(move || assert!(Session::accept(server, &offer()).is_err()));
+    client.write_all(b"KNDAEM02").unwrap();
+    assert_eq!(client.read(&mut [0; 1]).unwrap(), 0);
+    server.join().unwrap();
 }

@@ -8,6 +8,7 @@
 
 #![cfg_attr(feature = "async", doc = include_str!("../README.md"))]
 
+mod identity;
 #[cfg(feature = "async")]
 mod lifecycle;
 mod ownership;
@@ -16,6 +17,7 @@ pub mod transport;
 #[cfg(feature = "async")]
 mod upgrade;
 
+pub use identity::{ServiceIdentity, ServicePaths};
 #[cfg(feature = "async")]
 pub use lifecycle::{DrainOutcome, Lifecycle, RequestGuard};
 pub use ownership::ProcessLock;

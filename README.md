@@ -96,7 +96,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 ## Binary lifecycle protocol
 
 The optional [`wire` and `wire-async` features](docs/wire.md) provide bounded
-Bilrost messages and version/capability negotiation on a separate endpoint.
+Protobuf messages and version/capability negotiation on a separate endpoint.
 Legacy clients retain their listener and message format. Both adapters can use
 the same lifecycle and handoff logic. The protocol is experimental until its
 first consumer release; applications still own peer authorization and deadlines.

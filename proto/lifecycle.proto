@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package kunobi.daemon.v2;
+
+// Version/capability offer. Field numbers are part of the wire contract.
+// Never reuse a removed field number or change its type.
+message Hello {
+  // Oldest binary version this peer can speak.
+  uint32 minimum = 1;
+  // Newest binary version this peer can speak.
+  uint32 maximum = 2;
+  // Implemented optional capabilities.
+  uint64 supported = 3;
+  // Capabilities without which this connection must be refused.
+  uint64 required = 4;
+  // Maximum encoded frame this peer will receive.
+  uint32 max_frame = 5;
+  // Application protocol identifier; not an authentication credential.
+  string application = 6;
+  // Installation profile, such as stable or dev. Must match the peer exactly.
+  string profile = 7;
+  // Named service instance. Must match the peer exactly.
+  string instance = 8;
+  // Package-owned UUID, exactly 16 bytes, non-nil and stable across upgrades.
+  // This is an identity check, not an authentication credential.
+  bytes service_id = 9;
+}
+
+// Separates shared lifecycle operation IDs from application-owned operation IDs.
+enum MessageKind {
+  // Operations maintained by kunobi-daemon.
+  LIFECYCLE = 0;
+  // Operations maintained by the application, starting at 1.
+  APPLICATION = 1;
+}
+
+// Common lifecycle control fields. Unknown fields are not interpreted by the Rust
+// receiver and retained when re-encoding. New semantics require capabilities.
+message Control {
+  // Operation: health=1, drain=2, prepare=3, paused=4, ready=5, commit=6, abort=7.
+  // For kind=APPLICATION, the application owns IDs starting at 1 instead.
+  // Never reuse retired operation IDs within either kind.
+  uint32 operation = 1;
+  // Caller-supplied correlation ID; never used to automatically replay work.
+  uint64 request_id = 2;
+  // Destination generation, where applicable.
+  uint64 generation = 3;
+  // Attempt identity. The handoff coordinator validates its meaning.
+  bytes token = 4;
+  // Byte boundary acknowledged by the handoff peer. Absent differs from zero.
+  optional uint64 offset = 5;
+  // Bounded application data; large streams must be chunked.
+  bytes payload = 6;
+  // Selects the operation namespace. Unknown kinds must be rejected.
+  MessageKind kind = 7;
+}

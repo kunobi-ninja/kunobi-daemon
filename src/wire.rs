@@ -6,11 +6,17 @@
 //! The caller authenticates the OS peer and applies I/O deadlines before using
 //! this module. A codec cannot enforce deadlines on an arbitrary blocking I/O.
 
-use bilrost::{Message, OwnedMessage};
+use buffa::Message;
+
+#[rustfmt::skip]
+#[allow(missing_docs, clippy::derivable_impls)]
+mod generated;
+use crate::ServiceIdentity;
+pub use generated::{Control, Hello, MessageKind};
 use std::io::{self, Read, Write};
 
 /// Identifies the binary transport, independently of application versions.
-pub const MAGIC: [u8; 8] = *b"KNDAEM02";
+pub const MAGIC: [u8; 8] = *b"KNDPB002";
 /// First binary protocol version. Legacy application protocols are unchanged.
 pub const VERSION: u32 = 2;
 /// Absolute message bound, including encoded field overhead.
@@ -48,53 +54,41 @@ pub mod operation {
     pub const COMMIT: u32 = 6;
     /// Abandon a handoff attempt.
     pub const ABORT: u32 = 7;
-    /// First application-defined operation. Applications own their ID registry.
-    pub const APPLICATION_START: u32 = 1024;
-}
-
-/// Version/capability offer. Field tags are part of the wire contract.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Message)]
-pub struct Hello {
-    /// Oldest binary version this peer can speak.
-    #[bilrost(1)]
-    pub minimum: u32,
-    /// Newest binary version this peer can speak.
-    #[bilrost(2)]
-    pub maximum: u32,
-    /// Implemented optional capabilities.
-    #[bilrost(3)]
-    pub supported: u64,
-    /// Capabilities without which this connection must be refused.
-    #[bilrost(4)]
-    pub required: u64,
-    /// Maximum encoded frame this peer will receive.
-    #[bilrost(5)]
-    pub max_frame: u32,
-    /// Application protocol identifier; not an authentication credential.
-    #[bilrost(6)]
-    pub application: String,
 }
 
 impl Hello {
-    /// Offer the current binary version and the supplied application protocol.
-    pub fn new(application: impl Into<String>, supported: u64, required: u64) -> Self {
+    /// Offer capabilities for a stable service installation. Use the same
+    /// identity to derive resource paths and negotiate on both endpoints.
+    pub fn new(identity: &ServiceIdentity, supported: u64, required: u64) -> Self {
         Self {
             minimum: VERSION,
             maximum: VERSION,
             supported,
             required,
             max_frame: MAX_FRAME,
-            application: application.into(),
+            application: identity.application().into(),
+            profile: identity.profile().into(),
+            instance: identity.instance().into(),
+            service_id: identity.id().to_vec(),
+            ..Default::default()
         }
     }
 
     fn validate(&self) -> io::Result<()> {
+        ServiceIdentity::new(
+            self.service_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("service UUID must have 16 bytes"))?,
+            &self.application,
+            &self.profile,
+            &self.instance,
+        )
+        .map_err(|_| invalid("invalid service identity"))?;
         if self.minimum == 0
             || self.minimum > self.maximum
             || self.required & !self.supported != 0
             || !(MIN_FRAME..=MAX_FRAME).contains(&self.max_frame)
-            || self.application.is_empty()
-            || self.application.len() > 128
         {
             return Err(invalid("invalid version or capability offer"));
         }
@@ -118,8 +112,12 @@ pub struct Agreement {
 pub fn negotiate(local: &Hello, remote: &Hello) -> io::Result<Agreement> {
     local.validate()?;
     remote.validate()?;
-    if local.application != remote.application {
-        return Err(invalid("application protocol mismatch"));
+    if local.service_id != remote.service_id
+        || local.application != remote.application
+        || local.profile != remote.profile
+        || local.instance != remote.instance
+    {
+        return Err(invalid("service identity mismatch"));
     }
     let minimum = local.minimum.max(remote.minimum);
     let maximum = local.maximum.min(remote.maximum);
@@ -137,40 +135,19 @@ pub fn negotiate(local: &Hello, remote: &Hello) -> io::Result<Agreement> {
     })
 }
 
-/// Common control fields. Application messages use IDs at or above 1024.
-///
-/// Missing optional fields retain their defaults; decoders ignore unknown field
-/// tags. Adding an operation still requires an agreed application capability.
-/// Token, generation and offset semantics belong to the handoff coordinator.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Message)]
-pub struct Control {
-    /// Operation number from [`operation`] or the application's registry.
-    #[bilrost(1)]
-    pub operation: u32,
-    /// Caller-supplied correlation ID; never used to automatically replay work.
-    #[bilrost(2)]
-    pub request_id: u64,
-    /// Destination generation, where applicable.
-    #[bilrost(3)]
-    pub generation: u64,
-    /// Attempt identity. The coordinator validates its meaning.
-    #[bilrost(tag(4), encoding(plainbytes))]
-    pub token: Vec<u8>,
-    /// Byte boundary acknowledged by the handoff peer.
-    #[bilrost(5)]
-    pub offset: Option<u64>,
-    /// Bounded, application-defined data; large streams must be chunked.
-    #[bilrost(tag(6), encoding(plainbytes))]
-    pub payload: Vec<u8>,
-}
-
-fn required_capability(operation: u32) -> io::Result<u64> {
+fn required_capability(message: &Control) -> io::Result<u64> {
+    match message.kind.as_known() {
+        Some(MessageKind::Application) if message.operation != 0 => {
+            return Ok(capability::APPLICATION);
+        }
+        Some(MessageKind::Lifecycle) => {}
+        _ => return Err(invalid("invalid message kind or application operation")),
+    }
     use self::{capability as c, operation as o};
-    match operation {
+    match message.operation {
         o::HEALTH => Ok(c::HEALTH),
         o::DRAIN => Ok(c::DRAIN),
         o::PREPARE..=o::ABORT => Ok(c::HANDOFF),
-        o::APPLICATION_START.. => Ok(c::APPLICATION),
         _ => Err(invalid("unknown control operation")),
     }
 }
@@ -179,12 +156,41 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn encode_frame<M: Message>(
+    message: &M,
+    limit: u32,
+    buffer: &mut Vec<u8>,
+    cache: &mut buffa::SizeCache,
+) -> io::Result<()> {
+    buffer.clear();
+    buffer.extend_from_slice(&[0; 4]);
+    let length = message
+        .try_encode_bounded_with_cache(limit, cache, buffer)
+        .map_err(io::Error::other)?;
+    if length == 0 {
+        return Err(invalid("empty message"));
+    }
+    buffer[..4].copy_from_slice(&length.to_le_bytes());
+    Ok(())
+}
+
+fn decode_message<M: Message>(buffer: &[u8], limit: u32) -> io::Result<M> {
+    buffa::DecodeOptions::new()
+        .with_max_message_size(limit as usize)
+        .with_recursion_limit(32)
+        .with_unknown_field_limit(128)
+        .with_element_memory_limit(MAX_FRAME as usize)
+        .decode_from_slice(buffer)
+        .map_err(io::Error::other)
+}
+
 /// Bounded framing with reusable scratch storage. The first four bytes are the
 /// encoded body length in little endian, not a native Rust struct layout.
 /// A framing/I/O error poisons this codec: reconnect instead of retrying bytes.
 pub struct Framed<S> {
     io: S,
     buffer: Vec<u8>,
+    cache: buffa::SizeCache,
     limit: u32,
     failed: bool,
 }
@@ -198,6 +204,7 @@ impl<S: Read + Write> Framed<S> {
         Ok(Self {
             io,
             buffer: Vec::new(),
+            cache: buffa::SizeCache::new(),
             limit,
             failed: false,
         })
@@ -214,14 +221,7 @@ impl<S: Read + Write> Framed<S> {
     /// Encode one complete bounded message and flush it. No automatic retries.
     pub fn send<M: Message>(&mut self, message: &M) -> io::Result<()> {
         self.usable()?;
-        let length = message.encoded_len();
-        if length == 0 || length > self.limit as usize {
-            return Err(invalid("encoded message exceeds negotiated bounds"));
-        }
-        self.buffer.clear();
-        self.buffer
-            .extend_from_slice(&(length as u32).to_le_bytes());
-        message.encode(&mut self.buffer).map_err(io::Error::other)?;
+        encode_frame(message, self.limit, &mut self.buffer, &mut self.cache)?;
         self.failed = true;
         self.io.write_all(&self.buffer)?;
         self.io.flush()?;
@@ -231,7 +231,7 @@ impl<S: Read + Write> Framed<S> {
 
     /// Read exactly one message without consuming bytes from the next frame.
     /// An oversized header is rejected before allocating its advertised size.
-    pub fn receive<M: OwnedMessage>(&mut self) -> io::Result<M> {
+    pub fn receive<M: Message + Default>(&mut self) -> io::Result<M> {
         self.usable()?;
         self.failed = true;
         let mut length = [0; 4];
@@ -242,7 +242,7 @@ impl<S: Read + Write> Framed<S> {
         }
         self.buffer.resize(length as usize, 0);
         self.io.read_exact(&mut self.buffer)?;
-        let value = M::decode(self.buffer.as_slice()).map_err(io::Error::other)?;
+        let value = decode_message(self.buffer.as_slice(), self.limit)?;
         self.failed = false;
         Ok(value)
     }
@@ -322,7 +322,7 @@ impl<S: Read + Write> Session<S> {
     }
 
     fn check(&self, message: &Control) -> io::Result<()> {
-        if required_capability(message.operation)? & self.agreement.capabilities == 0 {
+        if required_capability(message)? & self.agreement.capabilities == 0 {
             return Err(invalid("operation capability was not negotiated"));
         }
         Ok(())

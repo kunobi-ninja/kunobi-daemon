@@ -1,0 +1,11 @@
+syntax = "proto3";
+package example.cache;
+
+// Application-owned messages, independent of the daemon's control schema.
+message CacheLookup {
+  bytes key = 1;
+}
+
+message CacheResult {
+  bool hit = 1;
+}

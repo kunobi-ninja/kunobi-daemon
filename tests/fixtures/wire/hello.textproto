@@ -1,0 +1,9 @@
+minimum: 2
+maximum: 2
+supported: 9223372036854775813
+required: 4
+max_frame: 65536
+application: "fixture"
+profile: "stable"
+instance: "default"
+service_id: "\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001"

@@ -241,7 +241,7 @@ async fn concurrent_clients_create_one_replacement_process() {
 #[cfg(feature = "wire-async")]
 #[tokio::test]
 async fn legacy_and_binary_endpoints_share_admission_and_preserve_both_inflight_replies() {
-    use kunobi_daemon::wire::{AsyncSession, Control, Hello, capability, operation};
+    use kunobi_daemon::wire::{AsyncSession, Control, Hello, capability};
     let fixture = Fixture::new();
     let old = fixture.start(1).await;
     let (_relay_pid, mut legacy) = fixture.relay().await;
@@ -255,14 +255,19 @@ async fn legacy_and_binary_endpoints_share_admission_and_preserve_both_inflight_
     socket.set_nodelay(true).unwrap();
     let mut binary = AsyncSession::connect(
         socket,
-        &Hello::new("fixture", capability::APPLICATION, capability::APPLICATION),
+        &Hello::new(
+            &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+            capability::APPLICATION,
+            capability::APPLICATION,
+        ),
     )
     .await
     .unwrap();
     send(&mut legacy, "CALL 80 hold").await.unwrap();
     binary
         .send(&Control {
-            operation: operation::APPLICATION_START,
+            kind: kunobi_daemon::wire::MessageKind::Application.into(),
+            operation: 1,
             request_id: 81,
             payload: b"hold".to_vec(),
             ..Default::default()

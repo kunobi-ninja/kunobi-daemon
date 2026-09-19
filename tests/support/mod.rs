@@ -443,7 +443,11 @@ async fn binary_handle(
 ) -> io::Result<()> {
     use kunobi_daemon::wire::{AsyncSession, Hello, capability, operation};
     stream.set_nodelay(true)?;
-    let offer = Hello::new("fixture", capability::APPLICATION | capability::HEALTH, 0);
+    let offer = Hello::new(
+        &kunobi_daemon::ServiceIdentity::new([1; 16], "fixture", "stable", "default").unwrap(),
+        capability::APPLICATION | capability::HEALTH,
+        0,
+    );
     let mut session = timeout(BUDGET, AsyncSession::accept(stream, &offer)).await??;
     loop {
         let message = tokio::select! {
@@ -451,7 +455,9 @@ async fn binary_handle(
             _ = lifecycle.draining() => return Ok(()),
             message = session.receive() => message?,
         };
-        if message.operation == operation::HEALTH {
+        if message.kind == kunobi_daemon::wire::MessageKind::Lifecycle
+            && message.operation == operation::HEALTH
+        {
             session
                 .send(&kunobi_daemon::wire::Control {
                     payload: format!("IDENTITY {} {build}", std::process::id()).into_bytes(),
@@ -459,7 +465,9 @@ async fn binary_handle(
                 })
                 .await?;
         } else {
-            if message.operation != operation::APPLICATION_START {
+            if message.kind != kunobi_daemon::wire::MessageKind::Application
+                || message.operation != 1
+            {
                 return Err(invalid());
             }
             let hold = match message.payload.as_slice() {

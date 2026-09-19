@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub struct AsyncSession<S> {
     io: S,
     buffer: Vec<u8>,
+    cache: buffa::SizeCache,
     agreement: Agreement,
     failed: bool,
 }
@@ -15,6 +16,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         Self {
             io,
             buffer: Vec::new(),
+            cache: buffa::SizeCache::new(),
             agreement: Agreement {
                 version: VERSION,
                 capabilities: 0,
@@ -79,7 +81,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
     }
 
     fn check(&self, message: &Control) -> io::Result<()> {
-        if required_capability(message.operation)? & self.agreement.capabilities == 0 {
+        if required_capability(message)? & self.agreement.capabilities == 0 {
             return Err(invalid("operation capability was not negotiated"));
         }
         Ok(())
@@ -103,14 +105,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
 
     async fn send_message<M: Message>(&mut self, message: &M) -> io::Result<()> {
         self.usable()?;
-        let length = message.encoded_len();
-        if length == 0 || length > self.agreement.max_frame as usize {
-            return Err(invalid("encoded message exceeds negotiated bounds"));
-        }
-        self.buffer.clear();
-        self.buffer
-            .extend_from_slice(&(length as u32).to_le_bytes());
-        message.encode(&mut self.buffer).map_err(io::Error::other)?;
+        encode_frame(
+            message,
+            self.agreement.max_frame,
+            &mut self.buffer,
+            &mut self.cache,
+        )?;
         self.failed = true;
         self.io.write_all(&self.buffer).await?;
         self.io.flush().await?;
@@ -118,7 +118,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         Ok(())
     }
 
-    async fn receive_message<M: OwnedMessage>(&mut self) -> io::Result<M> {
+    async fn receive_message<M: Message + Default>(&mut self) -> io::Result<M> {
         self.usable()?;
         self.failed = true;
         let length = self.io.read_u32_le().await?;
@@ -127,7 +127,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         }
         self.buffer.resize(length as usize, 0);
         self.io.read_exact(&mut self.buffer).await?;
-        let message = M::decode(self.buffer.as_slice()).map_err(io::Error::other)?;
+        let message = decode_message(self.buffer.as_slice(), self.agreement.max_frame)?;
         self.failed = false;
         Ok(message)
     }
