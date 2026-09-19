@@ -1,0 +1,5 @@
+kunobi-daemon
+Copyright 2026 Zondax AG
+
+The blocking transport, atomic publication and their regression tests were
+extracted from Kunobi and are distributed here under Apache-2.0.

@@ -1,5 +1,7 @@
 //! Regression tests for daemon lifecycle.
 
+#![cfg(feature = "async")]
+
 use kunobi_daemon::{DrainOutcome, Lifecycle};
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
