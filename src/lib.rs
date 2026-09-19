@@ -22,3 +22,6 @@ pub use ownership::ProcessLock;
 pub use publication::publish_record;
 #[cfg(feature = "async")]
 pub use upgrade::{UpgradeError, ensure_current};
+
+#[cfg(feature = "wire")]
+pub mod wire;

@@ -10,14 +10,24 @@ repository = "https://github.com/kunobi-ninja/kunobi-daemon"
 [features]
 default = ["async"]
 async = ["dep:tokio"]
+wire = ["dep:bilrost"]
+wire-async = ["wire", "async", "tokio/io-util"]
 
 [dependencies]
+bilrost = { version = "=0.1016.1", optional = true, default-features = false, features = ["derive", "std"] }
 tokio = { version = "1", optional = true, features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+
+[[bench]]
+name = "control_codec"
+harness = false
+required-features = ["wire"]
