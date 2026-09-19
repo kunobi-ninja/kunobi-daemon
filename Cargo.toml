@@ -12,7 +12,7 @@ categories = ["os", "asynchronous"]
 
 [features]
 default = ["async"]
-async = ["dep:tokio"]
+async = ["dep:tokio", "tokio/macros"]
 wire = ["dep:buffa"]
 local = ["dep:interprocess", "dep:socket2", "dep:libc"]
 local-async = ["local", "async", "interprocess/tokio", "dep:widestring"]
