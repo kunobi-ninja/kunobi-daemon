@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Lowercase Windows `#[link]` names (`kernel32`, `advapi32`) so `cargo-xwin` /
+  `lld-link` on Linux can find the xwin import libraries.
+
+## 0.2.0
+
+Shared replacement coordinator, process lock, drain, and optional Protobuf
+sessions. See the 0.2.0 release notes.
+
 ## 0.1.0
 
 Initial release of shared primitives for local daemons:
