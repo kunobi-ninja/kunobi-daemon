@@ -106,6 +106,13 @@ pub trait Driver {
     type Error;
     /// Perform exactly the requested operation, bounding I/O by the given deadline.
     fn perform(&mut self, step: Step, deadline: Option<Instant>) -> Result<Progress, Self::Error>;
+    /// Client shims to prefault after selection commits. Empty by default.
+    ///
+    /// Typical entries are the relay or compiler wrapper next to this daemon.
+    /// Prefault errors are discarded: publication has already succeeded.
+    fn warmup_paths(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
 }
 
 /// Async application operations.
@@ -119,6 +126,10 @@ pub trait AsyncDriver {
         step: Step,
         deadline: Option<tokio::time::Instant>,
     ) -> impl std::future::Future<Output = Result<Progress, Self::Error>> + Send;
+    /// Client shims to prefault after selection commits. Empty by default.
+    fn warmup_paths(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
 }
 
 struct Machine {
@@ -194,8 +205,15 @@ pub fn run<D: Driver>(
         if step != Step::Commit && deadline.is_some_and(|limit| Instant::now() >= limit) {
             return Err(machine.failure(Reason::Deadline));
         }
+        let committed_before = machine.committed;
         if let Some(outcome) = machine.advance(progress)? {
+            if machine.committed && !committed_before {
+                crate::warmup::prefault_all(driver.warmup_paths());
+            }
             return Ok(outcome);
+        }
+        if machine.committed && !committed_before {
+            crate::warmup::prefault_all(driver.warmup_paths());
         }
         if machine.step != step {
             if machine.step == Step::Drain || machine.step == Step::Retire {
@@ -242,8 +260,15 @@ pub async fn run_async<D: AsyncDriver>(
         {
             return Err(machine.failure(Reason::Deadline));
         }
+        let committed_before = machine.committed;
         if let Some(outcome) = machine.advance(progress)? {
+            if machine.committed && !committed_before {
+                crate::warmup::prefault_all(driver.warmup_paths());
+            }
             return Ok(outcome);
+        }
+        if machine.committed && !committed_before {
+            crate::warmup::prefault_all(driver.warmup_paths());
         }
         if machine.step != step {
             if machine.step == Step::Drain || machine.step == Step::Retire {
