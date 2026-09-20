@@ -56,3 +56,17 @@ jobs:
       - run: cargo +1.89.0 test --locked --all-features
       - run: cargo +1.89.0 test --locked --no-default-features --features wire
       - run: cargo +1.89.0 test --locked --no-default-features
+
+  # Native windows-latest cannot see mixed-case .lib names. cargo check does
+  # not link; this job is the cargo-xwin path Kunobi's sidecar uses.
+  xwin:
+    name: Windows cross-link (xwin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: rustup target add x86_64-pc-windows-msvc
+      - run: sudo apt-get update && sudo apt-get install -y clang lld
+      - run: cargo install cargo-xwin --locked --version 0.23.1
+      - run: cargo xwin build --locked --all-features --all-targets --target x86_64-pc-windows-msvc

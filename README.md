@@ -88,9 +88,10 @@ their existing semantics.
 ## Development
 
 Rust 1.89 or newer. Run `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, and `cargo test`. CI checks Linux, macOS, Windows, and the minimum Rust
-version. Tests cover concurrent upgraders, stale replies, cancellation, multiple
-drain observers, and file ownership across real child processes.
+warnings`, and `cargo test`. CI checks Linux, macOS, native Windows, a
+`cargo xwin` MSVC link from Linux, and the minimum Rust version. Tests cover
+concurrent upgraders, stale replies, cancellation, multiple drain observers,
+and file ownership across real child processes.
 
 The [process handoff suite](tests/README.md) also checks that a relay keeps its
 client session through replacement, preserves late replies and never replays
