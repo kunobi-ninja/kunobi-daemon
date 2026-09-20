@@ -1,4 +1,9 @@
 //! Windows named-pipe adapters with peer checks and setup deadlines.
+//!
+//! Syscall import libs use lowercase names (`kernel32`, `advapi32`). cargo-xwin's
+//! `lld-link` on Linux opens `Advapi32.lib` as a file and cannot see the xwin
+//! splat's `advapi32.lib`. Native MSVC is case-insensitive, so lowercase is
+//! valid on both.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -140,7 +145,7 @@ pub fn verify_process_user(pid: u32) -> io::Result<()> {
 pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
     use std::ffi::c_void;
     type Handle = *mut c_void;
-    #[link(name = "Kernel32")]
+    #[link(name = "kernel32")]
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
@@ -282,7 +287,7 @@ struct Overlapped {
     event: Handle,
 }
 
-#[link(name = "Kernel32")]
+#[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateEventW(
         event_attributes: *const c_void,
@@ -317,7 +322,7 @@ unsafe extern "system" {
     fn CloseHandle(object: Handle) -> i32;
 }
 
-#[link(name = "Advapi32")]
+#[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
     fn GetTokenInformation(
