@@ -1,9 +1,6 @@
 //! Prefault and bounded spawn do not take daemon locks.
-use kunobi_daemon::{warm_executable, warm_spawn, warm_spawn_until};
-use std::{
-    io,
-    time::{Duration, Instant},
-};
+use kunobi_daemon::{warm_executable, warm_spawn};
+use std::io;
 
 #[test]
 fn prefault_reads_an_existing_file_and_rejects_missing_paths() {
@@ -56,6 +53,8 @@ fn spawn_requires_a_successful_exit() {
 #[cfg(unix)]
 #[test]
 fn a_stuck_spawn_is_killed_at_the_deadline() {
+    use kunobi_daemon::warm_spawn_until;
+    use std::time::{Duration, Instant};
     let error = warm_spawn_until(
         std::path::Path::new("/bin/sleep"),
         &["30"],
