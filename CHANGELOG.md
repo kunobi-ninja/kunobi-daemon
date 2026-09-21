@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+- `launch` feature (off by default, needs `local`): client spawn primitives.
+  `spawn` keeps the caller's stdio/env; `spawn_detached` nulls stdio for a
+  protocol shim; `spawn_and_wait` waits on the caller's probe via `readiness`.
+  Kernel bind remains the election; `ProcessLock` is layer two.
+- Windows `local`: `install_session_end_handler` / `session_end_requested` for
+  CLOSE, LOGOFF and SHUTDOWN, and `StdioInheritGuard` for daemon spawns.
+
 ## 0.2.1
 
 - Lowercase Windows `#[link]` names (`kernel32`, `advapi32`) so `cargo-xwin` /

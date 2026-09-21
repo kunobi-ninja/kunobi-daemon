@@ -18,6 +18,36 @@ A lock is coordination, not authentication. An application chooses an OS-protect
 instance directory and authenticates the socket peer separately from service UUID
 validation. A UUID prevents accidental cross-service dispatch; it is not a secret.
 
+## Client attach
+
+Features compose as the destination for shared process code:
+
+| Feature | Role |
+| --- | --- |
+| `local` | Blocking OS transport, bind, peer checks, session-end, spawn inherit guard |
+| `local-async` | Tokio listener (`windows_socket`) for a process that accepts |
+| `launch` | Client-side spawn primitives on top of `local` |
+| `replacement` / `readiness` | Exclusive or overlapping upgrade; bounded live probes |
+
+A byte-pump shim enables `launch` and can call `spawn_and_wait` with a connect
+probe. A cache daemon already uses `local-async`, `replacement` and
+`readiness`; it can later call `launch::spawn` after setting argv, env and
+stderr, and keep its health/epoch probe. It does not replace `ensure` with
+connect-is-live.
+
+The kernel bind is the election. `local::unix_socket::acquire` and
+`local::windows_socket::acquire` return `Won` or `AlreadyRunning`. Clients never
+unlink the endpoint. An advisory `ProcessLock` on a sibling path is layer two:
+it reduces a thundering herd of client forks. If the lock and the kernel
+disagree, the kernel is right.
+
+`launch::spawn` does not change stdio. `spawn_detached` nulls stdin, stdout and
+stderr for shims whose protocol owns those streams. Windows inherit of the
+caller's pipes is suppressed around spawn (`StdioInheritGuard`).
+
+On Windows, `local::windows::install_session_end_handler` arms CLOSE, LOGOFF
+and SHUTDOWN so a published pipe is not left behind after logoff.
+
 ## Readiness and request admission
 
 A discovery record, an accepted connection and a zero process exit code are not

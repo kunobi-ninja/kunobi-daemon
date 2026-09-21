@@ -16,6 +16,7 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
 - `wire` and `control`: Buffa Protobuf negotiation, typed health and drain replies.
 - `local` and `transport`: optional OS peer checks, setup deadlines, half-close,
   byte pumps and replaceable writers.
+- `launch`: stdio clients that may start the daemon. Off by default; needs `local`.
 - `admission` and `observation`: independent capacity pools and local telemetry data.
 
 See [Daemon lifecycle and replacement](docs/architecture.md) for the transition
@@ -25,6 +26,8 @@ The default `async` feature adds Tokio-based lifecycle and generation support.
 Blocking clients use `default-features = false`; `wire` and `local` do not create
 a runtime. `wire-async` adds the async protocol and control handler.
 `local-async` adds the Tokio Windows listener with an explicit local-owner ACL.
+`launch` is the shim-side start recipe on top of `local`. A daemon that only
+binds does not enable it.
 
 ## Request draining
 

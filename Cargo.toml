@@ -1,6 +1,6 @@
 [package]
 name = "kunobi-daemon"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -17,6 +17,9 @@ wire = ["dep:buffa"]
 local = ["dep:interprocess", "dep:socket2", "dep:libc"]
 local-async = ["local", "async", "interprocess/tokio", "dep:widestring"]
 wire-async = ["wire", "async", "tokio/io-util"]
+# Stdio clients that may start the daemon. Off by default so a process that
+# only binds and serves does not compile spawn helpers.
+launch = ["local"]
 
 [dependencies]
 buffa = { version = "=0.9.2", optional = true, default-features = false, features = ["std"] }
