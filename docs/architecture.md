@@ -170,3 +170,13 @@ service. It drains the owner, bounds the manager client, and verifies readiness
 independently of the command's exit status. A timed-out manager command may have
 been accepted by the manager; retry through discovery instead of assuming it
 was cancelled. Production adapters also validate their executable and build policy.
+
+## Client shim warmup
+
+A later client exec still belongs to Cursor, `rustc` or the MCP host; the daemon
+cannot hold a pre-spawned shim on those stdio pipes. After `Commit`,
+`replacement::run` prefaults `Driver::warmup_paths()` into the file cache and
+ignores I/O errors so publication stays authoritative. Call
+`warm_executable` on daemon start for the same sibling path. Use `warm_spawn`
+only with an argv that exits before discovery (`--warmup` in the consumer).
+Prefault is not a keepalive loop.

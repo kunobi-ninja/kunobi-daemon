@@ -135,3 +135,10 @@ The optional `local` adapters provide OS peer checks and absolute setup deadline
 for both reads and writes. Call authentication before sending protocol bytes. Clear setup deadlines before ordinary application traffic. Long jobs
 and slow readers are application policy; observations never impose a job timeout
 or cancel work.
+
+`warm_executable` faults a client shim into the OS page cache without running
+it. Call it when the daemon starts and after a replacement commit (drivers can
+list paths on `replacement::Driver::warmup_paths`; missing files do not fail
+the commit). `warm_spawn` is the extra step for macOS's per-path first-exec
+cache: the child argv must exit without connecting or taking locks. Do not
+poll on a timer; the miss that costs ~100 ms is a new path, not eviction.

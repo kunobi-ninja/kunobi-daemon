@@ -12,9 +12,13 @@ struct Recorder {
     steps: Vec<Step>,
     fail: Option<Step>,
     pending: Option<Step>,
+    warmup: Vec<std::path::PathBuf>,
 }
 impl Driver for Recorder {
     type Error = &'static str;
+    fn warmup_paths(&self) -> Vec<std::path::PathBuf> {
+        self.warmup.clone()
+    }
     fn perform(&mut self, step: Step, _: Option<Instant>) -> Result<Progress, Self::Error> {
         self.steps.push(step);
         if self.fail == Some(step) {
@@ -70,6 +74,7 @@ fn exclusive_releases_the_incumbent_before_start_and_overlap_selects_before_reti
             steps: vec![],
             fail: None,
             pending: None,
+            warmup: vec![],
         };
         assert_eq!(
             replacement::run(&lock, mode, budgets(), &mut driver).unwrap(),
@@ -98,6 +103,7 @@ fn failures_do_not_advance_and_report_the_commit_boundary() {
             steps: vec![],
             fail: Some(step),
             pending: None,
+            warmup: vec![],
         };
         let error = replacement::run(&lock, Mode::Overlap, budgets(), &mut driver).unwrap_err();
         assert_eq!(error.step, step);
@@ -117,6 +123,7 @@ fn pending_verification_retries_only_the_probe_and_pending_retirement_is_not_com
         steps: vec![],
         fail: None,
         pending: Some(Step::Verify),
+        warmup: vec![],
     };
     replacement::run(&lock, Mode::Overlap, budgets(), &mut driver).unwrap();
     assert_eq!(
@@ -131,11 +138,33 @@ fn pending_verification_retries_only_the_probe_and_pending_retirement_is_not_com
         steps: vec![],
         fail: None,
         pending: Some(Step::Retire),
+        warmup: vec![],
     };
     assert_eq!(
         replacement::run(&lock, Mode::Overlap, budgets(), &mut driver).unwrap(),
         Outcome::RetirementPending
     );
+}
+
+#[test]
+fn commit_prefaults_warmup_paths_and_ignores_missing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = ProcessLock::try_acquire(dir.path().join("upgrade.lock"))
+        .unwrap()
+        .unwrap();
+    let shim = dir.path().join("shim");
+    std::fs::write(&shim, vec![1; 8_192]).unwrap();
+    let mut driver = Recorder {
+        steps: vec![],
+        fail: None,
+        pending: None,
+        warmup: vec![shim, dir.path().join("absent")],
+    };
+    assert_eq!(
+        replacement::run(&lock, Mode::Exclusive, budgets(), &mut driver).unwrap(),
+        Outcome::Complete
+    );
+    assert_eq!(*driver.steps.last().unwrap(), Step::Commit);
 }
 
 #[test]
