@@ -18,6 +18,26 @@ A lock is coordination, not authentication. An application chooses an OS-protect
 instance directory and authenticates the socket peer separately from service UUID
 validation. A UUID prevents accidental cross-service dispatch; it is not a secret.
 
+## Client attach
+
+A stdio shim that may start the daemon enables the `launch` feature. A process
+that only binds and serves enables `local` (and `local-async` on Windows) and
+leaves `launch` off.
+
+The kernel bind is the election. `local::unix_socket::acquire` and
+`local::windows_socket::acquire` return `Won` or `AlreadyRunning`. Clients never
+unlink the endpoint. An advisory `ProcessLock` on a sibling path is layer two:
+it reduces a thundering herd of client forks. If the lock and the kernel
+disagree, the kernel is right.
+
+Liveness is a connect (or a protocol probe), never the existence of a discovery
+file. `launch::spawn_and_wait` starts a detached peer and waits on the caller's
+probe. Stdio is not inherited: a daemon that writes to the shim's stdout
+corrupts the client's protocol.
+
+On Windows, `local::windows::install_session_end_handler` arms CLOSE, LOGOFF
+and SHUTDOWN so a published pipe is not left behind after logoff.
+
 ## Readiness and request admission
 
 A discovery record, an accepted connection and a zero process exit code are not

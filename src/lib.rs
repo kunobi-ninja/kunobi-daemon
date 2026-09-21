@@ -8,6 +8,8 @@
 
 #![cfg_attr(feature = "async", doc = include_str!("../README.md"))]
 
+#[cfg(feature = "launch")]
+pub mod launch;
 #[cfg(feature = "local")]
 #[allow(unsafe_code)]
 pub mod local;

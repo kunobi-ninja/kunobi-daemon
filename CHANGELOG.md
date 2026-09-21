@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+- `launch` feature (off by default, needs `local`): stdio clients start a
+  daemon with detached stdio and wait on a connect probe, never a discovery
+  file. Kernel bind remains the election; `ProcessLock` is layer two.
+- Windows `local`: `install_session_end_handler` / `session_end_requested` for
+  CLOSE, LOGOFF and SHUTDOWN.
+
 ## 0.2.1
 
 - Lowercase Windows `#[link]` names (`kernel32`, `advapi32`) so `cargo-xwin` /
