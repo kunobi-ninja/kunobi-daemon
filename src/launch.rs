@@ -3,6 +3,10 @@
 //! Enable the `launch` feature. A process that only binds and serves keeps
 //! `local` and does not compile this module.
 //!
+//! These are primitives, not a full replacement coordinator. A cache daemon
+//! keeps [`crate::replacement`] and an application health probe; a byte-pump
+//! shim can use [`spawn_and_wait`] with a connect probe.
+//!
 //! # Roles
 //!
 //! The kernel bind is the election: [`crate::local::unix_socket::acquire`] or
@@ -13,18 +17,22 @@
 //! reduces a thundering herd of client forks. If the lock and the kernel
 //! disagree, the kernel is right. Continue to bind or connect.
 //!
-//! Liveness is a connect (or an application handshake), never the existence of
-//! a discovery file. [`wait_until_live`] polls the caller's probe.
+//! Liveness is the caller's probe (connect or a protocol handshake), never the
+//! existence of a discovery file. [`wait_until_live`] is a bool wrapper over
+//! [`crate::readiness::wait_until`].
 //!
-//! Stdio of this process is not inherited. A daemon that writes to the shim's
-//! stdout corrupts the client's protocol.
+//! [`spawn`] does not change stdio: the caller sets it. [`spawn_detached`]
+//! nulls stdin, stdout and stderr for shims whose protocol owns those streams.
 
+use std::convert::Infallible;
 use std::io;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Gap between liveness probes while waiting for a freshly spawned peer.
-pub const POLL: Duration = Duration::from_millis(100);
+use crate::readiness;
+
+/// Gap between unsuccessful liveness probes. Same cadence as [`readiness`].
+pub const POLL: Duration = readiness::POLL_INTERVAL;
 
 /// Outcome of [`spawn_and_wait`].
 ///
@@ -38,40 +46,46 @@ pub struct SpawnWait {
     pub spawn_error: Option<io::Error>,
 }
 
-/// Spawn a peer with stdin, stdout and stderr detached.
+/// Spawn `command` with OS spawn hygiene. Stdio, argv and env stay as set.
 ///
 /// On Unix this restores SIGCHLD around `Command::spawn` so a failed exec
 /// still returns an error instead of panicking, then reap-ignores again.
+/// On Windows this suppresses inherit on the caller's standard handles for
+/// the spawn, then restores them.
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        crate::local::unix::spawn_with_child_waiting(command)
+    }
+    #[cfg(windows)]
+    {
+        let _guard = crate::local::windows::StdioInheritGuard::suppress();
+        command.spawn()
+    }
+}
+
+/// Spawn a peer with stdin, stdout and stderr detached.
+///
+/// Use this when the caller's stdio is a client protocol. Callers that need a
+/// daemon log on stderr set that stream themselves and call [`spawn`].
 pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        crate::local::unix::spawn_with_child_waiting(command)
-    }
-    #[cfg(not(unix))]
-    {
-        command.spawn()
-    }
+    spawn(command)
 }
 
 /// Poll `is_live` until it succeeds or `deadline` is reached.
 ///
-/// `is_live` must attempt a connect (or a protocol probe). Do not use
-/// `path.exists()`.
+/// `is_live` must attempt a connect or a protocol probe. Do not use
+/// `path.exists()`. Application proofs with errors use
+/// [`readiness::wait_until`] directly.
 pub fn wait_until_live(deadline: Instant, mut is_live: impl FnMut() -> bool) -> bool {
-    loop {
-        if is_live() {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        std::thread::sleep(POLL.min(deadline.saturating_duration_since(now)));
-    }
+    readiness::wait_until(deadline, |_| Ok::<_, Infallible>(is_live().then_some(())))
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Detach-spawn `command`, then wait on `is_live` for `budget`.

@@ -324,6 +324,7 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
         add: i32,
     ) -> i32;
+    fn SetHandleInformation(object: Handle, mask: u32, flags: u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -665,6 +666,53 @@ pub fn install_session_end_handler() -> io::Result<()> {
 /// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
 pub fn session_end_requested() -> bool {
     SESSION_END.load(Ordering::Acquire)
+}
+
+const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+/// Clears inherit on this process's standard handles and restores it on drop.
+///
+/// Explicit child stdio is unaffected: the standard library marks those
+/// handles inheritable. This removes incidental inheritance of the caller's
+/// pipes across `Command::spawn`.
+pub struct StdioInheritGuard {
+    restore: Vec<Handle>,
+}
+
+impl StdioInheritGuard {
+    /// Suppress inherit for the duration of a spawn.
+    pub fn suppress() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        let handles: [Handle; 3] = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut restore = Vec::new();
+        for handle in handles {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            // SAFETY: handle is a live std handle; clearing inherit is
+            // process-local and restored on drop.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                restore.push(handle);
+            }
+        }
+        Self { restore }
+    }
+}
+
+impl Drop for StdioInheritGuard {
+    fn drop(&mut self) {
+        for handle in &self.restore {
+            // SAFETY: handles were successfully cleared by `suppress`.
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
