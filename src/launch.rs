@@ -105,7 +105,6 @@ pub fn spawn_and_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn wait_until_live_fails_when_the_probe_never_succeeds() {
@@ -205,7 +204,7 @@ mod tests {
     fn spawn_detached_execs() {
         let bin = ["/usr/bin/true", "/bin/true"]
             .into_iter()
-            .find(|path| Path::new(path).exists());
+            .find(|path| std::path::Path::new(path).exists());
         let Some(bin) = bin else {
             return;
         };
