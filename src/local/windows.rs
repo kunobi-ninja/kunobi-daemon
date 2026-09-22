@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::{Stream as _, StreamCommon as _};
 use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream, ToNsName};
 
-use super::ConnectError;
+use super::{ConnectError, Endpoint};
 use crate::local::Duplex;
 use crate::transport::WriteHalf;
 
@@ -27,95 +27,6 @@ use crate::transport::WriteHalf;
 pub struct WindowsDuplex {
     stream: Stream,
     read_deadline: Cell<Option<Instant>>,
-}
-
-impl WindowsDuplex {
-    /// Attempt one connection without retrying or sending application data.
-    pub fn connect_once(endpoint: &str) -> Result<Self, ConnectError> {
-        let name = endpoint
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|_| ConnectError::ConnectTimeout)?;
-        ConnectOptions::new()
-            .name(name)
-            .wait_mode(interprocess::ConnectWaitMode::Timeout(Duration::ZERO))
-            .connect_sync()
-            .map(|stream| Self {
-                stream,
-                read_deadline: Cell::new(None),
-            })
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    ConnectError::PermissionDenied
-                } else {
-                    ConnectError::ConnectTimeout
-                }
-            })
-    }
-    /// Retry endpoint availability within the fixed connection setup budget.
-    pub fn connect(endpoint: &str) -> Result<Self, ConnectError> {
-        Self::connect_until(endpoint, Instant::now() + Duration::from_secs(5))
-    }
-
-    /// Retry local pipe availability under one absolute connection deadline.
-    pub fn connect_until(endpoint: &str, deadline: Instant) -> Result<Self, ConnectError> {
-        let name = endpoint
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|_| ConnectError::ConnectTimeout)?;
-        loop {
-            match ConnectOptions::new()
-                .name(name.clone())
-                .wait_mode(interprocess::ConnectWaitMode::Timeout(Duration::ZERO))
-                .connect_sync()
-            {
-                Ok(stream) => {
-                    return Ok(Self {
-                        stream,
-                        read_deadline: Cell::new(None),
-                    });
-                }
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(ConnectError::PermissionDenied);
-                }
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(
-                        Duration::from_millis(50)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(_) => return Err(ConnectError::ConnectTimeout),
-            }
-        }
-    }
-
-    /// Check the server process token before sending any client identity.
-    pub fn verify_peer_user(&self) -> io::Result<()> {
-        verify_process_user(self.peer_pid()?)
-    }
-
-    /// Read the server PID from the named-pipe kernel object.
-    pub fn peer_pid(&self) -> io::Result<u32> {
-        self.stream
-            .peer_creds()?
-            .pid()
-            .ok_or_else(|| io::Error::other("named-pipe peer has no PID"))
-    }
-
-    /// Arm an absolute deadline for reads performed during session setup.
-    ///
-    /// The split reader enforces this with overlapped `ReadFile`, then the
-    /// caller clears it before handing the reader to the ordinary byte pump.
-    /// Set or clear the absolute setup deadline before splitting.
-    pub fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let deadline = timeout
-            .map(|duration| {
-                Instant::now().checked_add(duration).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "read deadline overflow")
-                })
-            })
-            .transpose()?;
-        self.read_deadline.set(deadline);
-        Ok(())
-    }
 }
 
 /// Verify a kernel-reported peer PID against the current process token user.
@@ -244,6 +155,61 @@ impl WriteHalf for WindowsWriter {
 impl Duplex for WindowsDuplex {
     type Reader = WindowsReader;
     type Writer = WindowsWriter;
+
+    fn connect_once_until(endpoint: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
+        let name = endpoint
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|_| ConnectError::ConnectTimeout)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ConnectError::ConnectTimeout);
+        }
+        ConnectOptions::new()
+            .name(name)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(Duration::ZERO))
+            .connect_sync()
+            .map(|stream| Self {
+                stream,
+                read_deadline: Cell::new(None),
+            })
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    ConnectError::PermissionDenied
+                } else {
+                    ConnectError::ConnectTimeout
+                }
+            })
+    }
+
+    /// Check the server process token before sending any client identity.
+    fn verify_peer_user(&self) -> io::Result<()> {
+        verify_process_user(self.peer_pid()?)
+    }
+
+    /// Read the server PID from the named-pipe kernel object.
+    fn peer_pid(&self) -> io::Result<u32> {
+        self.stream
+            .peer_creds()?
+            .pid()
+            .ok_or_else(|| io::Error::other("named-pipe peer has no PID"))
+    }
+
+    /// Arm an absolute deadline for reads performed during session setup.
+    ///
+    /// The split reader enforces this with overlapped `ReadFile`, then the
+    /// caller clears it before handing the reader to the ordinary byte pump.
+    /// Set or clear the absolute setup deadline before splitting.
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let deadline = timeout
+            .map(|duration| {
+                Instant::now().checked_add(duration).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read deadline overflow")
+                })
+            })
+            .transpose()?;
+        self.read_deadline.set(deadline);
+        Ok(())
+    }
 
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)> {
         let deadline = self.read_deadline.get();

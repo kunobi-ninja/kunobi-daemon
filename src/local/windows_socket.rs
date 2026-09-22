@@ -2,6 +2,8 @@
 use std::io;
 use std::path::Path;
 
+use super::Duplex;
+
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
