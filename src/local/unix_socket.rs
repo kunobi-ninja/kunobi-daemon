@@ -21,6 +21,34 @@ pub enum BindError {
     /// Failed to remove a proven stale socket.
     Unlink(io::Error),
 }
+/// Longest socket path, in bytes, that fits in a Unix socket address on this
+/// platform: `sockaddr_un.sun_path` less the NUL that terminates it.
+pub const MAX_PATH_BYTES: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
+
+/// Fails when `socket` is too long to bind or connect to as a Unix socket.
+///
+/// The OS reports this only as an invalid argument, naming neither the length
+/// nor the limit, and a deep application directory hits it without warning.
+/// Callers can check before creating anything, and add their own advice.
+pub fn check_path(socket: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = socket.as_os_str().as_bytes().len();
+    if bytes > MAX_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path is {bytes} bytes, but a Unix socket path can be at most \
+                 {MAX_PATH_BYTES} on this platform: {}",
+                socket.display()
+            ),
+        ));
+    }
+    Ok(())
+}
 fn lock_path(path: &Path) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(".bind.lock");
@@ -44,6 +72,9 @@ fn bind_private(socket: &Path) -> io::Result<UnixListener> {
 /// Serialize stale-socket recovery. Only ConnectionRefused permits reclaiming
 /// an existing socket; permission failures and unrelated files are preserved.
 pub fn acquire(socket: &Path) -> Result<Bound<UnixListener>, BindError> {
+    // Before creating the directory or taking the lock: a path that cannot be
+    // bound should leave nothing behind.
+    check_path(socket).map_err(BindError::Bind)?;
     ensure_private_dir(
         socket
             .parent()
@@ -130,6 +161,68 @@ mod tests {
         p.push(format!("daemon-single-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn a_path_fits_up_to_the_limit_and_not_one_byte_more() {
+        let fits = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
+        assert_eq!(fits.len(), MAX_PATH_BYTES);
+        check_path(Path::new(&fits)).unwrap();
+
+        let error = check_path(Path::new(&format!("{fits}b"))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "{} bytes, but a Unix socket path can be at most {MAX_PATH_BYTES}",
+                MAX_PATH_BYTES + 1
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_limit_matches_this_platform_socket_address() {
+        let expected = if cfg!(any(target_os = "linux", target_os = "android")) {
+            107
+        } else {
+            103
+        };
+        assert_eq!(MAX_PATH_BYTES, expected);
+    }
+
+    #[test]
+    fn the_limit_is_the_one_the_os_enforces() {
+        let dir = temp_dir("limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("s").as_os_str().len();
+        // Pad the name so the whole path lands exactly on the limit, then one past it.
+        let at_limit = dir.join(format!("s{}", "a".repeat(MAX_PATH_BYTES - prefix)));
+        assert_eq!(at_limit.as_os_str().len(), MAX_PATH_BYTES);
+        UnixListener::bind(&at_limit).expect("the limit itself binds");
+        let past = dir.join(format!("s{}", "a".repeat(MAX_PATH_BYTES - prefix + 1)));
+        assert!(
+            UnixListener::bind(&past).is_err(),
+            "one byte past the limit must not bind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_overlong_path_is_refused_before_anything_is_created() {
+        let dir = temp_dir("overlong");
+        let sock = dir.join("a".repeat(MAX_PATH_BYTES));
+        match acquire(&sock) {
+            Err(BindError::Bind(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("at most"), "{error}");
+            }
+            other => panic!("expected a bind error, got {other:?}"),
+        }
+        assert!(
+            !dir.exists(),
+            "no directory may be created for a path that cannot bind"
+        );
     }
 
     #[test]
