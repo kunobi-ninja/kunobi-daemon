@@ -41,8 +41,10 @@ pub fn verify_process_user(pid: u32) -> io::Result<()> {
     let peer = token_user(process.0)?;
     // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
     let own = token_user(unsafe { GetCurrentProcess() })?;
-    // TOKEN_USER begins with SID_AND_ATTRIBUTES; its first member is a SID pointer.
-    // Both aligned buffers and their embedded SIDs remain alive for EqualSid.
+    // SAFETY: TOKEN_USER starts with a SID_AND_ATTRIBUTES whose first member is
+    // the SID pointer, so element 0 of each buffer is that pointer. Both
+    // buffers, and the SIDs the kernel wrote inside them, are owned locals that
+    // outlive this call. EqualSid only reads them.
     let equal = unsafe { EqualSid(peer[0] as *const c_void, own[0] as *const c_void) };
     if equal != 0 {
         Ok(())
@@ -314,7 +316,10 @@ fn token_user(process: Handle) -> io::Result<Vec<usize>> {
     }
     let token = Event(token);
     let mut needed = 0;
-    // TokenUser=1. The first call obtains the OS-owned structure's required size.
+    // SAFETY: `token` is a live token handle and TokenUser is class 1. A null
+    // buffer with length 0 is the documented size query: the call writes only
+    // through `needed` and returns FALSE with ERROR_INSUFFICIENT_BUFFER, which
+    // is the 122 checked below.
     let result = unsafe { GetTokenInformation(token.0, 1, ptr::null_mut(), 0, &mut needed) };
     if result != 0
         || io::Error::last_os_error().raw_os_error() != Some(122)
@@ -326,8 +331,11 @@ fn token_user(process: Handle) -> io::Result<Vec<usize>> {
             "cannot size peer token",
         ));
     }
-    // usize storage provides TOKEN_USER's pointer alignment, unlike Vec<u8>.
+    // A Vec<usize> gives TOKEN_USER's pointer alignment, which Vec<u8> does not.
     let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: the buffer holds at least `needed` bytes, the size the previous
+    // call asked for, and is aligned for the pointer TOKEN_USER starts with.
+    // The kernel writes at most `needed` bytes into it.
     if unsafe { GetTokenInformation(token.0, 1, buffer.as_mut_ptr().cast(), needed, &mut needed) }
         == 0
     {
@@ -391,6 +399,9 @@ fn transfer_overlapped(
     if length == 0 {
         return Ok(0);
     }
+    // SAFETY: a null security descriptor takes the default, and a null name
+    // creates an unnamed event, both documented. The manual-reset and
+    // initial-state arguments are plain booleans, so nothing is dereferenced.
     let event = Event(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) });
     if event.0.is_null() {
         return Err(io::Error::last_os_error());
@@ -404,6 +415,11 @@ fn transfer_overlapped(
         // An overlapped operation may complete inline. Ask the kernel for the
         // byte count instead of relying on `lpNumberOfBytesRead`, which must be
         // null for asynchronous handles.
+        //
+        // SAFETY: `operation` and `bytes_read` are stack locals that outlive
+        // this call, and `handle` is the one the operation was started on.
+        // `wait = 0` returns immediately rather than leaving the OVERLAPPED
+        // pending past this frame.
         let completed = unsafe { GetOverlappedResult(handle, &mut operation, &mut bytes_read, 0) };
         return if completed != 0 {
             Ok(bytes_read as usize)
@@ -594,6 +610,8 @@ pub fn process_has_exited(pid: u32) -> bool {
     // SAFETY: process is our live handle; zero timeout never blocks. Closing
     // that handle releases our reference and does not stop the process.
     let result = unsafe { WaitForSingleObject(process, 0) };
+    // SAFETY: this closes exactly the handle opened above, which nothing else
+    // owns. Releasing our reference to a process does not stop it.
     unsafe {
         CloseHandle(process);
     }

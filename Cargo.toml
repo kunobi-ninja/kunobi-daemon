@@ -41,6 +41,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "
 unsafe_code = "deny"
 missing_docs = "warn"
 
+[lints.clippy]
+# Nearly all of this crate's unsafe is FFI into Win32 and libc, where the
+# invariant lives in the platform's documentation rather than in Rust's types.
+# A block without that justification written down should fail the build.
+undocumented_unsafe_blocks = "deny"
+
 [[bench]]
 name = "control_codec"
 harness = false
