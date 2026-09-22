@@ -9,7 +9,10 @@ use std::{
     net::{Shutdown, TcpStream as StdStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -583,15 +586,20 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
     let (mut current, mut peer) = connect_sync(&root, minimum, None)?;
     let writer = Arc::new(WriterSlot::new(SocketWriter(peer.try_clone()?)));
     let pending = Arc::new(Mutex::new(BTreeSet::new()));
+    // Set before the upstream shutdown that makes the daemon close, so a
+    // downstream close can never be seen before the client EOF that caused it.
+    let client_gone = Arc::new(AtomicBool::new(false));
     let upstream = {
         let writer = Arc::clone(&writer);
         let pending = Arc::clone(&pending);
+        let client_gone = Arc::clone(&client_gone);
         let client = client.try_clone()?;
         std::thread::spawn(move || {
             let mut client = std::io::BufReader::new(client);
             loop {
                 let mut line = String::new();
                 if client.read_line(&mut line).unwrap() == 0 {
+                    client_gone.store(true, Ordering::Release);
                     writer.shutdown();
                     return;
                 }
@@ -621,7 +629,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
             writeln!(out.client, "UNCERTAIN {id}")?;
         }
         out.client.flush()?;
-        if upstream.is_finished() {
+        if client_gone.load(Ordering::Acquire) {
             writer.close();
             upstream.join().unwrap();
             return Ok(());
