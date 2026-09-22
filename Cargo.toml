@@ -1,6 +1,6 @@
 [package]
 name = "kunobi-daemon"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -14,8 +14,8 @@ categories = ["os", "asynchronous"]
 default = ["async"]
 async = ["dep:tokio", "tokio/macros"]
 wire = ["dep:buffa"]
-local = ["dep:interprocess", "dep:socket2", "dep:libc"]
-local-async = ["local", "async", "interprocess/tokio", "dep:widestring"]
+local = ["dep:interprocess", "dep:socket2", "dep:libc", "dep:widestring"]
+local-async = ["local", "async", "interprocess/tokio"]
 wire-async = ["wire", "async", "tokio/io-util"]
 # Stdio clients that may start the daemon. Off by default so a process that
 # only binds and serves does not compile spawn helpers.
