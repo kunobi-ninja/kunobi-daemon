@@ -4,119 +4,20 @@ use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use super::ConnectError;
+use super::{ConnectError, Endpoint};
 use crate::local::Duplex;
 use crate::transport::WriteHalf;
-
-/// How long to keep retrying a refused connection before giving up.
-///
-/// The app may be up while the peer is still binding, so a single attempt is
-/// too strict. "App not running at all" is detected earlier and separately from
-/// the absence of the discovery file, so this budget is only ever spent on the
-/// genuinely transient case.
-pub const CONNECT_BUDGET: Duration = Duration::from_secs(5);
-
-/// Gap between connection attempts.
-const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A Unix connection whose setup deadline is shared by its independent halves.
 pub struct UnixDuplex {
     stream: UnixStream,
     read_deadline: Cell<Option<Instant>>,
-}
-
-impl UnixDuplex {
-    /// Planned handoff tries one endpoint once; failures leave the old session
-    /// serving instead of spending the ordinary recovery retry budget.
-    pub fn connect_once(path: &Path) -> Result<Self, ConnectError> {
-        Self::connect_once_until(path, Instant::now() + CONNECT_BUDGET)
-    }
-
-    /// Make one connection attempt bounded by the caller's absolute deadline.
-    pub fn connect_once_until(path: &Path, deadline: Instant) -> Result<Self, ConnectError> {
-        let connect = || -> io::Result<UnixStream> {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-            socket.connect_timeout(&socket2::SockAddr::unix(path)?, remaining)?;
-            let fd: std::os::fd::OwnedFd = socket.into();
-            let stream = UnixStream::from(fd);
-            stream.peer_addr()?;
-            Ok(stream)
-        };
-        connect()
-            .map(|stream| Self {
-                stream,
-                read_deadline: Cell::new(None),
-            })
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    ConnectError::PermissionDenied
-                } else {
-                    ConnectError::ConnectTimeout
-                }
-            })
-    }
-    /// Connect, retrying a refused socket until the budget is spent.
-    ///
-    /// `EACCES`/`EPERM` short-circuits: a permissions failure is not going to
-    /// resolve itself by waiting, and burning five seconds before saying so
-    /// makes the diagnosis slower for no benefit.
-    pub fn connect(path: &Path) -> Result<Self, ConnectError> {
-        Self::connect_until(path, Instant::now() + CONNECT_BUDGET)
-    }
-
-    /// Retry availability under one absolute connection deadline.
-    pub fn connect_until(path: &Path, deadline: Instant) -> Result<Self, ConnectError> {
-        loop {
-            match Self::connect_once_until(path, deadline) {
-                Ok(stream) => return Ok(stream),
-                Err(ConnectError::PermissionDenied) => return Err(ConnectError::PermissionDenied),
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(
-                        RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// Reject another OS user before sending a preamble or handoff token.
-    pub fn verify_peer_user(&self) -> io::Result<()> {
-        verify_peer_user(self.stream.as_raw_fd())
-    }
-
-    /// PID of the process at the other end of this live socket.
-    ///
-    /// This is stronger than trusting the discovery file's PID: the open
-    /// connection pins the peer while the kernel reports its credentials.
-    pub fn peer_pid(&self) -> io::Result<u32> {
-        peer_pid(self.stream.as_raw_fd())
-    }
-
-    /// Arm one absolute deadline for the whole session-establishment phase.
-    pub fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
-        let deadline = timeout
-            .map(|duration| {
-                Instant::now().checked_add(duration).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "read deadline overflow")
-                })
-            })
-            .transpose()?;
-        self.stream.set_nonblocking(deadline.is_some())?;
-        self.read_deadline.set(deadline);
-        Ok(())
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -356,6 +257,61 @@ pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
 impl Duplex for UnixDuplex {
     type Reader = UnixReader;
     type Writer = UnixWriter;
+
+    /// Make one connection attempt bounded by the caller's absolute deadline.
+    fn connect_once_until(path: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
+        let connect = || -> io::Result<UnixStream> {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+            socket.connect_timeout(&socket2::SockAddr::unix(path)?, remaining)?;
+            let fd: std::os::fd::OwnedFd = socket.into();
+            let stream = UnixStream::from(fd);
+            stream.peer_addr()?;
+            Ok(stream)
+        };
+        connect()
+            .map(|stream| Self {
+                stream,
+                read_deadline: Cell::new(None),
+            })
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    ConnectError::PermissionDenied
+                } else {
+                    ConnectError::ConnectTimeout
+                }
+            })
+    }
+
+    /// Reject another OS user before sending a preamble or handoff token.
+    fn verify_peer_user(&self) -> io::Result<()> {
+        verify_peer_user(self.stream.as_raw_fd())
+    }
+
+    /// PID of the process at the other end of this live socket.
+    ///
+    /// This is stronger than trusting the discovery file's PID: the open
+    /// connection pins the peer while the kernel reports its credentials.
+    fn peer_pid(&self) -> io::Result<u32> {
+        peer_pid(self.stream.as_raw_fd())
+    }
+
+    /// Arm one absolute deadline for the whole session-establishment phase.
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let deadline = timeout
+            .map(|duration| {
+                Instant::now().checked_add(duration).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read deadline overflow")
+                })
+            })
+            .transpose()?;
+        self.stream.set_nonblocking(deadline.is_some())?;
+        self.read_deadline.set(deadline);
+        Ok(())
+    }
 
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)> {
         let deadline = self.read_deadline.get();
@@ -828,7 +784,7 @@ mod tests {
         if let Err(e) = result {
             assert_eq!(e, ConnectError::PermissionDenied);
             assert!(
-                elapsed < CONNECT_BUDGET,
+                elapsed < crate::local::CONNECT_BUDGET,
                 "permission failure burned the retry budget instead of short-circuiting"
             );
         }
