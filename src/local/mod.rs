@@ -104,6 +104,24 @@ pub enum Bound<L> {
     AlreadyRunning,
 }
 
+/// This platform's [`Duplex`].
+///
+/// Safe to name without a `cfg` because the trait fixes what both adapters
+/// offer; they cannot drift apart behind this alias.
+#[cfg(unix)]
+pub use unix::UnixDuplex as PlatformDuplex;
+/// This platform's [`Duplex`].
+#[cfg(windows)]
+pub use windows::WindowsDuplex as PlatformDuplex;
+
+// Same name, same signature on both platforms. Everything else in `unix` and
+// `windows` differs (uid and child-reaping helpers on one side, a session-end
+// handler and an inherit guard on the other) and stays behind its module.
+#[cfg(unix)]
+pub use unix::{process_has_exited, terminate_legacy_peer};
+#[cfg(windows)]
+pub use windows::{process_has_exited, terminate_legacy_peer};
+
 /// Listener ownership for this platform.
 ///
 /// Both sides now offer `acquire` under `local`, returning a blocking listener.
