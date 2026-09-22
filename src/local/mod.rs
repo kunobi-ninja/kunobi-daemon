@@ -90,6 +90,33 @@ pub trait Duplex: Sized {
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)>;
 }
 
+/// The outcome of trying to own an endpoint. Busy is ownership evidence, never
+/// application readiness proof.
+///
+/// Shared across platforms because the outcome has the same shape everywhere.
+/// `BindError` deliberately is not: a Unix socket can fail to prepare its parent
+/// directory or to unlink a proven stale inode, and a named pipe has neither.
+#[derive(Debug)]
+pub enum Bound<L> {
+    /// The caller owns this listener.
+    Won(L),
+    /// A listener or another serialized binder already owns the endpoint.
+    AlreadyRunning,
+}
+
+/// Listener ownership for this platform.
+///
+/// Both sides now offer `acquire` under `local`, returning a blocking listener.
+/// Only Windows also offers `acquire_tokio`: a named pipe needs the Tokio
+/// wrapper chosen at creation, while a Unix descriptor converts to one
+/// afterwards, so asking this crate to do it would pull `interprocess` into
+/// every Unix build to save the caller two lines.
+#[cfg(unix)]
+pub use unix_socket as socket;
+/// Listener ownership for this platform.
+#[cfg(windows)]
+pub use windows_socket as socket;
+
 /// Connection establishment failure, before application traffic is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -127,5 +154,5 @@ fn test_handshake(write: &mut impl io::Write, read: &mut impl io::Read, _: &str)
     Ok(())
 }
 
-#[cfg(all(windows, feature = "local-async"))]
+#[cfg(windows)]
 pub mod windows_socket;

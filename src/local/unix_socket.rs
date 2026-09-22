@@ -10,14 +10,7 @@ use std::{
     time::Duration,
 };
 
-/// A bind result. Busy is ownership evidence, never application readiness proof.
-#[derive(Debug)]
-pub enum Bound {
-    /// The caller owns this listener.
-    Won(UnixListener),
-    /// A listener or another serialized binder already owns the endpoint.
-    AlreadyRunning,
-}
+pub use super::Bound;
 /// Failed acquisition, preserving filesystem errors separately from contention.
 #[derive(Debug)]
 pub enum BindError {
@@ -50,7 +43,7 @@ fn bind_private(socket: &Path) -> io::Result<UnixListener> {
 }
 /// Serialize stale-socket recovery. Only ConnectionRefused permits reclaiming
 /// an existing socket; permission failures and unrelated files are preserved.
-pub fn acquire(socket: &Path) -> Result<Bound, BindError> {
+pub fn acquire(socket: &Path) -> Result<Bound<UnixListener>, BindError> {
     ensure_private_dir(
         socket
             .parent()
