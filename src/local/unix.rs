@@ -29,7 +29,10 @@ fn child_disposition(handler: usize) -> io::Result<usize> {
     unsafe extern "C" {
         fn signal(number: std::os::raw::c_int, handler: usize) -> usize;
     }
-    // POSIX SIG_DFL=0, SIG_IGN=1, SIG_ERR=-1. No callback is installed.
+    // SAFETY: every caller passes SIG_DFL (0) or SIG_IGN (1), the two
+    // dispositions POSIX defines as constants rather than addresses, so no
+    // Rust code is ever installed on a signal stack. `signal` reports failure
+    // as SIG_ERR, checked below against `usize::MAX`.
     let previous = unsafe { signal(CHILD_SIGNAL, handler) };
     if previous == usize::MAX {
         Err(io::Error::last_os_error())
@@ -81,9 +84,11 @@ fn reap_exited_children() {
     }
     // A peer can exit while SIGCHLD is temporarily default. Reap those
     // zombies after restoring SIG_IGN; subsequent exits are kernel-reaped.
-    // SAFETY: -1 selects this relay's children, a null status discards their
-    // exit codes, and WNOHANG=1 on the supported Linux and macOS targets.
     loop {
+        // SAFETY: -1 selects any child of this process. POSIX allows a null
+        // `stat_loc`, which discards the exit status rather than writing
+        // through the pointer. WNOHANG is 1 on both supported targets, so the
+        // call returns immediately instead of blocking here.
         let pid = unsafe { waitpid(-1, std::ptr::null_mut(), 1) };
         if pid > 0 {
             continue;
@@ -187,6 +192,9 @@ pub fn own_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
+    // SAFETY: geteuid takes no arguments and dereferences nothing. POSIX
+    // specifies it as always successful, so there is no error case and no
+    // errno to read afterwards.
     unsafe { geteuid() }
 }
 
