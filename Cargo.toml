@@ -40,6 +40,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
+# Kani sets cfg(kani) for its harnesses; declare it so check-cfg does not warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [lints.clippy]
 # Nearly all of this crate's unsafe is FFI into Win32 and libc, where the
