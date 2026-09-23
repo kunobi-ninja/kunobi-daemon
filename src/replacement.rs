@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 /// Whether the application permits old and new processes to coexist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Mode {
     /// Verify and select the candidate before retiring the incumbent.
     Overlap,
@@ -37,6 +38,7 @@ pub enum Step {
 
 /// Result of one adapter operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Progress {
     /// The operation completed.
     Done,
@@ -281,6 +283,85 @@ pub async fn run_async<D: AsyncDriver>(
         } else {
             let wake = tokio::time::Instant::now() + crate::readiness::POLL_INTERVAL;
             tokio::time::sleep_until(deadline.map_or(wake, |limit| limit.min(wake))).await;
+        }
+    }
+}
+
+/// Properties of the transition machine for every adapter answer, not only the
+/// sequences a test author thought of. Each one restates a promise from this
+/// module's documentation.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Long enough to reach `Complete` in either mode with a `Pending` at every
+    /// step that allows one: Recheck, Prepare, Drain, Start, Verify, Validate,
+    /// Commit and Retire, each preceded by a retry.
+    const ANSWERS: usize = 17;
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn replacement_never_claims_what_it_has_not_done() {
+        let mode: Mode = kani::any();
+        let mut machine = Machine::new(mode);
+        let mut drained = false;
+        let mut verified = false;
+        let mut validated = false;
+
+        for _ in 0..ANSWERS {
+            let step = machine.step;
+            let was_committed = machine.committed;
+            let progress: Progress = kani::any();
+            let result = machine.advance::<()>(progress);
+
+            // Selection is never withdrawn once it has been made.
+            assert!(!was_committed || machine.committed);
+
+            if progress == Progress::Done {
+                drained |= step == Step::Drain;
+                verified |= step == Step::Verify;
+                validated |= step == Step::Validate;
+            }
+
+            // Overlap keeps the incumbent serving: it never drains it.
+            if mode == Mode::Overlap {
+                assert!(machine.step != Step::Drain);
+            }
+            // Exclusive releases the incumbent before starting the candidate.
+            if mode == Mode::Exclusive && machine.step == Step::Start {
+                assert!(drained);
+            }
+            // A candidate is selected only after a live proof and revalidation.
+            if machine.committed {
+                assert!(verified && validated);
+            }
+            // The incumbent is retired only after the new selection is committed.
+            if machine.step == Step::Retire {
+                assert!(machine.committed);
+            }
+
+            match result {
+                Ok(Some(Outcome::Unchanged)) => {
+                    // "Unchanged" is only ever the answer to Recheck, before
+                    // anything was replaced.
+                    assert!(step == Step::Recheck && !machine.committed);
+                    return;
+                }
+                Ok(Some(Outcome::Complete | Outcome::RetirementPending)) => {
+                    // Success is never reported for a candidate that was not
+                    // selected.
+                    assert!(machine.committed);
+                    return;
+                }
+                Ok(None) => {}
+                Err(failure) => {
+                    // A failure after commit says so, so the caller does not
+                    // treat an authoritative selection as rolled back.
+                    assert!(failure.committed == machine.committed);
+                    assert!(failure.step == step);
+                    return;
+                }
+            }
         }
     }
 }

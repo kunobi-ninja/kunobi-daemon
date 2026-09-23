@@ -71,3 +71,24 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y clang lld
       - run: cargo install cargo-xwin --locked --version 0.23.1
       - run: cargo xwin build --locked --all-features --all-targets --target x86_64-pc-windows-msvc
+
+  # Model-checks the replacement state machine for every adapter answer, not
+  # only the sequences a test was written for. Same verifier version as kache.
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: |
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+      # A harness that stops compiling under cfg(kani) would otherwise leave
+      # this job green with nothing verified.
+      - name: Require at least one harness
+        run: |
+          cargo kani list --format json
+          count="$(python3 -c 'import json; print(json.load(open("kani-list.json"))["totals"]["standard-harnesses"])')"
+          echo "harnesses: $count"
+          test "$count" -ge 1
+      - run: cargo kani --output-format terse
