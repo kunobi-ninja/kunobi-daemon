@@ -72,8 +72,8 @@ jobs:
       - run: cargo install cargo-xwin --locked --version 0.23.1
       - run: cargo xwin build --locked --all-features --all-targets --target x86_64-pc-windows-msvc
 
-  # Model-checks the replacement state machine for every adapter answer, not
-  # only the sequences a test was written for. Same verifier version as kache.
+  # Model-checks the replacement state machine and wire negotiation for every
+  # input, not only the cases a test was written for. Same verifier as kache.
   kani:
     name: Kani proofs
     runs-on: ubuntu-latest
@@ -87,11 +87,12 @@ jobs:
       # this job green with nothing verified.
       - name: Require at least one harness
         run: |
-          cargo kani list --format json
+          cargo kani --all-features list --format json
           count="$(python3 -c 'import json; print(json.load(open("kani-list.json"))["totals"]["standard-harnesses"])')"
           echo "harnesses: $count"
           test "$count" -ge 1
-      - run: cargo kani --output-format terse
+      # All features: the wire harnesses sit behind the `wire` feature.
+      - run: cargo kani --all-features --output-format terse
 
   # Explores every interleaving of WriterSlot's Mutex/Condvar state machine.
   # Default features stay off because Tokio reacts to cfg(loom) internally.

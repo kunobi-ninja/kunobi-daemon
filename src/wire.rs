@@ -126,14 +126,59 @@ impl Hello {
             &self.instance,
         )
         .map_err(|_| invalid("invalid service identity"))?;
-        if self.minimum == 0
-            || self.minimum > self.maximum
-            || self.required & !self.supported != 0
-            || !(MIN_FRAME..=MAX_FRAME).contains(&self.max_frame)
-        {
+        if !Terms::of(self).valid() {
             return Err(invalid("invalid version or capability offer"));
         }
         Ok(())
+    }
+}
+
+/// The numeric part of an offer: what negotiation compares once both peers
+/// have shown the same service identity. Kept apart from the identity strings
+/// so the agreement rules can be model-checked for every value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+struct Terms {
+    minimum: u32,
+    maximum: u32,
+    supported: u64,
+    required: u64,
+    max_frame: u32,
+}
+
+impl Terms {
+    fn of(hello: &Hello) -> Self {
+        Self {
+            minimum: hello.minimum,
+            maximum: hello.maximum,
+            supported: hello.supported,
+            required: hello.required,
+            max_frame: hello.max_frame,
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.minimum != 0
+            && self.minimum <= self.maximum
+            && self.required & !self.supported == 0
+            && (MIN_FRAME..=MAX_FRAME).contains(&self.max_frame)
+    }
+
+    fn agree(self, remote: Self) -> io::Result<Agreement> {
+        let minimum = self.minimum.max(remote.minimum);
+        let maximum = self.maximum.min(remote.maximum);
+        if minimum > VERSION || maximum < VERSION {
+            return Err(invalid("no implemented binary version in common"));
+        }
+        let capabilities = self.supported & remote.supported;
+        if (self.required | remote.required) & !capabilities != 0 {
+            return Err(invalid("required capability unavailable"));
+        }
+        Ok(Agreement {
+            version: VERSION,
+            capabilities,
+            max_frame: self.max_frame.min(remote.max_frame),
+        })
     }
 }
 
@@ -160,20 +205,7 @@ pub fn negotiate(local: &Hello, remote: &Hello) -> io::Result<Agreement> {
     {
         return Err(invalid("service identity mismatch"));
     }
-    let minimum = local.minimum.max(remote.minimum);
-    let maximum = local.maximum.min(remote.maximum);
-    if minimum > VERSION || maximum < VERSION {
-        return Err(invalid("no implemented binary version in common"));
-    }
-    let capabilities = local.supported & remote.supported;
-    if (local.required | remote.required) & !capabilities != 0 {
-        return Err(invalid("required capability unavailable"));
-    }
-    Ok(Agreement {
-        version: VERSION,
-        capabilities,
-        max_frame: local.max_frame.min(remote.max_frame),
-    })
+    Terms::of(local).agree(Terms::of(remote))
 }
 
 fn required_capability(message: &Control) -> io::Result<u64> {
@@ -407,3 +439,46 @@ pub fn select_endpoint<'a>(legacy: &'a str, binary: Option<&'a str>) -> io::Resu
 mod asynchronous;
 #[cfg(feature = "wire-async")]
 pub use asynchronous::AsyncSession;
+
+/// Negotiation properties for every pair of valid offers.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn valid_offer() -> Terms {
+        let terms: Terms = kani::any();
+        kani::assume(terms.valid());
+        terms
+    }
+
+    /// `Agreement` says both peers calculate it independently. They must reach
+    /// the same answer, or one side sends frames or operations the other
+    /// refuses.
+    #[kani::proof]
+    fn both_peers_reach_the_same_agreement() {
+        let a = valid_offer();
+        let b = valid_offer();
+        match (a.agree(b), b.agree(a)) {
+            (Ok(x), Ok(y)) => assert!(x == y),
+            (Err(_), Err(_)) => {}
+            _ => panic!("one peer agreed and the other refused"),
+        }
+    }
+
+    /// An agreement never exceeds what either peer offered, and every required
+    /// capability is part of it.
+    #[kani::proof]
+    fn an_agreement_stays_within_both_offers() {
+        let a = valid_offer();
+        let b = valid_offer();
+        if let Ok(agreed) = a.agree(b) {
+            assert!((MIN_FRAME..=MAX_FRAME).contains(&agreed.max_frame));
+            assert!(agreed.max_frame <= a.max_frame && agreed.max_frame <= b.max_frame);
+            assert!(agreed.capabilities & !a.supported == 0);
+            assert!(agreed.capabilities & !b.supported == 0);
+            assert!((a.required | b.required) & !agreed.capabilities == 0);
+            assert!(a.minimum <= agreed.version && agreed.version <= a.maximum);
+            assert!(b.minimum <= agreed.version && agreed.version <= b.maximum);
+        }
+    }
+}
