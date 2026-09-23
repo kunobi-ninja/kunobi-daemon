@@ -3,8 +3,12 @@
 //! Transport adapters supply half-close and their own I/O deadlines. Discovery,
 //! authentication, request IDs, and protocol bootstrap remain with the caller.
 
+#[cfg(loom)]
+use loom::sync::{Condvar, Mutex};
 use std::io::{self, Read, Write};
-use std::sync::{Condvar, Mutex, TryLockError};
+use std::sync::TryLockError;
+#[cfg(not(loom))]
+use std::sync::{Condvar, Mutex};
 
 /// A transport writer that can close requests while preserving incoming replies.
 pub trait WriteHalf: Write + Send + 'static {

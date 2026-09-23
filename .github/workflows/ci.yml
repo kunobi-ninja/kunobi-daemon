@@ -92,3 +92,16 @@ jobs:
           echo "harnesses: $count"
           test "$count" -ge 1
       - run: cargo kani --output-format terse
+
+  # Explores every interleaving of WriterSlot's Mutex/Condvar state machine.
+  # Default features stay off because Tokio reacts to cfg(loom) internally.
+  loom:
+    name: Loom (WriterSlot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: cargo test --release --locked --no-default-features --test loom_writer_slot
+        env:
+          RUSTFLAGS: --cfg loom
