@@ -33,6 +33,11 @@ socket2 = { version = "0.6", optional = true }
 widestring = { version = "1.2", optional = true }
 interprocess = { version = "2.4.3", optional = true, default-features = false }
 
+[target.'cfg(loom)'.dependencies]
+# Model-checked builds only: RUSTFLAGS="--cfg loom" with --no-default-features,
+# because Tokio reacts to cfg(loom) internally.
+loom = "0.7"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
@@ -40,8 +45,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
-# Kani sets cfg(kani) for its harnesses; declare it so check-cfg does not warn.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# Kani sets cfg(kani) for its harnesses and the loom job sets cfg(loom);
+# declare both so check-cfg does not warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 
 [lints.clippy]
 # Nearly all of this crate's unsafe is FFI into Win32 and libc, where the
