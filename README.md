@@ -41,9 +41,10 @@ the same reason.
 On Windows the daemon also leaves the caller's job object when the job allows
 it. A job that forbids breakaway keeps it, and cargo's job does: a daemon
 started under cargo on Windows still dies with cargo on Ctrl-C.
-`DaemonChild::in_callers_job` reports that case. Starting the daemon from
-outside the job, through a scheduled task or a service, is the only way around
-it.
+`DaemonChild::in_callers_job` reports that case. With nested jobs the daemon
+leaves the ones that allow breakaway and stays in any enclosing job that does
+not, without that being reported. Starting the daemon from outside the job,
+through a scheduled task or a service, is the only way around it.
 
 `local::process_state` reports a PID as alive, exited or unknown, and never
 folds an access-denied query into either answer. Alive describes the PID, which

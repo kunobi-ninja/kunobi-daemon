@@ -760,12 +760,15 @@ mod tests {
         // Without an application name the loader treats the command line's
         // first token as a name to resolve: an extensionless path gets `.exe`
         // appended. Passed as the application name, the file named runs.
+        // The copies are this test binary and whoami: system tools such as
+        // PING load their messages from a .mui file named after the
+        // executable, so a renamed copy of one prints nothing.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::copy(system32("PING.EXE"), dir.path().join("daemon")).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), dir.path().join("daemon")).unwrap();
         std::fs::copy(system32("whoami.exe"), dir.path().join("daemon.exe")).unwrap();
         let out = tempfile::NamedTempFile::new().unwrap();
         let program = dir.path().join("daemon");
-        let args: Vec<std::ffi::OsString> = vec!["-n".into(), "1".into(), "127.0.0.1".into()];
+        let args: Vec<std::ffi::OsString> = vec!["--list".into()];
         let mut child = spawn(&Spawn {
             program: &program,
             args: &args,
@@ -778,7 +781,7 @@ mod tests {
         child.wait().unwrap();
         let printed = std::fs::read_to_string(out.path()).unwrap();
         assert!(
-            printed.contains("127.0.0.1"),
+            printed.contains("job_breakaway_helper: test"),
             "ran the wrong file: {printed}"
         );
     }
@@ -953,24 +956,6 @@ mod tests {
 
     #[test]
     fn a_job_that_forbids_breakaway_keeps_the_daemon_and_one_that_allows_it_does_not() {
-        // Whether this test process can leave its own jobs decides what the
-        // allowing case can show: under `cargo test` it is in cargo's job,
-        // which forbids breakaway, and a job nested inside that one cannot
-        // let a child leave it either.
-        let program = system32("cmd.exe");
-        let args: Vec<std::ffi::OsString> = vec!["/c".into(), "exit".into()];
-        let mut probe = spawn(&Spawn {
-            program: &program,
-            args: &args,
-            env: &[],
-            current_dir: None,
-            stdout: Target::Null,
-            stderr: Target::Null,
-        })
-        .unwrap();
-        let can_break_away = !probe.in_callers_job();
-        probe.wait().unwrap();
-
         let forbidding = job(false);
         let (pid, stayed) = spawn_from_inside(&forbidding);
         assert!(stayed, "a job without BREAKAWAY_OK must be reported");
@@ -979,13 +964,15 @@ mod tests {
             "the fallback daemon is not in its caller's job"
         );
 
+        // This test process may itself be in a job that forbids breakaway
+        // (cargo's, under `cargo test`), which then encloses the one made
+        // here. The daemon still leaves the job that allows it.
         let allowing = job(true);
         let (pid, stayed) = spawn_from_inside(&allowing);
-        let inside = in_job_then_stop(pid, &allowing);
-        assert_eq!(stayed, inside, "the report disagrees with IsProcessInJob");
-        assert_eq!(
-            stayed, !can_break_away,
-            "breakaway should succeed exactly when every enclosing job allows it"
+        assert!(!stayed, "a job with BREAKAWAY_OK refused breakaway");
+        assert!(
+            !in_job_then_stop(pid, &allowing),
+            "the daemon did not leave a job that allows breakaway"
         );
     }
 }

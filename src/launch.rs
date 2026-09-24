@@ -289,6 +289,11 @@ impl DaemonChild {
     /// job forbids breakaway, so it will die with the caller's job (see the
     /// job objects section of [`DaemonCommand`]). Always false on Unix, which
     /// has no job objects.
+    ///
+    /// False does not prove the daemon is in no job. With nested jobs, a job
+    /// that allows breakaway lets the daemon leave it even when an enclosing
+    /// job does not; the daemon then stays in that outer job without the
+    /// breakaway being refused.
     pub fn in_callers_job(&self) -> bool {
         #[cfg(unix)]
         {
