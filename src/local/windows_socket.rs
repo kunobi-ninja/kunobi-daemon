@@ -1,6 +1,7 @@
 //! Named-pipe ownership with an explicit local owner ACL.
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use super::Duplex;
 
@@ -35,22 +36,93 @@ fn options(name: &str) -> Result<ListenerOptions<'_>, BindError> {
         .security_descriptor(security))
 }
 
-/// Decide whether a failed bind is contention or a real error.
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Pauses between bind attempts while `ACCESS_DENIED` meets no live peer.
+///
+/// A listener that just closed can leave pipe instances in the kernel for a
+/// moment, and `FILE_FLAG_FIRST_PIPE_INSTANCE` refuses a new first instance
+/// with `ACCESS_DENIED` until they go. Retrying for about a third of a second
+/// rides that out; a denial that outlasts it is a real one.
+const CLOSING_PIPE_BACKOFF: [Duration; 4] = [
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+];
+
+/// What to do after a failed bind.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Another listener owns the endpoint.
+    Contended,
+    /// Wait this long, then try to bind again.
+    Retry(Duration),
+    /// A real error: report it.
+    Fail,
+}
+
+/// Decide what a failed bind means.
 ///
 /// `FILE_FLAG_FIRST_PIPE_INSTANCE` reports `ACCESS_DENIED` for an existing
 /// listener too, so that case is only contention once a same-user live peer
-/// answers on the endpoint.
-fn classify<L>(endpoint: &str, error: io::Error) -> Result<Bound<L>, BindError> {
-    if error.kind() == io::ErrorKind::AddrInUse || error.raw_os_error() == Some(231) {
-        return Ok(Bound::AlreadyRunning);
+/// answers on the endpoint. Without one it is usually a listener still
+/// closing, so it is retried a few times before it counts as an error.
+fn next_step(
+    kind: io::ErrorKind,
+    code: Option<i32>,
+    peer_answered: bool,
+    retries_used: usize,
+) -> Next {
+    if kind == io::ErrorKind::AddrInUse || code == Some(ERROR_PIPE_BUSY) {
+        return Next::Contended;
     }
-    if error.raw_os_error() == Some(5) {
-        return match super::windows::WindowsDuplex::connect_once(endpoint) {
-            Ok(peer) if peer.verify_peer_user().is_ok() => Ok(Bound::AlreadyRunning),
-            _ => Err(BindError::Io(error)),
+    if code != Some(ERROR_ACCESS_DENIED) {
+        return Next::Fail;
+    }
+    if peer_answered {
+        return Next::Contended;
+    }
+    CLOSING_PIPE_BACKOFF
+        .get(retries_used)
+        .map_or(Next::Fail, |pause| Next::Retry(*pause))
+}
+
+fn live_same_user_peer(endpoint: &str) -> bool {
+    matches!(
+        super::windows::WindowsDuplex::connect_once(endpoint),
+        Ok(peer) if peer.verify_peer_user().is_ok()
+    )
+}
+
+/// Run `create` until it binds, meets another owner, or fails for good.
+fn bind<L>(
+    endpoint: &str,
+    mut create: impl FnMut() -> io::Result<L>,
+) -> Result<Bound<L>, BindError> {
+    let mut retries_used = 0;
+    loop {
+        let error = match create() {
+            Ok(listener) => return Ok(Bound::Won(listener)),
+            Err(error) => error,
         };
+        let peer_answered =
+            error.raw_os_error() == Some(ERROR_ACCESS_DENIED) && live_same_user_peer(endpoint);
+        match next_step(
+            error.kind(),
+            error.raw_os_error(),
+            peer_answered,
+            retries_used,
+        ) {
+            Next::Contended => return Ok(Bound::AlreadyRunning),
+            Next::Retry(pause) => {
+                retries_used += 1;
+                std::thread::sleep(pause);
+            }
+            Next::Fail => return Err(BindError::Io(error)),
+        }
     }
-    Err(BindError::Io(error))
 }
 
 /// Bind a local pipe, blocking, as the Unix side does.
@@ -60,27 +132,111 @@ fn classify<L>(endpoint: &str, error: io::Error) -> Result<Bound<L>, BindError> 
 /// wrapper owns the handle, not in how the pipe is created.
 pub fn acquire(endpoint: &Path) -> Result<Bound<interprocess::local_socket::Listener>, BindError> {
     let endpoint = endpoint.to_string_lossy();
-    match options(&endpoint)?.create_sync() {
-        Ok(listener) => Ok(Bound::Won(listener)),
-        Err(error) => classify(&endpoint, error),
-    }
+    // Checked once so a bad name or descriptor is reported, not retried.
+    options(&endpoint)?;
+    bind(&endpoint, || match options(&endpoint) {
+        Ok(options) => options.create_sync(),
+        Err(BindError::Io(error)) => Err(error),
+    })
 }
 
 /// Bind the same pipe for a Tokio accept loop.
+///
+/// A bind that meets a listener still closing waits for it on the calling
+/// thread, for at most the few hundred milliseconds in
+/// `CLOSING_PIPE_BACKOFF`.
 #[cfg(feature = "local-async")]
 pub fn acquire_tokio(
     endpoint: &Path,
 ) -> Result<Bound<interprocess::local_socket::tokio::Listener>, BindError> {
     let endpoint = endpoint.to_string_lossy();
-    match options(&endpoint)?.create_tokio() {
-        Ok(listener) => Ok(Bound::Won(listener)),
-        Err(error) => classify(&endpoint, error),
-    }
+    options(&endpoint)?;
+    bind(&endpoint, || match options(&endpoint) {
+        Ok(options) => options.create_tokio(),
+        Err(BindError::Io(error)) => Err(error),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contention_is_reported_without_retrying() {
+        assert_eq!(
+            next_step(io::ErrorKind::AddrInUse, None, false, 0),
+            Next::Contended
+        );
+        assert_eq!(
+            next_step(io::ErrorKind::Other, Some(ERROR_PIPE_BUSY), false, 0),
+            Next::Contended
+        );
+        assert_eq!(
+            next_step(
+                io::ErrorKind::PermissionDenied,
+                Some(ERROR_ACCESS_DENIED),
+                true,
+                0
+            ),
+            Next::Contended
+        );
+    }
+
+    #[test]
+    fn a_denial_with_no_peer_is_retried_then_fails() {
+        let denied = |used| {
+            next_step(
+                io::ErrorKind::PermissionDenied,
+                Some(ERROR_ACCESS_DENIED),
+                false,
+                used,
+            )
+        };
+        for (used, pause) in CLOSING_PIPE_BACKOFF.iter().enumerate() {
+            assert_eq!(denied(used), Next::Retry(*pause));
+        }
+        assert_eq!(denied(CLOSING_PIPE_BACKOFF.len()), Next::Fail);
+    }
+
+    #[test]
+    fn other_errors_fail_at_once() {
+        assert_eq!(
+            next_step(io::ErrorKind::NotFound, Some(2), false, 0),
+            Next::Fail
+        );
+    }
+
+    #[test]
+    fn a_denial_that_clears_binds_on_a_later_attempt() {
+        let name = unique_name("closing");
+        let mut attempts = 0;
+        let bound = bind(&name, || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))
+            } else {
+                Ok("listener")
+            }
+        })
+        .unwrap();
+        assert!(matches!(bound, Bound::Won("listener")));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn a_denial_that_never_clears_is_the_original_error() {
+        let name = unique_name("denied");
+        let mut attempts = 0;
+        let result = bind::<()>(&name, || {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))
+        });
+        let Err(BindError::Io(error)) = result else {
+            panic!("a lasting denial must fail")
+        };
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED));
+        assert_eq!(attempts, CLOSING_PIPE_BACKOFF.len() + 1);
+    }
 
     fn unique_name(tag: &str) -> String {
         let unique = tempfile::tempdir().unwrap();

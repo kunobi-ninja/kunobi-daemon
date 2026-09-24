@@ -118,9 +118,28 @@ pub use windows::WindowsDuplex as PlatformDuplex;
 // `windows` differs (uid and child-reaping helpers on one side, a session-end
 // handler and an inherit guard on the other) and stays behind its module.
 #[cfg(unix)]
-pub use unix::{process_has_exited, terminate_legacy_peer};
+pub use unix::{process_has_exited, process_state, terminate_legacy_peer};
 #[cfg(windows)]
-pub use windows::{process_has_exited, terminate_legacy_peer};
+pub use windows::{process_has_exited, process_state, terminate_legacy_peer};
+
+/// What the OS can establish about a PID.
+///
+/// `Unknown` is its own state because the two useful answers need proof in
+/// opposite directions. Retiring a process's work needs proof it exited;
+/// treating it as still serving needs proof it runs. A denied or failed query
+/// proves neither, and a caller that folds it into either side eventually acts
+/// on a guess: waiting forever for a process that is gone, or starting a
+/// second owner next to one that is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    /// The process exists and has not exited.
+    Alive,
+    /// The process exited, or no process has this PID any more.
+    Exited,
+    /// The OS did not say, for example because access to the process was
+    /// denied. Neither alive nor exited can be assumed.
+    Unknown,
+}
 
 /// Listener ownership for this platform.
 ///
@@ -174,3 +193,8 @@ fn test_handshake(write: &mut impl io::Write, read: &mut impl io::Read, _: &str)
 
 #[cfg(windows)]
 pub mod windows_socket;
+
+#[cfg(any(all(windows, feature = "launch"), test))]
+pub(crate) mod command_line;
+#[cfg(all(windows, feature = "launch"))]
+pub(crate) mod windows_spawn;

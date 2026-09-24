@@ -16,7 +16,8 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
 - `wire` and `control`: Buffa Protobuf negotiation, typed health and drain replies.
 - `local` and `transport`: optional OS peer checks, setup deadlines, half-close,
   byte pumps and replaceable writers.
-- `launch`: stdio clients that may start the daemon. Off by default; needs `local`.
+- `launch`: clients that may start the daemon, including `DaemonCommand` for a
+  daemon fully detached from its caller. Off by default; needs `local`.
 - `admission` and `observation`: independent capacity pools and local telemetry data.
 
 See [Daemon lifecycle and replacement](docs/architecture.md) for the transition
@@ -26,8 +27,16 @@ The default `async` feature adds Tokio-based lifecycle and generation support.
 Blocking clients use `default-features = false`; `wire` and `local` do not create
 a runtime. `wire-async` adds the async protocol and control handler.
 `local-async` adds the Tokio Windows listener with an explicit local-owner ACL.
-`launch` is the shim-side start recipe on top of `local`. A daemon that only
+`launch` is the client-side start recipe on top of `local`. A daemon that only
 binds does not enable it.
+
+A daemon a client starts should outlive that client and not tie it up.
+`launch::DaemonCommand` starts one in a new session on Unix, so Ctrl-C in the
+caller's terminal and the terminal's hangup do not reach it. On Windows it gets
+its own hidden console and inherits only its three standard handles, so a pipe
+the caller holds, such as a build tool's output pipe, is not kept open by the
+daemon. `local::process_state` reports a PID as alive, exited or unknown, and
+never folds an access-denied query into either answer.
 
 ## Request draining
 
