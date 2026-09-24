@@ -609,12 +609,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let printed = run_to_file(&["/c", "cd"], &[], Some(dir.path()));
-        let expected = dir.path().canonicalize().unwrap();
-        let expected = expected.to_string_lossy();
-        let expected = expected.trim_start_matches(r"\\?\");
+        // cmd may print the directory with 8.3 short components (RUNNER~1),
+        // so compare the tempdir's own name, which is unique and has no
+        // short form of its own.
+        let leaf = dir.path().file_name().unwrap().to_string_lossy();
         assert!(
-            printed.trim().eq_ignore_ascii_case(expected),
-            "{printed} vs {expected}"
+            printed
+                .trim()
+                .to_ascii_lowercase()
+                .ends_with(&format!("\\{}", leaf.to_ascii_lowercase())),
+            "{printed} does not end in {leaf}"
         );
     }
 
