@@ -227,11 +227,17 @@ fn verify_peer_user(fd: RawFd) -> io::Result<()> {
 
 /// True only when the OS establishes that a previously verified PID exited.
 pub fn process_has_exited(pid: u32) -> bool {
+    process_state(pid) == super::ProcessState::Exited
+}
+
+/// What the OS establishes about `pid`: see [`super::ProcessState`].
+pub fn process_state(pid: u32) -> super::ProcessState {
+    use super::ProcessState;
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
     if pid == 0 || pid > i32::MAX as u32 {
-        return false;
+        return ProcessState::Unknown;
     }
     // A container's PID 1 may leave an exited orphan unreaped. kill(pid, 0)
     // still succeeds for that zombie, although it cannot own any more work.
@@ -240,10 +246,155 @@ pub fn process_has_exited(pid: u32) -> bool {
         stat.rsplit_once(") ")
             .is_some_and(|(_, fields)| fields.starts_with("Z ") || fields.starts_with("X "))
     }) {
-        return true;
+        return ProcessState::Exited;
     }
     // SAFETY: signal 0 checks process existence without delivering a signal.
-    (unsafe { kill(pid as i32, 0) }) != 0 && io::Error::last_os_error().raw_os_error() == Some(3)
+    if unsafe { kill(pid as i32, 0) } == 0 {
+        return ProcessState::Alive;
+    }
+    liveness_from_errno(io::Error::last_os_error().raw_os_error())
+}
+
+/// `kill(pid, 0)` failed: ESRCH means no such process, and EPERM means one
+/// exists that this user may not signal. Anything else proves nothing.
+fn liveness_from_errno(errno: Option<i32>) -> super::ProcessState {
+    use super::ProcessState;
+    const EPERM: i32 = 1;
+    const ESRCH: i32 = 3;
+    match errno {
+        Some(ESRCH) => ProcessState::Exited,
+        Some(EPERM) => ProcessState::Alive,
+        _ => ProcessState::Unknown,
+    }
+}
+
+/// Send SIGINT to every process in group `pgid`, as Ctrl-C in a terminal
+/// does to its foreground group. Test support for the launch module.
+#[cfg(all(test, feature = "launch"))]
+pub(crate) fn interrupt_process_group(pgid: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGINT: i32 = 2;
+    let pgid = i32::try_from(pgid).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: a negative PID addresses the process group; the caller passes
+    // the ID of a group it created for the test.
+    if unsafe { kill(-pgid, SIGINT) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Spawn `command` as the leader of a new session.
+///
+/// `setsid` in the child, before exec, gives it its own session and process
+/// group and no controlling terminal. So Ctrl-C in the terminal that started
+/// the caller does not reach it (SIGINT goes to the terminal's foreground
+/// process group), and neither does the hangup when that terminal closes. A
+/// new process group alone would stop the first but keep the terminal as the
+/// child's controlling terminal.
+///
+/// Every descriptor above stderr is also marked close-on-exec in the child, so
+/// the new program starts with only its standard streams. Without this a
+/// descriptor the caller left inheritable, such as a make jobserver pipe or a
+/// build tool's output pipe, stays open for the daemon's whole life, and the
+/// process waiting for its other end never sees EOF. The descriptors are
+/// marked rather than closed because the standard library reports a failed
+/// exec back to the parent through a close-on-exec pipe of its own; closing it
+/// before exec would make a missing binary look like a successful spawn.
+///
+/// Child waiting is handled as in [`spawn_with_child_waiting`].
+pub fn spawn_in_new_session(
+    command: &mut std::process::Command,
+) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    // Computed here, in the parent: getrlimit is not on the async-signal-safe
+    // list, and the child may only make such calls between fork and exec.
+    let descriptor_limit = descriptor_limit();
+    let prepare = move || {
+        // SAFETY: setsid takes no arguments and only changes the calling
+        // process's own session and process group. It cannot fail with EPERM
+        // here: a freshly forked child is never a process group leader.
+        if unsafe { libc::setsid() } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        mark_inherited_descriptors_cloexec(descriptor_limit);
+        Ok(())
+    };
+    // SAFETY: the hook runs in the forked child between fork and exec. It
+    // calls only setsid, close_range (Linux) and fcntl, which are
+    // async-signal-safe, and builds an `io::Error` from errno, which does not
+    // allocate. It touches no memory shared with the parent.
+    unsafe {
+        command.pre_exec(prepare);
+    }
+    spawn_with_child_waiting(command)
+}
+
+/// The highest descriptor number to consider, from the soft RLIMIT_NOFILE.
+///
+/// An unlimited or very large limit is capped: the fallback loop costs one
+/// system call per number, and descriptors that high are not something a
+/// caller hands to a daemon by accident.
+fn descriptor_limit() -> libc::c_int {
+    const CAP: libc::rlim_t = 1 << 16;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid output slot for getrlimit.
+    let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    let current = if known { limit.rlim_cur } else { 1024 };
+    libc::c_int::try_from(current.min(CAP)).unwrap_or(1 << 16)
+}
+
+/// A pipe with neither end close-on-exec, as a build tool's jobserver or
+/// output pipe is when it runs a compiler that starts the daemon. Test support.
+#[cfg(all(test, feature = "launch"))]
+pub(crate) fn inheritable_pipe() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element output array for pipe(2).
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: pipe succeeded, so both descriptors are open and now ours.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// Mark every descriptor from 3 up close-on-exec. Async-signal-safe.
+fn mark_inherited_descriptors_cloexec(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range with CLOSE_RANGE_CLOEXEC only sets a flag on
+        // this process's descriptors; it frees nothing. Linux 5.11 and later
+        // support it; older kernels return ENOSYS or EINVAL and the loop
+        // below does the same job.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        } == 0;
+        if done {
+            return;
+        }
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl on a number that is not an open descriptor fails with
+        // EBADF and changes nothing. FD_CLOEXEC is the only descriptor flag,
+        // so setting it outright loses nothing.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
 }
 
 /// One-time compatibility fallback for a protocol-v1 peer that cannot drain.
@@ -563,6 +714,49 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn process_state_reports_alive_exited_and_unknown() {
+        use super::super::ProcessState;
+        assert_eq!(process_state(std::process::id()), ProcessState::Alive);
+        assert_eq!(process_state(0), ProcessState::Unknown);
+        assert_eq!(process_state(u32::MAX), ProcessState::Unknown);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // Reaped, so the PID is gone (barring reuse within this test).
+        assert_eq!(process_state(pid), ProcessState::Exited);
+        assert!(process_has_exited(pid));
+    }
+
+    #[test]
+    fn a_new_session_child_leads_its_own_session_and_process_group() {
+        unsafe extern "C" {
+            fn getsid(pid: i32) -> i32;
+            fn getpgid(pid: i32) -> i32;
+        }
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let mut child = spawn_in_new_session(&mut command).unwrap();
+        let pid = child.id() as i32;
+        // SAFETY: both only read the session and group IDs of a live PID
+        // (our child, not yet waited) and of this process (0).
+        let (child_sid, child_pgid, own_sid) = unsafe { (getsid(pid), getpgid(pid), getsid(0)) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(child_sid, pid, "not a session leader");
+        assert_eq!(child_pgid, pid, "not a process group leader");
+        assert_ne!(child_sid, own_sid, "still in the caller's session");
+    }
+
+    #[test]
+    fn a_process_this_user_may_not_signal_is_alive_not_exited() {
+        use super::super::ProcessState;
+        assert_eq!(liveness_from_errno(Some(1)), ProcessState::Alive);
+        assert_eq!(liveness_from_errno(Some(3)), ProcessState::Exited);
+        assert_eq!(liveness_from_errno(Some(22)), ProcessState::Unknown);
+        assert_eq!(liveness_from_errno(None), ProcessState::Unknown);
     }
 
     fn temp_socket(name: &str) -> std::path::PathBuf {

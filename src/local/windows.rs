@@ -596,26 +596,51 @@ mod tests {
 
 /// True only when the OS establishes that a previously verified PID exited.
 pub fn process_has_exited(pid: u32) -> bool {
+    process_state(pid) == super::ProcessState::Exited
+}
+
+/// What the OS establishes about `pid`: see [`super::ProcessState`].
+///
+/// A PID that no longer exists makes `OpenProcess` fail with
+/// `ERROR_INVALID_PARAMETER`, which is proof it exited. Access denial is not:
+/// the process may be running under another user, or be an exited process
+/// object someone still holds a handle to.
+pub fn process_state(pid: u32) -> super::ProcessState {
+    use super::ProcessState;
     if pid == 0 {
-        return false;
+        return ProcessState::Unknown;
     }
     const SYNCHRONIZE: u32 = 0x00100000;
-    // SAFETY: requests only a waitable handle to the previously verified PID.
+    // SAFETY: requests only a waitable handle to the given PID.
     let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
     if process.is_null() {
-        // A nonzero PID that no longer exists yields ERROR_INVALID_PARAMETER.
-        // Access denial and other errors leave lifetime unknown.
-        return std::io::Error::last_os_error().raw_os_error() == Some(87);
+        return state_from_open_error(std::io::Error::last_os_error().raw_os_error());
     }
-    // SAFETY: process is our live handle; zero timeout never blocks. Closing
-    // that handle releases our reference and does not stop the process.
+    // SAFETY: process is our live handle; zero timeout never blocks.
     let result = unsafe { WaitForSingleObject(process, 0) };
     // SAFETY: this closes exactly the handle opened above, which nothing else
     // owns. Releasing our reference to a process does not stop it.
     unsafe {
         CloseHandle(process);
     }
-    result == 0 // WAIT_OBJECT_0: the process exited.
+    state_from_wait(result)
+}
+
+fn state_from_open_error(error: Option<i32>) -> super::ProcessState {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    if error == Some(ERROR_INVALID_PARAMETER) {
+        super::ProcessState::Exited
+    } else {
+        super::ProcessState::Unknown
+    }
+}
+
+fn state_from_wait(result: u32) -> super::ProcessState {
+    match result {
+        WAIT_OBJECT_0 => super::ProcessState::Exited,
+        WAIT_TIMEOUT => super::ProcessState::Alive,
+        _ => super::ProcessState::Unknown,
+    }
 }
 
 static SESSION_END: AtomicBool = AtomicBool::new(false);
@@ -701,9 +726,39 @@ impl Drop for StdioInheritGuard {
 
 #[cfg(test)]
 mod lifetime_tests {
+    use super::super::ProcessState;
+
     #[test]
     fn the_current_process_and_unknown_pid_are_not_retired() {
         assert!(!super::process_has_exited(std::process::id()));
         assert!(!super::process_has_exited(0));
+        assert_eq!(
+            super::process_state(std::process::id()),
+            ProcessState::Alive
+        );
+        assert_eq!(super::process_state(0), ProcessState::Unknown);
+    }
+
+    #[test]
+    fn access_denied_is_unknown_and_only_a_missing_pid_is_exited() {
+        assert_eq!(super::state_from_open_error(Some(87)), ProcessState::Exited);
+        assert_eq!(super::state_from_open_error(Some(5)), ProcessState::Unknown);
+        assert_eq!(super::state_from_open_error(None), ProcessState::Unknown);
+        assert_eq!(super::state_from_wait(0), ProcessState::Exited);
+        assert_eq!(super::state_from_wait(258), ProcessState::Alive);
+        assert_eq!(super::state_from_wait(0xFFFF_FFFF), ProcessState::Unknown);
+    }
+
+    #[test]
+    fn a_child_that_exited_reads_as_exited() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Keep the handle open while checking: an exited process object that
+        // is still referenced reads as exited through the wait, not the open.
+        child.wait().unwrap();
+        assert_eq!(super::process_state(pid), ProcessState::Exited);
     }
 }
