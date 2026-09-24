@@ -113,9 +113,23 @@ enum EnvChange {
 /// differs from `Command`'s, and batch files are refused.
 ///
 /// On Unix the child is a new session leader (`setsid`): Ctrl-C and the hangup
-/// of the caller's terminal do not reach it. On Windows it gets its own hidden
-/// console and a new process group, and inherits only its three standard
-/// handles, so no pipe the caller holds stays open because of it.
+/// of the caller's terminal do not reach it. Every descriptor above stderr is
+/// closed across the exec, so it starts with only its standard streams.
+///
+/// On Windows it gets its own hidden console and a new process group, and
+/// inherits only its three standard handles, so no pipe the caller holds stays
+/// open because of it. It is also taken out of the caller's job object when
+/// that job allows it.
+///
+/// # Job objects on Windows
+///
+/// A job can forbid its processes' children from leaving it, and cargo's does:
+/// cargo puts itself and every child in a job that kills them all when cargo
+/// is interrupted, without allowing breakaway. A daemon started under such a
+/// job stays in it and dies with the caller on Ctrl-C, whatever this builder
+/// does. [`DaemonChild::in_callers_job`] reports that case so the caller can
+/// say so. The only way out is to start the daemon from outside the job, for
+/// example through a scheduled task or a service.
 #[derive(Debug)]
 pub struct DaemonCommand {
     program: PathBuf,
@@ -156,6 +170,9 @@ impl DaemonCommand {
     }
 
     /// Set a variable in the child's environment.
+    ///
+    /// On Windows, where names are case-insensitive, a later change to `path`
+    /// replaces `Path`. That match folds ASCII letters only.
     pub fn env(&mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> &mut Self {
         self.env.push(EnvChange::Set(name.into(), value.into()));
         self
@@ -266,6 +283,21 @@ impl DaemonChild {
     /// The daemon's process ID.
     pub fn id(&self) -> u32 {
         self.inner.id()
+    }
+
+    /// True when the daemon was left in the caller's job object because that
+    /// job forbids breakaway, so it will die with the caller's job (see the
+    /// job objects section of [`DaemonCommand`]). Always false on Unix, which
+    /// has no job objects.
+    pub fn in_callers_job(&self) -> bool {
+        #[cfg(unix)]
+        {
+            false
+        }
+        #[cfg(windows)]
+        {
+            self.inner.in_callers_job()
+        }
     }
 
     /// The exit status if the daemon has exited, without blocking.
@@ -481,6 +513,52 @@ mod tests {
             crate::local::ProcessState::Alive,
             "the daemon died with its caller's process group"
         );
+    }
+
+    /// True if every write end is gone within `timeout`: a read then ends.
+    #[cfg(unix)]
+    fn reaches_eof_within(read: File, timeout: Duration) -> bool {
+        use std::io::Read;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut read = read;
+            let mut buffer = [0u8; 64];
+            while matches!(read.read(&mut buffer), Ok(n) if n > 0) {}
+            let _ = done.send(());
+        });
+        finished.recv_timeout(timeout).is_ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_does_not_keep_the_callers_pipe_open() {
+        let (read, write) = crate::local::unix::inheritable_pipe();
+        let mut child = sleeper();
+        drop(write);
+        let eof = reaches_eof_within(read, Duration::from_secs(5));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(eof, "the daemon kept the caller's pipe open");
+    }
+
+    /// The control for the test above: a plain spawn does keep the pipe open,
+    /// so a pass there is the descriptor sweep working.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_spawn_would_keep_the_callers_pipe_open() {
+        let (read, write) = crate::local::unix::inheritable_pipe();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(write);
+        let eof = reaches_eof_within(read, Duration::from_secs(1));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!eof, "a plain spawn is expected to inherit the write end");
     }
 
     #[cfg(unix)]

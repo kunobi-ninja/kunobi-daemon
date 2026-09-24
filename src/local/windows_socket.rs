@@ -142,19 +142,49 @@ pub fn acquire(endpoint: &Path) -> Result<Bound<interprocess::local_socket::List
 
 /// Bind the same pipe for a Tokio accept loop.
 ///
-/// A bind that meets a listener still closing waits for it on the calling
-/// thread, for at most the few hundred milliseconds in
-/// `CLOSING_PIPE_BACKOFF`.
+/// Async because a bind that meets a listener still closing waits for it
+/// (at most the few hundred milliseconds in `CLOSING_PIPE_BACKOFF`), and that
+/// wait must not hold a runtime worker. It needs a Tokio runtime with the time
+/// driver enabled.
 #[cfg(feature = "local-async")]
-pub fn acquire_tokio(
+pub async fn acquire_tokio(
     endpoint: &Path,
 ) -> Result<Bound<interprocess::local_socket::tokio::Listener>, BindError> {
-    let endpoint = endpoint.to_string_lossy();
+    let endpoint = endpoint.to_string_lossy().into_owned();
     options(&endpoint)?;
-    bind(&endpoint, || match options(&endpoint) {
-        Ok(options) => options.create_tokio(),
-        Err(BindError::Io(error)) => Err(error),
-    })
+    let mut retries_used = 0;
+    loop {
+        let error = match options(&endpoint) {
+            Ok(options) => match options.create_tokio() {
+                Ok(listener) => return Ok(Bound::Won(listener)),
+                Err(error) => error,
+            },
+            Err(BindError::Io(error)) => error,
+        };
+        let peer_answered = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            // The probe connects with a blocking deadline; keep it off the
+            // runtime's workers.
+            let probe = endpoint.clone();
+            tokio::task::spawn_blocking(move || live_same_user_peer(&probe))
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        match next_step(
+            error.kind(),
+            error.raw_os_error(),
+            peer_answered,
+            retries_used,
+        ) {
+            Next::Contended => return Ok(Bound::AlreadyRunning),
+            Next::Retry(pause) => {
+                retries_used += 1;
+                tokio::time::sleep(pause).await;
+            }
+            Next::Fail => return Err(BindError::Io(error)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,12 +299,15 @@ mod tests {
     async fn the_tokio_acquisition_contends_with_the_blocking_one_for_the_same_endpoint() {
         let name = unique_name("tokio-owner");
         let endpoint = Path::new(&name);
-        let Bound::Won(owner) = acquire_tokio(endpoint).unwrap() else {
+        let Bound::Won(owner) = acquire_tokio(endpoint).await.unwrap() else {
             panic!("first owner")
         };
         // Same kernel object: a blocking binder must see the Tokio owner.
         assert!(matches!(acquire(endpoint).unwrap(), Bound::AlreadyRunning));
         drop(owner);
-        assert!(matches!(acquire_tokio(endpoint).unwrap(), Bound::Won(_)));
+        assert!(matches!(
+            acquire_tokio(endpoint).await.unwrap(),
+            Bound::Won(_)
+        ));
     }
 }

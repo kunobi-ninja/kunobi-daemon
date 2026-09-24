@@ -35,8 +35,19 @@ A daemon a client starts should outlive that client and not tie it up.
 caller's terminal and the terminal's hangup do not reach it. On Windows it gets
 its own hidden console and inherits only its three standard handles, so a pipe
 the caller holds, such as a build tool's output pipe, is not kept open by the
-daemon. `local::process_state` reports a PID as alive, exited or unknown, and
-never folds an access-denied query into either answer.
+daemon. On Unix every descriptor above stderr is closed across the exec for
+the same reason.
+
+On Windows the daemon also leaves the caller's job object when the job allows
+it. A job that forbids breakaway keeps it, and cargo's job does: a daemon
+started under cargo on Windows still dies with cargo on Ctrl-C.
+`DaemonChild::in_callers_job` reports that case. Starting the daemon from
+outside the job, through a scheduled task or a service, is the only way around
+it.
+
+`local::process_state` reports a PID as alive, exited or unknown, and never
+folds an access-denied query into either answer. Alive describes the PID, which
+the OS reuses, so confirm the daemon through its endpoint before trusting it.
 
 ## Request draining
 

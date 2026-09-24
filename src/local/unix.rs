@@ -295,32 +295,106 @@ pub(crate) fn interrupt_process_group(pgid: u32) -> io::Result<()> {
 /// new process group alone would stop the first but keep the terminal as the
 /// child's controlling terminal.
 ///
+/// Every descriptor above stderr is also marked close-on-exec in the child, so
+/// the new program starts with only its standard streams. Without this a
+/// descriptor the caller left inheritable, such as a make jobserver pipe or a
+/// build tool's output pipe, stays open for the daemon's whole life, and the
+/// process waiting for its other end never sees EOF. The descriptors are
+/// marked rather than closed because the standard library reports a failed
+/// exec back to the parent through a close-on-exec pipe of its own; closing it
+/// before exec would make a missing binary look like a successful spawn.
+///
 /// Child waiting is handled as in [`spawn_with_child_waiting`].
 pub fn spawn_in_new_session(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    unsafe extern "C" {
-        fn setsid() -> i32;
-    }
-    let new_session = || {
+    // Computed here, in the parent: getrlimit is not on the async-signal-safe
+    // list, and the child may only make such calls between fork and exec.
+    let descriptor_limit = descriptor_limit();
+    let prepare = move || {
         // SAFETY: setsid takes no arguments and only changes the calling
         // process's own session and process group. It cannot fail with EPERM
         // here: a freshly forked child is never a process group leader.
-        if unsafe { setsid() } == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        if unsafe { libc::setsid() } == -1 {
+            return Err(io::Error::last_os_error());
         }
+        mark_inherited_descriptors_cloexec(descriptor_limit);
+        Ok(())
     };
     // SAFETY: the hook runs in the forked child between fork and exec. It
-    // calls only setsid, which POSIX lists as async-signal-safe, and builds an
-    // `io::Error` from errno, which does not allocate. It touches no memory
-    // shared with the parent.
+    // calls only setsid, close_range (Linux) and fcntl, which are
+    // async-signal-safe, and builds an `io::Error` from errno, which does not
+    // allocate. It touches no memory shared with the parent.
     unsafe {
-        command.pre_exec(new_session);
+        command.pre_exec(prepare);
     }
     spawn_with_child_waiting(command)
+}
+
+/// The highest descriptor number to consider, from the soft RLIMIT_NOFILE.
+///
+/// An unlimited or very large limit is capped: the fallback loop costs one
+/// system call per number, and descriptors that high are not something a
+/// caller hands to a daemon by accident.
+fn descriptor_limit() -> libc::c_int {
+    const CAP: libc::rlim_t = 1 << 16;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid output slot for getrlimit.
+    let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    let current = if known { limit.rlim_cur } else { 1024 };
+    libc::c_int::try_from(current.min(CAP)).unwrap_or(1 << 16)
+}
+
+/// A pipe with neither end close-on-exec, as a build tool's jobserver or
+/// output pipe is when it runs a compiler that starts the daemon. Test support.
+#[cfg(all(test, feature = "launch"))]
+pub(crate) fn inheritable_pipe() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element output array for pipe(2).
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: pipe succeeded, so both descriptors are open and now ours.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// Mark every descriptor from 3 up close-on-exec. Async-signal-safe.
+fn mark_inherited_descriptors_cloexec(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range with CLOSE_RANGE_CLOEXEC only sets a flag on
+        // this process's descriptors; it frees nothing. Linux 5.11 and later
+        // support it; older kernels return ENOSYS or EINVAL and the loop
+        // below does the same job.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        } == 0;
+        if done {
+            return;
+        }
+    }
+    for fd in 3..limit {
+        // SAFETY: fcntl on a number that is not an open descriptor fails with
+        // EBADF and changes nothing. FD_CLOEXEC is the only descriptor flag,
+        // so setting it outright loses nothing.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
 }
 
 /// One-time compatibility fallback for a protocol-v1 peer that cannot drain.

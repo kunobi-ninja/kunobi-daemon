@@ -127,6 +127,8 @@ const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+const ERROR_ACCESS_DENIED: i32 = 5;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -160,11 +162,16 @@ pub(crate) struct Spawn<'a> {
 pub(crate) struct WindowsChild {
     process: OwnedHandle,
     pid: u32,
+    in_callers_job: bool,
 }
 
 impl WindowsChild {
     pub(crate) fn id(&self) -> u32 {
         self.pid
+    }
+
+    pub(crate) fn in_callers_job(&self) -> bool {
+        self.in_callers_job
     }
 
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -210,6 +217,33 @@ impl WindowsChild {
     }
 }
 
+/// Refuse a program the loader would not run as named.
+///
+/// Windows strips trailing dots and spaces from a file name when it opens the
+/// file, so `run.cmd.` names `run.cmd`: such names are refused before the
+/// batch-file check, which would otherwise see no extension. Batch files run
+/// through cmd.exe with its own quoting rules, and a daemon is an executable.
+fn check_program(program: &Path) -> io::Result<()> {
+    let refuse = |message: &'static str| Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+    let Some(name) = program.file_name().map(|name| name.to_string_lossy()) else {
+        return refuse("the program has no file name");
+    };
+    if name.ends_with('.') || name.ends_with(' ') {
+        return refuse("the program's file name ends in a dot or a space");
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".bat") || lower.ends_with(".cmd") {
+        return refuse("a detached daemon must be an executable, not a batch file");
+    }
+    Ok(())
+}
+
+/// Whether a failed create was a job refusing breakaway, so it is worth
+/// trying again inside the caller's job.
+fn breakaway_refused(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+}
+
 /// Start `spec` detached from the caller.
 ///
 /// `CREATE_NO_WINDOW` gives the child its own hidden console, so console
@@ -220,16 +254,15 @@ impl WindowsChild {
 /// `SetConsoleCtrlHandler` from seeing logoff and shutdown.
 /// `CREATE_NEW_PROCESS_GROUP` keeps it out of the caller's group for
 /// `GenerateConsoleCtrlEvent`.
+///
+/// `CREATE_BREAKAWAY_FROM_JOB` takes it out of the caller's job object, if
+/// the caller is in one. A job that does not allow breakaway refuses that with
+/// `ERROR_ACCESS_DENIED`, and the child is then created once more inside the
+/// job. Cargo runs itself and every child in such a job, set to kill them all
+/// when the job's last handle closes, so a daemon started under cargo still
+/// dies with it on Ctrl-C.
 pub(crate) fn spawn(spec: &Spawn<'_>) -> io::Result<WindowsChild> {
-    let extension = spec.program.extension().map(|ext| ext.to_ascii_lowercase());
-    if matches!(extension.as_deref(), Some(ext) if ext == "bat" || ext == "cmd") {
-        // Batch files run through cmd.exe with its own quoting rules; a
-        // daemon is an executable.
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a detached daemon must be an executable, not a batch file",
-        ));
-    }
+    check_program(spec.program)?;
 
     let program: Vec<u16> = spec.program.as_os_str().encode_wide().collect();
     let args: Vec<Vec<u16>> = spec
@@ -239,6 +272,14 @@ pub(crate) fn spawn(spec: &Spawn<'_>) -> io::Result<WindowsChild> {
         .collect();
     let mut line = command_line(&program, &args)?;
     line.push(0);
+    let line = line;
+    // An absolute program is also passed as the application name, so the
+    // loader runs exactly that file instead of searching the current
+    // directory and PATH for the first token of the command line.
+    let application = spec
+        .program
+        .is_absolute()
+        .then(|| wide_nul(spec.program.as_os_str()));
 
     let inherited = std::env::vars_os()
         .map(|(name, value)| (name.encode_wide().collect(), value.encode_wide().collect()))
@@ -288,41 +329,56 @@ pub(crate) fn spawn(spec: &Spawn<'_>) -> io::Result<WindowsChild> {
         },
         attribute_list: attributes.as_ptr(),
     };
-    let mut info = ProcessInformation {
-        process: ptr::null_mut(),
-        thread: ptr::null_mut(),
-        process_id: 0,
-        thread_id: 0,
-    };
-    let flags = EXTENDED_STARTUPINFO_PRESENT
+    let base = EXTENDED_STARTUPINFO_PRESENT
         | CREATE_UNICODE_ENVIRONMENT
         | CREATE_NEW_PROCESS_GROUP
         | CREATE_NO_WINDOW;
-    // SAFETY: every pointer is valid for the duration of the call. `line` is a
-    // NUL-terminated mutable buffer, as CreateProcessW requires; `environment`
-    // is a double-NUL-terminated UTF-16 block matching
-    // CREATE_UNICODE_ENVIRONMENT; `current_dir` is NUL-terminated or null.
-    // `startup` is a STARTUPINFOEXW whose `cb` says so and whose attribute list
-    // was initialised by AttributeList and outlives this call, as do the
-    // handles it lists. `inherit_handles` must be TRUE for the list to apply,
-    // and the list limits inheritance to exactly those handles.
-    let created = unsafe {
-        CreateProcessW(
-            ptr::null(),
-            line.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            1,
-            flags,
-            environment.as_ptr().cast(),
-            current_dir.as_ref().map_or(ptr::null(), |dir| dir.as_ptr()),
-            &startup.startup_info,
-            &mut info,
-        )
+    let create = |flags: u32| -> io::Result<ProcessInformation> {
+        // CreateProcessW may write to the command line, so each attempt gets
+        // its own copy.
+        let mut line = line.clone();
+        let mut info = ProcessInformation {
+            process: ptr::null_mut(),
+            thread: ptr::null_mut(),
+            process_id: 0,
+            thread_id: 0,
+        };
+        // SAFETY: every pointer is valid for the duration of the call. `line`
+        // is a NUL-terminated mutable buffer, as CreateProcessW requires;
+        // `application` is NUL-terminated or null; `environment` is a
+        // double-NUL-terminated UTF-16 block matching
+        // CREATE_UNICODE_ENVIRONMENT; `current_dir` is NUL-terminated or null.
+        // `startup` is a STARTUPINFOEXW whose `cb` says so and whose attribute
+        // list was initialised by AttributeList and outlives this call, as do
+        // the handles it lists. `inherit_handles` must be TRUE for the list to
+        // apply, and the list limits inheritance to exactly those handles.
+        let created = unsafe {
+            CreateProcessW(
+                application
+                    .as_ref()
+                    .map_or(ptr::null(), |name| name.as_ptr()),
+                line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                flags,
+                environment.as_ptr().cast(),
+                current_dir.as_ref().map_or(ptr::null(), |dir| dir.as_ptr()),
+                &startup.startup_info,
+                &mut info,
+            )
+        };
+        if created == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(info)
+        }
     };
-    if created == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let (info, in_callers_job) = match create(base | CREATE_BREAKAWAY_FROM_JOB) {
+        Ok(info) => (info, false),
+        Err(error) if breakaway_refused(&error) => (create(base)?, true),
+        Err(error) => return Err(error),
+    };
     // SAFETY: CreateProcessW succeeded, so both handles are open and now ours.
     // The thread handle is not needed; wrapping it closes it on drop.
     let (process, _thread) = unsafe {
@@ -334,6 +390,7 @@ pub(crate) fn spawn(spec: &Spawn<'_>) -> io::Result<WindowsChild> {
     Ok(WindowsChild {
         process,
         pid: info.process_id,
+        in_callers_job,
     })
 }
 
@@ -661,10 +718,24 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_file_is_refused() {
-        let program = PathBuf::from(r"C:\tools\run.cmd");
+    fn a_batch_file_or_a_name_windows_would_rewrite_is_refused() {
+        for program in [
+            r"C:\tools\run.cmd",
+            r"C:\tools\RUN.BAT",
+            r"C:\tools\run.Cmd",
+            r"C:\tools\run.cmd.",
+            r"C:\tools\run.cmd ",
+            r"C:\tools\daemon.exe.",
+            r"C:\tools\daemon ",
+        ] {
+            let error = check_program(Path::new(program)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{program}");
+        }
+        for program in [r"C:\tools\daemon.exe", "daemon.exe", r"C:\cmd.exe"] {
+            check_program(Path::new(program)).unwrap();
+        }
         let error = match spawn(&Spawn {
-            program: &program,
+            program: Path::new(r"C:\tools\run.cmd"),
             args: &[],
             env: &[],
             current_dir: None,
@@ -675,5 +746,246 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn only_access_denied_counts_as_a_refused_breakaway() {
+        assert!(breakaway_refused(&io::Error::from_raw_os_error(5)));
+        assert!(!breakaway_refused(&io::Error::from_raw_os_error(2)));
+        assert!(!breakaway_refused(&io::Error::other("x")));
+    }
+
+    #[test]
+    fn an_absolute_program_is_run_exactly_as_named() {
+        // Without an application name the loader treats the command line's
+        // first token as a name to resolve: an extensionless path gets `.exe`
+        // appended. Passed as the application name, the file named runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(system32("PING.EXE"), dir.path().join("daemon")).unwrap();
+        std::fs::copy(system32("whoami.exe"), dir.path().join("daemon.exe")).unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let program = dir.path().join("daemon");
+        let args: Vec<std::ffi::OsString> = vec!["-n".into(), "1".into(), "127.0.0.1".into()];
+        let mut child = spawn(&Spawn {
+            program: &program,
+            args: &args,
+            env: &[],
+            current_dir: None,
+            stdout: Target::File(out.as_file()),
+            stderr: Target::Null,
+        })
+        .unwrap();
+        child.wait().unwrap();
+        let printed = std::fs::read_to_string(out.path()).unwrap();
+        assert!(
+            printed.contains("127.0.0.1"),
+            "ran the wrong file: {printed}"
+        );
+    }
+
+    // ── Job objects ─────────────────────────────────────────────────
+
+    #[repr(C)]
+    struct BasicLimits {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const SecurityAttributes, name: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            job: Handle,
+            class: i32,
+            information: *const c_void,
+            length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+    }
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    /// A job that kills its processes when this handle closes, as cargo's
+    /// does, optionally allowing breakaway.
+    fn job(allow_breakaway: bool) -> OwnedHandle {
+        // SAFETY: null attributes and name create an anonymous job.
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        assert!(!job.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: CreateJobObjectW succeeded, so the handle is open and ours.
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        // SAFETY: an all-zero ExtendedLimits is a valid "no limits" value.
+        let mut limits: ExtendedLimits = unsafe { std::mem::zeroed() };
+        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | if allow_breakaway {
+                JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            } else {
+                0
+            };
+        // SAFETY: the pointer and length describe `limits`, the structure
+        // this information class expects.
+        let set = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&raw const limits).cast(),
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            )
+        };
+        assert_ne!(set, 0, "{}", io::Error::last_os_error());
+        job
+    }
+
+    /// Run by [`a_job_that_forbids_breakaway_keeps_the_daemon_and_one_that_allows_it_does_not`]
+    /// inside a job the test made. Does nothing in a normal test run.
+    #[test]
+    #[ignore = "helper process for the job tests"]
+    fn job_breakaway_helper() {
+        let (Some(go), Some(out)) = (
+            std::env::var_os("KDAEMON_JOB_HELPER_GO"),
+            std::env::var_os("KDAEMON_JOB_HELPER_OUT"),
+        ) else {
+            return;
+        };
+        // Wait until the test has put this process in its job.
+        while !Path::new(&go).exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut command = crate::launch::DaemonCommand::new(system32("PING.EXE"));
+        command.args(ping("30"));
+        let child = command.spawn().unwrap();
+        std::fs::write(
+            &out,
+            format!("{} {}", child.id(), u8::from(child.in_callers_job())),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    /// Start the helper in `job`; return the daemon's PID and whether it
+    /// reported staying in its caller's job.
+    fn spawn_from_inside(job: &OwnedHandle) -> (u32, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (go, out) = (dir.path().join("go"), dir.path().join("out"));
+        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local::windows_spawn::tests::job_breakaway_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KDAEMON_JOB_HELPER_GO", &go)
+            .env("KDAEMON_JOB_HELPER_OUT", &out)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // SAFETY: both are open handles owned for the duration of the call.
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.as_raw_handle(), helper.as_raw_handle()) };
+        assert_ne!(assigned, 0, "{}", io::Error::last_os_error());
+        std::fs::write(&go, b"").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let reported = loop {
+            if let Ok(text) = std::fs::read_to_string(&out)
+                && let Some((pid, flag)) = text.split_once(' ')
+                && let (Ok(pid), Ok(flag)) = (pid.parse::<u32>(), flag.parse::<u8>())
+            {
+                break (pid, flag == 1);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never started the daemon"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = helper.kill();
+        let _ = helper.wait();
+        reported
+    }
+
+    /// Whether `pid` is in `job`; the process is terminated afterwards.
+    fn in_job_then_stop(pid: u32, job: &OwnedHandle) -> bool {
+        // SAFETY: requests query and terminate rights on the daemon's PID.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        assert!(!process.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: OpenProcess succeeded, so the handle is open and ours.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let mut inside = 0;
+        // SAFETY: both handles are open and `inside` is a valid output slot.
+        let asked =
+            unsafe { IsProcessInJob(process.as_raw_handle(), job.as_raw_handle(), &mut inside) };
+        assert_ne!(asked, 0, "{}", io::Error::last_os_error());
+        // SAFETY: `process` has PROCESS_TERMINATE; this stops only the daemon.
+        unsafe {
+            TerminateProcess(process.as_raw_handle(), 1);
+        }
+        inside != 0
+    }
+
+    #[test]
+    fn a_job_that_forbids_breakaway_keeps_the_daemon_and_one_that_allows_it_does_not() {
+        // Whether this test process can leave its own jobs decides what the
+        // allowing case can show: under `cargo test` it is in cargo's job,
+        // which forbids breakaway, and a job nested inside that one cannot
+        // let a child leave it either.
+        let program = system32("cmd.exe");
+        let args: Vec<std::ffi::OsString> = vec!["/c".into(), "exit".into()];
+        let mut probe = spawn(&Spawn {
+            program: &program,
+            args: &args,
+            env: &[],
+            current_dir: None,
+            stdout: Target::Null,
+            stderr: Target::Null,
+        })
+        .unwrap();
+        let can_break_away = !probe.in_callers_job();
+        probe.wait().unwrap();
+
+        let forbidding = job(false);
+        let (pid, stayed) = spawn_from_inside(&forbidding);
+        assert!(stayed, "a job without BREAKAWAY_OK must be reported");
+        assert!(
+            in_job_then_stop(pid, &forbidding),
+            "the fallback daemon is not in its caller's job"
+        );
+
+        let allowing = job(true);
+        let (pid, stayed) = spawn_from_inside(&allowing);
+        let inside = in_job_then_stop(pid, &allowing);
+        assert_eq!(stayed, inside, "the report disagrees with IsProcessInJob");
+        assert_eq!(
+            stayed, !can_break_away,
+            "breakaway should succeed exactly when every enclosing job allows it"
+        );
     }
 }
