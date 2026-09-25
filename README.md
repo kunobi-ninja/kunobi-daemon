@@ -9,6 +9,8 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
 
 - `replacement`: one transition machine for exclusive and overlapping upgrades,
   with blocking and async drivers.
+- `selection`: wait for a replacement another process drives. Reports a fresh
+  proof, an authoritative but unproven commit, or no commit.
 - `ProcessLock`, `RecordSlot` and `local::unix_socket`: persistent ownership,
   atomic publication and cleanup that preserves a successor's endpoint.
 - `Lifecycle` and `generation`: request guards, generation selection, session
