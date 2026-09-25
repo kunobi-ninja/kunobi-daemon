@@ -21,8 +21,8 @@
 //! boundary [`crate::replacement::Failure::committed`] draws for the driver.
 //!
 //! Polling is the default wait between rounds. A source that can be woken
-//! overrides [`Evidence::wait`] or [`AsyncEvidence::wait`] without changing the
-//! decision rules.
+//! overrides [`Evidence::wait`], or `AsyncEvidence::wait` with the `async`
+//! feature, without changing the decision rules.
 use std::time::{Duration, Instant};
 
 use crate::readiness::POLL_INTERVAL;

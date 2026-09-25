@@ -22,7 +22,7 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
   daemon fully detached from its caller. Off by default; needs `local`.
 - `admission` and `observation`: independent capacity pools and local telemetry data.
 
-See [Daemon lifecycle and replacement](docs/architecture.md) for the transition
+See [Daemon lifecycle and replacement](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/docs/architecture.md) for the transition
 ordering, failure boundaries and consumer responsibilities.
 
 The default `async` feature adds Tokio-based lifecycle and generation support.
@@ -119,15 +119,15 @@ warnings`, and `cargo test`. CI checks Linux, macOS, native Windows, a
 concurrent upgraders, stale replies, cancellation, multiple drain observers,
 and file ownership across real child processes.
 
-The [process handoff suite](tests/README.md) also checks that a relay keeps its
+The [process handoff suite](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/tests/README.md) also checks that a relay keeps its
 client session through replacement, preserves late replies and never replays
 an ambiguously accepted request. Run it with `cargo test --test process_handoff`.
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/LICENSE).
 
 ## Binary lifecycle protocol
 
-The optional [`wire` and `wire-async` features](docs/wire.md) provide bounded
+The optional [`wire` and `wire-async` features](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/docs/wire.md) provide bounded
 Protobuf messages and version/capability negotiation on a separate endpoint.
 Legacy clients retain their listener and message format. Both decoders feed the same lifecycle and handoff logic. A client that discovers
 a binary endpoint must not downgrade after a failed negotiation.

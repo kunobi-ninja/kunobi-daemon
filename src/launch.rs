@@ -9,9 +9,10 @@
 //!
 //! # Roles
 //!
-//! The kernel bind is the election: [`crate::local::unix_socket::acquire`] or
-//! [`crate::local::windows_socket::acquire`] returns `Won` or `AlreadyRunning`.
-//! Clients never unlink the endpoint.
+//! The kernel bind is the election: `local::unix_socket::acquire` on Unix or
+//! `local::windows_socket::acquire` on Windows returns `Won` or
+//! `AlreadyRunning`. Each module exists only on its own platform, so these are
+//! not links. Clients never unlink the endpoint.
 //!
 //! An advisory [`crate::ProcessLock`] on a sibling path is layer two. It
 //! reduces a thundering herd of client forks. If the lock and the kernel

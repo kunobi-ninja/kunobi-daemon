@@ -26,6 +26,14 @@ jobs:
       - run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      # A link to a module or item that exists only on one platform or behind a
+      # feature breaks the docs everywhere else, docs.rs (Linux) included.
+      - run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --locked --no-default-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked --all-features
       - run: cargo test --locked --no-default-features --features wire,local
       - run: cargo test --locked --no-default-features --features wire,local,launch
