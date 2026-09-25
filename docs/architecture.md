@@ -56,6 +56,17 @@ process and generation against its protocol/build policy. `readiness` bounds tha
 verifier by an absolute deadline. Blocking probes must honor their supplied budget;
 async probes are also enclosed by the timeout.
 
+A process that launches or awaits a candidate without holding the upgrade lock
+uses `selection` instead of its own loop. Each round reads the published
+selection before probing, so a probe that reached the incumbent is never paired
+with a commit that landed while it ran. A fresh accepted probe is the only way to
+report `Current`. Without one, the record decides between `Committed`, which is
+authoritative and must not be rolled back, and `NotCommitted`, which may be
+discarded. The commit budget covers startup. The proof budget starts when a
+round reads the commit and bounds the probes after it. Polling is the default
+wait between rounds; a source that can be woken replaces it without changing
+these rules.
+
 `Lifecycle` owns one irreversible admission gate. Acquire a request guard at the
 application's operation boundary and keep it until the reply has been delivered or
 the application has durably accepted responsibility for it. Start drain before
@@ -179,6 +190,7 @@ fingerprint before a recovery launch, including candidates that can die after co
 | Broker request lifecycle | Lifecycle | Define the MCP call/reply boundary |
 | Broker generation controller | Generation, replacement, retry, Candidate | Artifact validation, route preparation, reports and legacy discovery decoding |
 | Relay platform I/O | local, transport, readiness | MCP bootstrap, request correlation and replay decisions |
+| Installer activation of a launched broker | selection | Discovery decoding, runtime reports and what to do with an unproven commit |
 | Kache startup/restart | ProcessLock, replacement in exclusive mode | Build revision policy, installed service ownership and launch arguments |
 | Kache control listener | ControlService, wire, admission | Cache-instance identity, readiness after initialization and endpoint advertisement |
 | Kache request shutdown | Lifecycle | Persist accepted uploads and decide which background tasks may stop |
