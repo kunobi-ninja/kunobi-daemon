@@ -530,9 +530,12 @@ fn connect_sync(
             let address = address.trim().parse().map_err(|_| invalid())?;
             if let Ok(mut socket) = StdStream::connect_timeout(&address, Duration::from_millis(100))
             {
+                diag!("connect_sync connected to {address}");
                 socket.set_read_timeout(Some(BUDGET))?;
                 socket.set_write_timeout(Some(BUDGET))?;
-                socket.write_all(b"HEALTH\n")?;
+                let health = socket.write_all(b"HEALTH\n");
+                diag!("connect_sync HEALTH write -> {health:?}");
+                health?;
                 let mut reader = std::io::BufReader::new(socket);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok()
@@ -645,15 +648,24 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
         out.frame.clear();
         let ids = std::mem::take(&mut *out.pending.lock().unwrap());
         for id in ids {
-            writeln!(out.client, "UNCERTAIN {id}")?;
+            let r = writeln!(out.client, "UNCERTAIN {id}");
+            diag!("relay UNCERTAIN {id} -> {r:?}");
+            r?;
         }
-        out.client.flush()?;
+        let r = out.client.flush();
+        diag!("relay client flush -> {r:?}");
+        r?;
         if client_gone.load(Ordering::Acquire) {
             writer.close();
             upstream.join().unwrap();
             return Ok(());
         }
-        let (next, socket) = connect_sync(&root, minimum, Some(current.pid))?;
+        let reconnected = connect_sync(&root, minimum, Some(current.pid));
+        diag!(
+            "relay reconnect -> {:?}",
+            reconnected.as_ref().map(|(id, _)| id.pid)
+        );
+        let (next, socket) = reconnected?;
         let socket = Arc::new(socket);
         writer.replace(SocketWriter(Arc::clone(&socket)));
         std::fs::write(

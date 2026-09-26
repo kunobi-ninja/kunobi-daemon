@@ -16,13 +16,13 @@ jobs:
         shell: pwsh
         run: |
           $fails = 0
-          for ($i = 1; $i -le 60; $i++) {
+          for ($i = 1; $i -le 150; $i++) {
             $out = cargo test --locked --all-features --test process_handoff 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
               $fails++
               Write-Output "===== FAILURE on iteration $i ====="
               Write-Output $out
-              if ($fails -ge 3) { break }
+              if ($fails -ge 2) { break }
             }
           }
           Write-Output "iterations: $i failures: $fails"
