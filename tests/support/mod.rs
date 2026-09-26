@@ -493,13 +493,18 @@ async fn binary_handle(
     }
 }
 
-struct SocketWriter(StdStream);
+// Shares the relay's one socket with its reader instead of a try_clone
+// duplicate. On Windows, shutdown on the duplicate intermittently failed with
+// WSAENOTCONN while the original was connected, so the daemon never saw the
+// end of the request stream and the relay waited for it until the budget ran
+// out.
+struct SocketWriter(Arc<StdStream>);
 impl Write for SocketWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes)
+        (&*self.0).write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        (&*self.0).flush()
     }
 }
 impl WriteHalf for SocketWriter {
@@ -517,28 +522,41 @@ fn connect_sync(
     loop {
         if let Ok(address) = std::fs::read_to_string(root.join("daemon.addr")) {
             let address = address.trim().parse().map_err(|_| invalid())?;
-            if let Ok(mut socket) = StdStream::connect_timeout(&address, Duration::from_millis(100))
-            {
-                socket.set_read_timeout(Some(BUDGET))?;
-                socket.set_write_timeout(Some(BUDGET))?;
-                socket.write_all(b"HEALTH\n")?;
-                let mut reader = std::io::BufReader::new(socket);
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_ok()
-                    && let Ok(id) = identity(&line)
-                    && id.build >= minimum
-                    && previous != Some(id.pid)
-                {
-                    let socket = reader.into_inner();
-                    socket.set_read_timeout(None)?;
-                    return Ok((id, socket));
-                }
+            // Any failed attempt means "not ready yet". After a crash the
+            // record still names the dead daemon, and on Windows its port can
+            // accept a connection that is reset on the first write. Returning
+            // that error killed the relay instead of waiting for the
+            // replacement.
+            if let Ok(Some(found)) = probe_daemon(&address, minimum, previous) {
+                return Ok(found);
             }
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn probe_daemon(
+    address: &std::net::SocketAddr,
+    minimum: u64,
+    previous: Option<u32>,
+) -> io::Result<Option<(Identity, StdStream)>> {
+    let mut socket = StdStream::connect_timeout(address, Duration::from_millis(100))?;
+    socket.set_read_timeout(Some(BUDGET))?;
+    socket.set_write_timeout(Some(BUDGET))?;
+    socket.write_all(b"HEALTH\n")?;
+    let mut reader = std::io::BufReader::new(socket);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    match identity(&line) {
+        Ok(id) if id.build >= minimum && previous != Some(id.pid) => {
+            let socket = reader.into_inner();
+            socket.set_read_timeout(None)?;
+            Ok(Some((id, socket)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -583,8 +601,9 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
     )?;
     let (client, _) = listener.accept()?;
     client.set_write_timeout(Some(BUDGET))?;
-    let (mut current, mut peer) = connect_sync(&root, minimum, None)?;
-    let writer = Arc::new(WriterSlot::new(SocketWriter(peer.try_clone()?)));
+    let (mut current, peer) = connect_sync(&root, minimum, None)?;
+    let mut peer = Arc::new(peer);
+    let writer = Arc::new(WriterSlot::new(SocketWriter(Arc::clone(&peer))));
     let pending = Arc::new(Mutex::new(BTreeSet::new()));
     // Set before the upstream shutdown that makes the daemon close, so a
     // downstream close can never be seen before the client EOF that caused it.
@@ -616,7 +635,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
         frame: Vec::new(),
     };
     loop {
-        match pump_downstream(&mut peer, &mut out) {
+        match pump_downstream(&mut &*peer, &mut out) {
             PumpExit::ClientGone => {
                 writer.close();
                 return Ok(());
@@ -635,7 +654,8 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
             return Ok(());
         }
         let (next, socket) = connect_sync(&root, minimum, Some(current.pid))?;
-        writer.replace(SocketWriter(socket.try_clone()?));
+        let socket = Arc::new(socket);
+        writer.replace(SocketWriter(Arc::clone(&socket)));
         std::fs::write(
             root.join(format!(
                 "relay-{}-connected-{}",
