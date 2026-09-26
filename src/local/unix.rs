@@ -419,6 +419,11 @@ impl Duplex for UnixDuplex {
 
     /// Make one connection attempt bounded by the caller's absolute deadline.
     fn connect_once_until(path: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
+        // `SockAddr::unix` would refuse it with an invalid argument, which read
+        // as a timeout and was retried until the deadline.
+        if crate::socket_path::check_socket_path(path).is_err() {
+            return Err(ConnectError::EndpointTooLong);
+        }
         let connect = || -> io::Result<UnixStream> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -823,6 +828,22 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "connect did not respect its deadline"
+        );
+    }
+
+    #[test]
+    fn an_overlong_endpoint_fails_at_once_instead_of_timing_out() {
+        // It used to read as a timeout and be retried for the whole budget.
+        let path = std::path::PathBuf::from(format!(
+            "/{}",
+            "a".repeat(super::super::unix_socket::MAX_PATH_BYTES)
+        ));
+        let started = Instant::now();
+        let err = UnixDuplex::connect_until(&path, Instant::now() + Duration::from_secs(5));
+        assert_eq!(err.err(), Some(ConnectError::EndpointTooLong));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "it retried a path that cannot work"
         );
     }
 

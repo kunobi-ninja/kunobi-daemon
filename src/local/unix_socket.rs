@@ -23,31 +23,19 @@ pub enum BindError {
 }
 /// Longest socket path, in bytes, that fits in a Unix socket address on this
 /// platform: `sockaddr_un.sun_path` less the NUL that terminates it.
-pub const MAX_PATH_BYTES: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
-    107
-} else {
-    103
+pub const MAX_PATH_BYTES: usize = match crate::socket_path::MAX_SOCKET_PATH_BYTES {
+    Some(limit) => limit,
+    None => unreachable!(),
 };
 
 /// Fails when `socket` is too long to bind or connect to as a Unix socket.
 ///
 /// The OS reports this only as an invalid argument, naming neither the length
 /// nor the limit, and a deep application directory hits it without warning.
-/// Callers can check before creating anything, and add their own advice.
+/// Prefer [`crate::socket_path::SocketDir`], which checks a directory against
+/// every socket it will hold before any of them is created.
 pub fn check_path(socket: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = socket.as_os_str().as_bytes().len();
-    if bytes > MAX_PATH_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "socket path is {bytes} bytes, but a Unix socket path can be at most \
-                 {MAX_PATH_BYTES} on this platform: {}",
-                socket.display()
-            ),
-        ));
-    }
-    Ok(())
+    crate::socket_path::check_socket_path(socket)
 }
 fn lock_path(path: &Path) -> PathBuf {
     let mut path = path.as_os_str().to_owned();

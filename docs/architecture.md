@@ -164,6 +164,15 @@ A persistent bind lock serializes stale-socket recovery and inode-checked cleanu
 Only a refused connection to an actual socket permits reclaiming that endpoint.
 Permission errors, busy listeners and unrelated files do not authorize removal.
 
+A Unix socket path fits in 103 bytes on macOS and 107 on Linux, and the OS
+reports an overflow only as an invalid argument. `socket_path` checks it where
+it is decided rather than where it fails: `SocketName::new` is a `const fn`, so
+a bad name fails the build, and `SocketDir::new` checks a directory once
+against every socket it will hold, including names a service derives at
+runtime. `ServiceIdentity::paths` does the same for `control.sock`. Bind and
+connect check again; an endpoint too long to address fails at once with
+`ConnectError::EndpointTooLong` instead of being retried until the deadline.
+
 Use `RecordSlot` when a publication can race an older owner's cleanup. Every
 publisher and conditional remover of that slot must use it. `publish_record` is
 the lower-level atomic-write primitive for callers already holding shared ownership.

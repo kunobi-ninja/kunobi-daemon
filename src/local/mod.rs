@@ -46,13 +46,16 @@ pub trait Duplex: Sized {
 
     /// Retry availability until the deadline passes.
     ///
-    /// A denial short-circuits: permissions do not resolve by waiting, and
-    /// spending the budget first only makes the diagnosis slower.
+    /// A denial or an endpoint too long to address short-circuits: neither
+    /// resolves by waiting, and spending the budget first only makes the
+    /// diagnosis slower.
     fn connect_until(endpoint: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
         loop {
             match Self::connect_once_until(endpoint, deadline) {
                 Ok(connected) => return Ok(connected),
-                Err(ConnectError::PermissionDenied) => return Err(ConnectError::PermissionDenied),
+                Err(error @ (ConnectError::PermissionDenied | ConnectError::EndpointTooLong)) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -168,12 +171,16 @@ pub enum ConnectError {
     ConnectTimeout,
     /// The OS denied access to the endpoint.
     PermissionDenied,
+    /// The endpoint path does not fit in a Unix socket address, so no attempt
+    /// can succeed. See [`crate::socket_path`].
+    EndpointTooLong,
 }
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::ConnectTimeout => "daemon connection timed out",
             Self::PermissionDenied => "daemon endpoint permission denied",
+            Self::EndpointTooLong => "daemon endpoint path is too long for a Unix socket",
         })
     }
 }
