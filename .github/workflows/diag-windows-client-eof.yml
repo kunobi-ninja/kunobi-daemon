@@ -1,0 +1,28 @@
+# TEMPORARY diagnostic for #34. Remove before merging anything.
+name: DIAG windows client EOF
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: cargo test --locked --all-features --test process_handoff --no-run
+      - name: Repeat until failure
+        shell: pwsh
+        run: |
+          $fails = 0
+          for ($i = 1; $i -le 80; $i++) {
+            $out = cargo test --locked --all-features --test process_handoff client_eof_preserves_the_late_reply_and_closes_the_same_relay_cleanly -- --exact 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              $fails++
+              Write-Output "===== FAILURE on iteration $i ====="
+              Write-Output $out
+              if ($fails -ge 3) { break }
+            }
+          }
+          Write-Output "iterations: $i failures: $fails"

@@ -1,6 +1,7 @@
 //! Real child processes; a small test protocol supplies the application adapters.
 
 use kunobi_daemon::transport::{PumpExit, WriteHalf, WriterSlot, pump_downstream};
+macro_rules! diag { ($($a:tt)*) => { eprintln!("DIAG {} pid={} {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::process::id(), format!($($a)*)) } }
 use kunobi_daemon::{DrainOutcome, Lifecycle, ProcessLock, publish_record};
 use std::{
     collections::BTreeSet,
@@ -353,7 +354,9 @@ async fn handle(
             _ = lifecycle.draining() => return Ok(()),
             n = peer.read_line(&mut line) => n?,
         };
+        diag!("daemon read {n} bytes: {:?}", line.trim());
         if n == 0 {
+            diag!("daemon peer EOF, closing connection");
             return Ok(());
         }
         if line.trim() == "HEALTH" {
@@ -380,7 +383,9 @@ async fn handle(
             else {
                 return Ok(());
             };
-            send(&mut peer, &reply).await?;
+            let sent = send(&mut peer, &reply).await;
+            diag!("daemon sent reply {reply:?} -> {sent:?}");
+            sent?;
         }
     }
 }
@@ -504,7 +509,9 @@ impl Write for SocketWriter {
 }
 impl WriteHalf for SocketWriter {
     fn shutdown_write(&mut self) -> io::Result<()> {
-        self.0.shutdown(Shutdown::Write)
+        let result = self.0.shutdown(Shutdown::Write);
+        diag!("relay shutdown_write -> {result:?}");
+        result
     }
 }
 
@@ -598,9 +605,12 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
             let mut client = std::io::BufReader::new(client);
             loop {
                 let mut line = String::new();
-                if client.read_line(&mut line).unwrap() == 0 {
+                let read = client.read_line(&mut line);
+                diag!("relay upstream read {read:?}");
+                if read.unwrap() == 0 {
                     client_gone.store(true, Ordering::Release);
                     writer.shutdown();
+                    diag!("relay upstream: writer.shutdown() returned");
                     return;
                 }
                 let id: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -618,10 +628,14 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
     loop {
         match pump_downstream(&mut peer, &mut out) {
             PumpExit::ClientGone => {
+                diag!("relay pump exit ClientGone");
                 writer.close();
                 return Ok(());
             }
-            PumpExit::PeerClosed => {}
+            PumpExit::PeerClosed => diag!(
+                "relay pump exit PeerClosed; client_gone={}",
+                client_gone.load(Ordering::Acquire)
+            ),
         }
         out.frame.clear();
         let ids = std::mem::take(&mut *out.pending.lock().unwrap());
