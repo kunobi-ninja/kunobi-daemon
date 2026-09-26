@@ -181,6 +181,8 @@ mod tests {
     use super::*;
 
     const DAEMON: SocketName = SocketName::new("daemon.sock");
+    // Only the Unix tests reach the limit it overflows.
+    #[cfg(unix)]
     const CONTROL: SocketName = SocketName::new("daemon.control.v2.sock");
 
     #[test]
