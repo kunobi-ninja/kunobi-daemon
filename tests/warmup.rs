@@ -55,23 +55,30 @@ fn spawn_requires_a_successful_exit() {
 #[cfg(unix)]
 #[test]
 fn warm_spawn_uses_the_warmup_argv_and_does_not_run_discovery() {
+    // The shim records which path it took. Timing cannot tell: macOS checks a
+    // newly written executable on its first run, which alone took 0.2-2.3s here.
     let dir = tempfile::tempdir().unwrap();
     let shim = dir.path().join("shim.sh");
+    let discovery = dir.path().join("ran-discovery");
     std::fs::write(
         &shim,
-        "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\nsleep 30\nexit 1\n",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\ntouch '{}'\nsleep 30\nexit 1\n",
+            discovery.display()
+        ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(&shim).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim, perms).unwrap();
-    let started = Instant::now();
-    warm_spawn(&shim, &["--warmup"]).unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "warmup ran the shim's long path"
-    );
+    kunobi_daemon::warm_spawn_until(
+        &shim,
+        &["--warmup"],
+        Instant::now() + Duration::from_secs(20),
+    )
+    .unwrap();
+    assert!(!discovery.exists(), "warmup ran the shim's long path");
 }
 
 #[cfg(unix)]
