@@ -65,11 +65,7 @@ impl SocketName {
             bytes.len() <= MAX_NAME_BYTES,
             "socket name is longer than MAX_NAME_BYTES"
         );
-        assert!(
-            !(bytes.len() == 1 && bytes[0] == b'.')
-                && !(bytes.len() == 2 && bytes[0] == b'.' && bytes[1] == b'.'),
-            "socket name is `.` or `..`"
-        );
+        assert!(!matches!(bytes, b"." | b".."), "socket name is `.` or `..`");
         let mut index = 0;
         while index < bytes.len() {
             let byte = bytes[index];
