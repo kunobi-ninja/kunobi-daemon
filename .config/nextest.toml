@@ -1,0 +1,6 @@
+[profile.default]
+# A test that fails and then passes on retry is reported FLAKY and fails the
+# run. Retries name the flaky test instead of hiding it.
+retries = 2
+flaky-result = "fail"
+fail-fast = false

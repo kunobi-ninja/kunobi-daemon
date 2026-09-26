@@ -1,0 +1,10 @@
+[tools]
+# The test runner. nextest runs every test in its own process, so process-wide
+# state (inherited descriptors, signal dispositions, spawned children) cannot
+# leak from one test into another the way it does between libtest's threads.
+#
+# The exact pin is load-bearing: this repo cuts several tag series
+# (cargo-nextest-*, nextest-runner-*, nextest-filtering-*) and the runner tags
+# sort newest, so a floating version resolves to the wrong artifact. The
+# version is the full tag.
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.140"

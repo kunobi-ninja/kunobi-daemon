@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      # Installs the tools pinned in mise.toml (cargo-nextest).
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       # A link to a module or item that exists only on one platform or behind a
@@ -34,11 +36,15 @@ jobs:
       - run: cargo doc --locked --no-default-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo test --locked --all-features
-      - run: cargo test --locked --no-default-features --features wire,local
-      - run: cargo test --locked --no-default-features --features wire,local,launch
-      - run: cargo test --locked --no-default-features --features wire
-      - run: cargo test --locked --no-default-features
+      # One process per test (see .config/nextest.toml): process-wide state
+      # cannot leak between tests, and a flaky test fails the run by name.
+      - run: cargo nextest run --locked --all-features
+      - run: cargo nextest run --locked --no-default-features --features wire,local
+      - run: cargo nextest run --locked --no-default-features --features wire,local,launch
+      - run: cargo nextest run --locked --no-default-features --features wire
+      - run: cargo nextest run --locked --no-default-features
+      # nextest does not run doctests.
+      - run: cargo test --locked --all-features --doc
       - run: cargo run --locked --no-default-features --features wire --example application_messages
       - run: cargo package --locked
 
