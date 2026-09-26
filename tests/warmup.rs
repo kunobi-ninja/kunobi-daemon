@@ -1,6 +1,8 @@
 //! Prefault and bounded spawn do not take daemon locks.
 use kunobi_daemon::{warm_executable, warm_spawn};
 use std::io;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 #[test]
 fn prefault_reads_an_existing_file_and_rejects_missing_paths() {
@@ -48,6 +50,28 @@ fn spawn_requires_a_successful_exit() {
     )
     .unwrap_err();
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_spawn_uses_the_warmup_argv_and_does_not_run_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let shim = dir.path().join("shim.sh");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nif [ \"$1\" = \"--warmup\" ]; then exit 0; fi\nsleep 30\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim, perms).unwrap();
+    let started = Instant::now();
+    warm_spawn(&shim, &["--warmup"]).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "warmup ran the shim's long path"
+    );
 }
 
 #[cfg(unix)]

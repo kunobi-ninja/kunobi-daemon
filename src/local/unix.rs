@@ -993,4 +993,23 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn a_live_endpoint_connect_once_does_not_retry_sleep() {
+        use super::super::{Duplex, RETRY_INTERVAL};
+
+        let path = temp_socket("live-once");
+        let listener = UnixListener::bind(&path).unwrap();
+        let accept = std::thread::spawn(move || listener.accept());
+        let started = std::time::Instant::now();
+        let duplex = UnixDuplex::connect_once(&path).expect("live endpoint");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < RETRY_INTERVAL,
+            "live connect inserted a retry sleep: {elapsed:?}"
+        );
+        drop(duplex);
+        let _ = accept.join();
+        let _ = std::fs::remove_file(&path);
+    }
 }
