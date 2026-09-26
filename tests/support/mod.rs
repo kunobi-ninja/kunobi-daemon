@@ -498,13 +498,17 @@ async fn binary_handle(
     }
 }
 
-struct SocketWriter(StdStream);
+// Shares the relay's one socket with its reader instead of a duplicate from
+// try_clone. On Windows, shutdown on a duplicated socket intermittently fails
+// with WSAENOTCONN while the original is connected, so the daemon never saw
+// the end of the request stream and the relay waited for it forever.
+struct SocketWriter(Arc<StdStream>);
 impl Write for SocketWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes)
+        (&*self.0).write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        (&*self.0).flush()
     }
 }
 impl WriteHalf for SocketWriter {
@@ -590,8 +594,9 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
     )?;
     let (client, _) = listener.accept()?;
     client.set_write_timeout(Some(BUDGET))?;
-    let (mut current, mut peer) = connect_sync(&root, minimum, None)?;
-    let writer = Arc::new(WriterSlot::new(SocketWriter(peer.try_clone()?)));
+    let (mut current, peer) = connect_sync(&root, minimum, None)?;
+    let mut peer = Arc::new(peer);
+    let writer = Arc::new(WriterSlot::new(SocketWriter(Arc::clone(&peer))));
     let pending = Arc::new(Mutex::new(BTreeSet::new()));
     // Set before the upstream shutdown that makes the daemon close, so a
     // downstream close can never be seen before the client EOF that caused it.
@@ -626,7 +631,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
         frame: Vec::new(),
     };
     loop {
-        match pump_downstream(&mut peer, &mut out) {
+        match pump_downstream(&mut &*peer, &mut out) {
             PumpExit::ClientGone => {
                 diag!("relay pump exit ClientGone");
                 writer.close();
@@ -649,7 +654,8 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
             return Ok(());
         }
         let (next, socket) = connect_sync(&root, minimum, Some(current.pid))?;
-        writer.replace(SocketWriter(socket.try_clone()?));
+        let socket = Arc::new(socket);
+        writer.replace(SocketWriter(Arc::clone(&socket)));
         std::fs::write(
             root.join(format!(
                 "relay-{}-connected-{}",
