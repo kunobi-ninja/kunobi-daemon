@@ -31,13 +31,14 @@ pub mod readiness;
 pub mod replacement;
 pub mod retry;
 pub mod selection;
+pub mod socket_path;
 pub mod transport;
 pub mod warmup;
 pub use warmup::{warm_executable, warm_spawn, warm_spawn_until};
 #[cfg(feature = "async")]
 mod upgrade;
 
-pub use identity::{ServiceIdentity, ServicePaths};
+pub use identity::{CONTROL_SOCKET, ServiceIdentity, ServicePaths};
 #[cfg(feature = "async")]
 pub use lifecycle::{DrainOutcome, Lifecycle, LifecycleSnapshot, RequestGuard};
 pub use ownership::ProcessLock;

@@ -1,4 +1,5 @@
 //! Stable identity and resource paths for independent daemon installations.
+use crate::socket_path::{SocketDir, SocketName};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -83,17 +84,23 @@ impl ServiceIdentity {
     /// The caller secures the root and creates these directories. Prefixes avoid
     /// Windows device names; distinct components cannot alias through separators.
     /// No version is included, so an upgrader finds its predecessor's resources.
-    /// Keep the root short enough for the OS socket-path limit.
-    pub fn paths(&self, user_root: impl AsRef<Path>) -> ServicePaths {
-        ServicePaths {
-            directory: user_root
-                .as_ref()
-                .join(format!("service-{:032x}", u128::from_be_bytes(self.id)))
-                .join(format!("profile-{}", self.profile))
-                .join(format!("instance-{}", self.instance)),
-        }
+    ///
+    /// Fails when the directory leaves no room for [`ServicePaths::control_socket`]
+    /// in a Unix socket address; the error says how long it may be. Check the
+    /// application's own sockets with [`ServicePaths::sockets`].
+    pub fn paths(&self, user_root: impl AsRef<Path>) -> io::Result<ServicePaths> {
+        let directory = user_root
+            .as_ref()
+            .join(format!("service-{:032x}", u128::from_be_bytes(self.id)))
+            .join(format!("profile-{}", self.profile))
+            .join(format!("instance-{}", self.instance));
+        SocketDir::new(&directory, &[CONTROL_SOCKET])?;
+        Ok(ServicePaths { directory })
     }
 }
+
+/// The file name of [`ServicePaths::control_socket`].
+pub const CONTROL_SOCKET: SocketName = SocketName::new("control.sock");
 
 /// Conventional resource paths for one service identity under a per-user root.
 ///
@@ -122,8 +129,18 @@ impl ServicePaths {
     pub fn discovery(&self) -> PathBuf {
         self.directory.join("discovery")
     }
-    /// Protobuf control endpoint for Unix-domain socket consumers.
+    /// Protobuf control endpoint for Unix-domain socket consumers. Fits a Unix
+    /// socket address: [`ServiceIdentity::paths`] checked it.
     pub fn control_socket(&self) -> PathBuf {
-        self.directory.join("control.sock")
+        self.directory.join(CONTROL_SOCKET.as_str())
+    }
+    /// The service directory checked against the application's own sockets,
+    /// together with [`CONTROL_SOCKET`]. Declare every socket the service binds
+    /// here, including the longest name it derives at runtime.
+    pub fn sockets(&self, names: &[SocketName]) -> io::Result<SocketDir> {
+        let mut all = Vec::with_capacity(names.len() + 1);
+        all.push(CONTROL_SOCKET);
+        all.extend_from_slice(names);
+        SocketDir::new(&self.directory, &all)
     }
 }

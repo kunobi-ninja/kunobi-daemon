@@ -1,13 +1,25 @@
 //! Service installations cannot share resources accidentally.
-use kunobi_daemon::{ProcessLock, ServiceIdentity, publish_record};
+use kunobi_daemon::{
+    ProcessLock, ServiceIdentity, publish_record,
+    socket_path::{MAX_SOCKET_PATH_BYTES, SocketName},
+};
 
 fn identity(id: u8, profile: &str, instance: &str) -> ServiceIdentity {
     ServiceIdentity::new([id; 16], "example.service", profile, instance).unwrap()
 }
 
+/// A root short enough for a Unix socket address. The platform temp directory
+/// is not: on macOS it alone is about 50 bytes.
+fn short_root() -> tempfile::TempDir {
+    #[cfg(unix)]
+    return tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    #[cfg(not(unix))]
+    return tempfile::tempdir().unwrap();
+}
+
 #[test]
 fn service_uuids_profiles_instances_and_users_have_disjoint_resources() {
-    let root = tempfile::tempdir().unwrap();
+    let root = short_root();
     let identities = [
         identity(1, "stable", "default"),
         identity(2, "stable", "default"),
@@ -17,7 +29,7 @@ fn service_uuids_profiles_instances_and_users_have_disjoint_resources() {
     let mut guards = Vec::new();
     let mut all_paths = std::collections::HashSet::new();
     for (index, identity) in identities.iter().enumerate() {
-        let paths = identity.paths(root.path());
+        let paths = identity.paths(root.path()).unwrap();
         std::fs::create_dir_all(paths.directory()).unwrap();
         for path in [
             paths.ownership_lock(),
@@ -38,10 +50,10 @@ fn service_uuids_profiles_instances_and_users_have_disjoint_resources() {
                 .unwrap(),
         );
         publish_record(&paths.discovery(), &[index as u8]).unwrap();
-        assert_ne!(paths, identity.paths(root.path().join("other-user")));
+        assert_ne!(paths, identity.paths("/tmp/u2").unwrap());
     }
     for (index, identity) in identities.iter().enumerate() {
-        let paths = identity.paths(root.path());
+        let paths = identity.paths(root.path()).unwrap();
         assert_eq!(std::fs::read(paths.discovery()).unwrap(), [index as u8]);
         assert!(
             ProcessLock::try_acquire(paths.ownership_lock())
@@ -57,7 +69,7 @@ fn service_uuids_profiles_instances_and_users_have_disjoint_resources() {
     drop(guards);
     for identity in &identities {
         assert!(
-            ProcessLock::try_acquire(identity.paths(root.path()).ownership_lock())
+            ProcessLock::try_acquire(identity.paths(root.path()).unwrap().ownership_lock())
                 .unwrap()
                 .is_some()
         );
@@ -99,7 +111,7 @@ fn invalid_or_ambiguous_identity_components_cannot_escape_the_user_root() {
     assert!(ServiceIdentity::new([0; 16], "app", "stable", "default").is_err());
     assert!(ServiceIdentity::new([1; 16], "a".repeat(65), "stable", "default").is_err());
     assert!(ServiceIdentity::new([1; 16], "a".repeat(64), "stable", "default").is_ok());
-    let windows_names = identity(1, "con", "nul").paths("root");
+    let windows_names = identity(1, "con", "nul").paths("root").unwrap();
     assert_eq!(
         windows_names.directory().file_name().unwrap(),
         "instance-nul"
@@ -111,9 +123,42 @@ fn upgrades_reuse_the_same_identity_and_lock_paths() {
     let old_build = identity(1, "stable", "default");
     let new_build = identity(1, "stable", "default");
     assert_eq!(old_build, new_build);
-    assert_eq!(old_build.paths("root"), new_build.paths("root"));
+    assert_eq!(
+        old_build.paths("root").unwrap(),
+        new_build.paths("root").unwrap()
+    );
     assert_eq!(old_build.id(), &[1; 16]);
     assert_eq!(old_build.application(), "example.service");
     assert_eq!(old_build.profile(), "stable");
     assert_eq!(old_build.instance(), "default");
+}
+
+#[test]
+fn a_root_too_deep_for_the_control_socket_is_refused_with_its_budget() {
+    let Some(limit) = MAX_SOCKET_PATH_BYTES else {
+        return;
+    };
+    let identity = identity(1, "stable", "default");
+    let deep = format!("/{}", "r".repeat(limit));
+    let error = identity.paths(&deep).unwrap_err().to_string();
+    assert!(error.contains("control.sock"), "{error}");
+    assert!(error.contains("can be at most"), "{error}");
+}
+
+#[test]
+fn the_applications_sockets_are_checked_with_the_control_socket() {
+    const DAEMON: SocketName = SocketName::new("daemon.sock");
+    const LONG: SocketName = SocketName::new("a-socket-name-long-enough-to-overflow-it.sock");
+    let identity = identity(1, "stable", "default");
+    let paths = identity.paths("/tmp/r").unwrap();
+    let sockets = paths.sockets(&[DAEMON]).unwrap();
+    assert_eq!(
+        sockets.path(DAEMON).unwrap(),
+        paths.directory().join("daemon.sock")
+    );
+    if MAX_SOCKET_PATH_BYTES.is_some() {
+        // control.sock fits this directory; this name does not.
+        let error = paths.sockets(&[DAEMON, LONG]).unwrap_err().to_string();
+        assert!(error.contains(LONG.as_str()), "{error}");
+    }
 }

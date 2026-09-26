@@ -10,7 +10,7 @@ The format is experimental until the first consumer release.
 
 Generate a UUID once per service and keep it in the application's package.
 `ServiceIdentity::new` takes its 16 bytes, an application name, a profile and an
-instance. Use the same identity for `identity.paths(private_user_root)` and
+instance. Use the same identity for `identity.paths(private_user_root)?` and
 `Hello::new(&identity, supported, required)`. The UUID, name, profile and instance
 must all match during negotiation. A mismatch closes the connection before any
 application operation is dispatched. Nil or incorrectly sized UUIDs are invalid.
