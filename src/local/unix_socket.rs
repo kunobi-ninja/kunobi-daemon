@@ -259,16 +259,21 @@ mod tests {
         // the path exists so `bind` fails, but nothing is listening so no client
         // can ever connect.
         let dir = temp_dir("stale");
-        // Under the lock: a directory created while a sibling test holds a
-        // narrowed umask comes out 0o600 and is untraversable.
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("b.sock");
 
-        // Bind then drop the listener WITHOUT unlinking - exactly what a killed
-        // process leaves behind.
+        // Leave a socket inode that nothing listens on, as a killed process
+        // does. Bind without listen: a child spawned concurrently by another
+        // test inherits every descriptor this process holds until it execs or
+        // exits, and a listening socket it held would accept the probe below,
+        // so the test failed intermittently with AlreadyRunning. A socket that
+        // never listened refuses a connection whoever holds it.
         {
-            let l = UnixListener::bind(&sock).unwrap();
-            drop(l);
+            let never_listened =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            never_listened
+                .bind(&socket2::SockAddr::unix(&sock).unwrap())
+                .unwrap();
         }
         assert!(sock.exists(), "fixture should leave the inode behind");
 
@@ -309,8 +314,6 @@ mod tests {
     fn a_regular_file_at_the_socket_path_is_preserved() {
         // An unrelated regular file must survive a failed acquisition.
         let dir = temp_dir("regular");
-        // Under the lock: a directory created while a sibling test holds a
-        // narrowed umask comes out 0o600 and is untraversable.
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("b.sock");
         let mut f = std::fs::File::create(&sock).unwrap();
@@ -344,8 +347,6 @@ mod tests {
         // created by an older build - or by a user - would keep its permissions
         // and never be checked.
         let dir = temp_dir("dirperms");
-        // Under the lock: a directory created while a sibling test holds a
-        // narrowed umask comes out 0o600 and is untraversable.
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -366,8 +367,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let dir = temp_dir("herd");
-        // Under the lock: a directory created while a sibling test holds a
-        // narrowed umask comes out 0o600 and is untraversable.
         std::fs::create_dir_all(&dir).unwrap();
         let sock = Arc::new(dir.join("b.sock"));
 
