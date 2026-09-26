@@ -528,31 +528,42 @@ fn connect_sync(
     loop {
         if let Ok(address) = std::fs::read_to_string(root.join("daemon.addr")) {
             let address = address.trim().parse().map_err(|_| invalid())?;
-            if let Ok(mut socket) = StdStream::connect_timeout(&address, Duration::from_millis(100))
-            {
-                diag!("connect_sync connected to {address}");
-                socket.set_read_timeout(Some(BUDGET))?;
-                socket.set_write_timeout(Some(BUDGET))?;
-                let health = socket.write_all(b"HEALTH\n");
-                diag!("connect_sync HEALTH write -> {health:?}");
-                health?;
-                let mut reader = std::io::BufReader::new(socket);
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_ok()
-                    && let Ok(id) = identity(&line)
-                    && id.build >= minimum
-                    && previous != Some(id.pid)
-                {
-                    let socket = reader.into_inner();
-                    socket.set_read_timeout(None)?;
-                    return Ok((id, socket));
-                }
+            // Any failed attempt is "not ready yet". After a crash the record
+            // still names the dead daemon, and on Windows its port can accept
+            // a connection that is reset on the first write; propagating that
+            // killed the relay instead of waiting for the replacement.
+            match probe_daemon(&address, minimum, previous) {
+                Ok(Some(found)) => return Ok(found),
+                Ok(None) => {}
+                Err(error) => diag!("connect_sync attempt failed: {error:?}"),
             }
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn probe_daemon(
+    address: &std::net::SocketAddr,
+    minimum: u64,
+    previous: Option<u32>,
+) -> io::Result<Option<(Identity, StdStream)>> {
+    let mut socket = StdStream::connect_timeout(address, Duration::from_millis(100))?;
+    socket.set_read_timeout(Some(BUDGET))?;
+    socket.set_write_timeout(Some(BUDGET))?;
+    socket.write_all(b"HEALTH\n")?;
+    let mut reader = std::io::BufReader::new(socket);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    match identity(&line) {
+        Ok(id) if id.build >= minimum && previous != Some(id.pid) => {
+            let socket = reader.into_inner();
+            socket.set_read_timeout(None)?;
+            Ok(Some((id, socket)))
+        }
+        _ => Ok(None),
     }
 }
 
