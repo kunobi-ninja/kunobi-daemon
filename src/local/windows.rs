@@ -502,6 +502,41 @@ mod tests {
     use crate::local::test_handshake as handshake;
 
     #[test]
+    fn shutdown_write_tells_the_server_no_more_requests_are_coming() {
+        // WriteHalf promises to close the sending direction while replies still
+        // arrive. A relay relies on it so its peer learns that no more requests
+        // will come; without it both ends wait for each other.
+        let endpoint = format!("daemon-transport-half-close-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(endpoint.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .unwrap();
+        let (ended_tx, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut peer = listener.accept().unwrap();
+            let mut requests = Vec::new();
+            let read = peer.read_to_end(&mut requests).map(|_| requests);
+            let _ = ended_tx.send(read);
+            let _ = peer.write_all(b"reply\n");
+        });
+        let transport = WindowsDuplex::connect(&endpoint).unwrap();
+        let (mut read, mut write) = transport.split().unwrap();
+        write.write_all(b"request\n").unwrap();
+        write.shutdown_write().unwrap();
+        let requests = ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the server never saw the end of the requests")
+            .unwrap();
+        assert_eq!(requests, b"request\n");
+        let mut reply = [0; 6];
+        read.read_exact(&mut reply).unwrap();
+        assert_eq!(
+            &reply, b"reply\n",
+            "replies must still arrive after the half-close"
+        );
+    }
+
+    #[test]
     fn setup_write_deadline_bounds_a_nonreading_named_pipe() {
         let endpoint = format!("daemon-transport-write-deadline-{}", std::process::id());
         let listener = ListenerOptions::new()
