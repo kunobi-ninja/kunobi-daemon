@@ -45,7 +45,11 @@ pub const MAX_NAME_BYTES: usize = 48;
 /// A socket file name, checked when it is constructed.
 ///
 /// [`SocketName::new`] is a `const fn` that panics on an empty name, `.` or
-/// `..`, a path separator or NUL, or a name longer than [`MAX_NAME_BYTES`].
+/// `..`, a path separator, `:` or NUL, or a name longer than
+/// [`MAX_NAME_BYTES`]. Windows reads a leading `c:` as a drive, so joining such
+/// a name to a directory would replace the directory, and a later `:` names an
+/// alternate data stream.
+///
 /// Declared as a `const`, a bad name fails the build:
 ///
 /// ```compile_fail
@@ -70,8 +74,8 @@ impl SocketName {
         while index < bytes.len() {
             let byte = bytes[index];
             assert!(
-                byte != b'/' && byte != b'\\' && byte != 0,
-                "socket name contains a path separator or NUL"
+                byte != b'/' && byte != b'\\' && byte != b':' && byte != 0,
+                "socket name contains a path separator, `:` or NUL"
             );
             index += 1;
         }
@@ -266,15 +270,10 @@ mod properties {
         }
     }
 
-    /// Names that follow the documented rules, including `:`, spaces and
-    /// dots, which are ordinary file name characters.
+    /// Names that follow the documented rules, including spaces and dots,
+    /// which are ordinary file name characters.
     fn valid_name() -> impl Strategy<Value = String> {
-        prop_oneof![
-            4 => "[a-zA-Z0-9._ :-]{1,48}",
-            // A drive letter and colon, which Windows paths read as a prefix.
-            1 => "[a-zA-Z]:[a-z.]{0,6}",
-        ]
-        .prop_filter("`.` and `..` are not names", |name| {
+        "[a-zA-Z0-9._ -]{1,48}".prop_filter("`.` and `..` are not names", |name| {
             name != "." && name != ".."
         })
     }
@@ -284,6 +283,8 @@ mod properties {
             3 => valid_name(),
             // Separators, NUL and dots.
             1 => "[a-z./\\\\\\x00]{0,4}",
+            // A drive letter and colon, which Windows paths read as a prefix.
+            1 => "[a-zA-Z]:[a-z.]{0,6}",
             1 => "\\PC{0,64}",
             1 => "[a-z]{40,60}",
         ]
@@ -303,7 +304,7 @@ mod properties {
                 && name.len() <= MAX_NAME_BYTES
                 && name != "."
                 && name != ".."
-                && !name.contains(['/', '\\', '\0']);
+                && !name.contains(['/', '\\', ':', '\0']);
             let name: &'static str = name.leak();
             prop_assert_eq!(std::panic::catch_unwind(|| SocketName::new(name)).is_ok(), allowed);
         }
@@ -366,7 +367,9 @@ mod properties {
                     prop_assert_eq!(path_bytes(&path), MAX_SOCKET_PATH_BYTES.unwrap());
                 }
             }
-            prop_assert!(SocketDir::new(format!("{dir}d"), &names).is_err());
+            // Not `format!("{dir}d")`: the proptest! macro hides `dir` from
+            // an inline format argument.
+            prop_assert!(SocketDir::new(dir.clone() + "d", &names).is_err());
         }
     }
 }
