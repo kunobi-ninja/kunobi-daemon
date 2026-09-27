@@ -53,7 +53,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 }
 fn bind_private(socket: &Path) -> io::Result<UnixListener> {
     // The 0700 parent excludes other users during bind; never alter global umask.
-    let listener = super::unix::without_spawns(|| UnixListener::bind(socket))?;
+    let listener = crate::spawn_lock::without_spawns(|| UnixListener::bind(socket))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -67,11 +67,11 @@ fn bind_private(socket: &Path) -> io::Result<UnixListener> {
 /// keeps accepting for the child's whole life, after the returned listener is
 /// dropped or this process exits, so a successor gets `AlreadyRunning`.
 ///
-/// Spawns through [`super::unix::spawn_with_child_waiting`], and the `launch`
-/// spawns built on it, wait while the socket is created. Other spawns,
-/// including [`crate::warmup`]'s, can still capture it. A process that spawns
-/// that way while it may be binding should have each child close, or mark
-/// close-on-exec, every descriptor above stderr before it execs.
+/// Every spawn this crate makes waits while the socket is created:
+/// [`super::unix::spawn_with_child_waiting`], the `launch` spawns built on it,
+/// and [`crate::warmup`]. Other spawns can still capture it. A process that
+/// spawns another way while it may be binding should have each child close,
+/// or mark close-on-exec, every descriptor above stderr before it execs.
 pub fn acquire(socket: &Path) -> Result<Bound<UnixListener>, BindError> {
     // Before creating the directory or taking the lock: a path that cannot be
     // bound should leave nothing behind.

@@ -53,9 +53,6 @@ pub fn restore_child_waiting() -> io::Result<()> {
     child_disposition(0).map(|_| ())
 }
 
-/// Held by every spawn in this module, and by [`without_spawns`].
-static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Spawn with normal child waiting, then restore the relay's reaping policy.
 ///
 /// Rust may wait for a failed exec's child inside `Command::spawn`. Ignoring
@@ -70,7 +67,7 @@ pub fn spawn_with_child_waiting(
 ) -> io::Result<std::process::Child> {
     // Signal dispositions are process-wide. Serialize relay launches until
     // both the previous policy and any exits during this window are handled.
-    let _spawn = SPAWN.lock().unwrap_or_else(|error| error.into_inner());
+    let _spawn = crate::spawn_lock::spawning();
     let previous = child_disposition(0)?;
     let child = command.spawn();
     child_disposition(previous)?;
@@ -78,19 +75,6 @@ pub fn spawn_with_child_waiting(
         reap_exited_children();
     }
     child
-}
-
-/// Run `create` while no spawn through [`spawn_with_child_waiting`] is under way.
-///
-/// Where the OS has no `SOCK_CLOEXEC`, as on macOS, the standard library
-/// creates a socket and then marks it close-on-exec. A child spawned between
-/// the two keeps the socket for its whole life, and a listener it keeps goes
-/// on accepting after its owner closes it. Linux creates the socket
-/// close-on-exec in one step, so nothing is held there.
-pub(crate) fn without_spawns<T>(create: impl FnOnce() -> T) -> T {
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _spawn = SPAWN.lock().unwrap_or_else(|error| error.into_inner());
-    create()
 }
 
 fn reap_exited_children() {

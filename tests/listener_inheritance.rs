@@ -26,8 +26,9 @@ const BINDERS: usize = 4;
 const MAX_BINDS: usize = 100_000;
 /// On Linux a spawn can return just before the child closes its close-on-exec
 /// descriptors. A listener still accepting this long after it was dropped is
-/// held by a running child, which sleeps far longer than this.
-const SETTLE: Duration = Duration::from_millis(500);
+/// held by a running child, which sleeps far longer than this. Generous, so a
+/// stalled runner cannot pass for a leak.
+const SETTLE: Duration = Duration::from_secs(5);
 const PROBE_INTERVAL: Duration = Duration::from_millis(20);
 
 type Spawn = fn(&mut Command) -> io::Result<Child>;
@@ -130,6 +131,11 @@ fn bind_and_drop(socket: &Path, race: &Race) -> Result<usize, String> {
             }
         }
         std::fs::remove_file(socket).map_err(|error| format!("bind {binds}: unlink: {error}"))?;
+    }
+    if !race.over.load(SeqCst) {
+        return Err(format!(
+            "stopped after {binds} binds, before the spawns ended, so the rest ran without this binder"
+        ));
     }
     Ok(binds)
 }

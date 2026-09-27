@@ -32,6 +32,7 @@ pub mod replacement;
 pub mod retry;
 pub mod selection;
 pub mod socket_path;
+mod spawn_lock;
 pub mod transport;
 pub mod warmup;
 pub use warmup::{warm_executable, warm_spawn, warm_spawn_until};
