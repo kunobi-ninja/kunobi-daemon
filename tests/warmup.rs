@@ -83,14 +83,46 @@ fn warm_spawn_uses_the_warmup_argv_and_does_not_run_discovery() {
 
 #[cfg(unix)]
 #[test]
-fn a_stuck_spawn_is_killed_at_the_deadline() {
-    use kunobi_daemon::warm_spawn_until;
-    use std::time::{Duration, Instant};
-    let error = warm_spawn_until(
-        std::path::Path::new("/bin/sleep"),
-        &["30"],
-        Instant::now() + Duration::from_millis(80),
+fn a_child_still_running_at_the_deadline_is_left_to_finish() {
+    // The child stands in for macOS's first-run check of a new executable,
+    // which can outlast the budget. Killing it would throw that work away.
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let go = dir.path().join("go");
+    let done = dir.path().join("done");
+    for fifo in [&go, &done] {
+        let made = std::process::Command::new("mkfifo").arg(fifo).status();
+        assert!(made.unwrap().success());
+    }
+    let shim = dir.path().join("shim.sh");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nread line < \"$1\"\necho finished > \"$2\"\n",
     )
-    .unwrap_err();
+    .unwrap();
+    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim, perms).unwrap();
+
+    // The child cannot exit before it is released, so the budget runs out.
+    let error = kunobi_daemon::warm_spawn_until(&shim, &[&go, &done], Instant::now()).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+    // Release it and read what it writes. A killed child never opens `go`,
+    // so this thread would block and the receive below would fail.
+    let (report, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut release = std::fs::OpenOptions::new().write(true).open(&go).unwrap();
+        release.write_all(b"go\n").unwrap();
+        drop(release);
+        let mut out = String::new();
+        std::fs::File::open(&done)
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let _ = report.send(out);
+    });
+    let out = finished.recv_timeout(Duration::from_secs(30));
+    assert_eq!(out.as_deref(), Ok("finished\n"), "the child was killed");
 }
