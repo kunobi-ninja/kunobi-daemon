@@ -129,11 +129,10 @@ CI regenerates the Rust schema and compares golden message bodies against the
 independent `protoc` encoder. Tests cover UUID/profile/instance mismatch, resource
 isolation and application operation 1 coexisting with lifecycle operation 1.
 
-`cargo bench --features wire --bench control_codec` measures Protobuf control
-messages with reusable output buffers. It reports p50/p95 of batch means after
-warmup, not per-request latency percentiles. It does not measure socket latency,
-allocations or complete upgrade time, or claim superiority over other codecs.
-No timing threshold runs on shared CI.
+The [benchmarks](benchmarks.md) count the instructions for the handshake and
+for sending and receiving each kind of `Control` message over an in-memory
+transport. CI fails a pull request that grows any of them by more than 5%. They
+do not measure socket latency or complete upgrade time.
 
 Regenerate the schemas with `cargo run --locked --manifest-path tools/proto-gen/Cargo.toml`.
 The generator requires `protoc`; normal builds do not. Check freshness with the

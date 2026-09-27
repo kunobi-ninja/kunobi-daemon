@@ -1,0 +1,50 @@
+# Instruction-count benchmarks for kunobi-daemon. See docs/benchmarks.md.
+#
+# A separate package, not a dev-dependency of the crate: Gungraun needs Linux
+# and Valgrind, and keeping it here leaves the library's lockfile, MSRV job,
+# Windows builds and cargo-deny graph untouched.
+[package]
+name = "kunobi-daemon-benches"
+version = "0.0.0"
+edition = "2024"
+# Same floor as the crate, so the lockfile resolves for every toolchain CI uses.
+rust-version = "1.89"
+publish = false
+
+[workspace]
+
+[lib]
+path = "support.rs"
+# Fixtures only. libtest would reject the Gungraun arguments that
+# `cargo bench -- ...` passes to every target.
+bench = false
+test = false
+doctest = false
+
+[dependencies]
+kunobi-daemon = { path = "..", features = ["wire-async"] }
+# Builds golden frames in setup code, outside the measured region. Same exact
+# version as the crate, so both sides encode identically.
+buffa = { version = "=0.9.2", default-features = false, features = ["std"] }
+# The runner binary must be the same version. CI installs the version this
+# lockfile resolves.
+gungraun = "=0.20.0"
+
+[[bench]]
+name = "transport"
+path = "transport.rs"
+harness = false
+
+[[bench]]
+name = "wire"
+path = "wire.rs"
+harness = false
+
+[[bench]]
+name = "startup"
+path = "startup.rs"
+harness = false
+
+[profile.bench]
+# Symbols let callgrind_annotate attribute instructions to source lines.
+debug = true
