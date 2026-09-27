@@ -42,6 +42,7 @@ interprocess = { version = "2.4.3", optional = true, default-features = false }
 loom = "0.7"
 
 [dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 

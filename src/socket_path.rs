@@ -45,7 +45,11 @@ pub const MAX_NAME_BYTES: usize = 48;
 /// A socket file name, checked when it is constructed.
 ///
 /// [`SocketName::new`] is a `const fn` that panics on an empty name, `.` or
-/// `..`, a path separator or NUL, or a name longer than [`MAX_NAME_BYTES`].
+/// `..`, a path separator, `:` or NUL, or a name longer than
+/// [`MAX_NAME_BYTES`]. Windows reads a leading `c:` as a drive, so joining such
+/// a name to a directory would replace the directory, and a later `:` names an
+/// alternate data stream.
+///
 /// Declared as a `const`, a bad name fails the build:
 ///
 /// ```compile_fail
@@ -70,8 +74,8 @@ impl SocketName {
         while index < bytes.len() {
             let byte = bytes[index];
             assert!(
-                byte != b'/' && byte != b'\\' && byte != 0,
-                "socket name contains a path separator or NUL"
+                byte != b'/' && byte != b'\\' && byte != b':' && byte != 0,
+                "socket name contains a path separator, `:` or NUL"
             );
             index += 1;
         }
@@ -247,6 +251,125 @@ mod tests {
         } else {
             assert!(check_socket_path(Path::new(&"a".repeat(4096))).is_ok());
             assert_eq!(max_dir_bytes(&[DAEMON]), None);
+        }
+    }
+}
+
+/// Name and directory rules over generated names and directories.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+    use std::ffi::OsStr;
+
+    fn config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    /// Names that follow the documented rules, including spaces and dots,
+    /// which are ordinary file name characters.
+    fn valid_name() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9._ -]{1,48}".prop_filter("`.` and `..` are not names", |name| {
+            name != "." && name != ".."
+        })
+    }
+
+    fn any_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => valid_name(),
+            // Separators, NUL and dots.
+            1 => "[a-z./\\\\\\x00]{0,4}",
+            // A drive letter and colon, which Windows paths read as a prefix.
+            1 => "[a-zA-Z]:[a-z.]{0,6}",
+            1 => "\\PC{0,64}",
+            1 => "[a-z]{40,60}",
+        ]
+    }
+
+    /// Leaked, because a name is `&'static str`; a few hundred short strings.
+    fn declare(name: String) -> SocketName {
+        SocketName::new(name.leak())
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn a_name_is_accepted_exactly_when_the_rules_allow_it(name in any_name()) {
+            let allowed = !name.is_empty()
+                && name.len() <= MAX_NAME_BYTES
+                && name != "."
+                && name != ".."
+                && !name.contains(['/', '\\', ':', '\0']);
+            let name: &'static str = name.leak();
+            prop_assert_eq!(std::panic::catch_unwind(|| SocketName::new(name)).is_ok(), allowed);
+        }
+
+        #[test]
+        fn a_socket_path_is_its_name_directly_inside_the_directory(
+            dir in "(/[a-z0-9-]{1,8}){1,3}",
+            name in valid_name(),
+        ) {
+            let name = declare(name);
+            // Short enough for every platform's limit.
+            let socket_dir = SocketDir::new(&dir, &[name]).unwrap();
+            let path = socket_dir.path(name).unwrap();
+            prop_assert_eq!(path.parent(), Some(Path::new(&dir)), "{:?}", path);
+            prop_assert_eq!(path.file_name(), Some(OsStr::new(name.as_str())), "{:?}", path);
+        }
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn a_directory_fits_exactly_when_it_is_within_the_budget(
+            names in proptest::collection::vec(valid_name(), 1..4),
+            undeclared in valid_name(),
+            dir in "(/[a-z0-9-]{1,16}){1,10}",
+        ) {
+            let limit = MAX_SOCKET_PATH_BYTES.unwrap();
+            let names: Vec<SocketName> = names.into_iter().map(declare).collect();
+            let budget = max_dir_bytes(&names).unwrap();
+            let checked = SocketDir::new(&dir, &names);
+            prop_assert_eq!(checked.is_ok(), dir.len() <= budget);
+            if let Ok(checked) = checked {
+                for &name in &names {
+                    prop_assert!(checked.path(name).is_ok(), "declared {:?} does not fit", name);
+                }
+                // A name that was not declared is checked on its own.
+                let undeclared = declare(undeclared);
+                prop_assert_eq!(
+                    checked.path(undeclared).is_ok(),
+                    dir.len() + 1 + undeclared.as_str().len() <= limit
+                );
+            }
+        }
+
+        #[test]
+        fn a_directory_at_the_budget_fits_and_one_byte_more_does_not(
+            names in proptest::collection::vec(valid_name(), 1..4),
+        ) {
+            let names: Vec<SocketName> = names.into_iter().map(declare).collect();
+            let budget = max_dir_bytes(&names).unwrap();
+            let dir = format!("/{}", "d".repeat(budget - 1));
+            let longest = names.iter().map(|name| name.as_str().len()).max().unwrap();
+            let fits = SocketDir::new(&dir, &names).unwrap();
+            for &name in &names {
+                let path = fits.path(name).unwrap();
+                prop_assert!(path_bytes(&path) <= MAX_SOCKET_PATH_BYTES.unwrap());
+                if name.as_str().len() == longest {
+                    prop_assert_eq!(path_bytes(&path), MAX_SOCKET_PATH_BYTES.unwrap());
+                }
+            }
+            // Not `format!("{dir}d")`: the proptest! macro hides `dir` from
+            // an inline format argument.
+            prop_assert!(SocketDir::new(dir.clone() + "d", &names).is_err());
         }
     }
 }

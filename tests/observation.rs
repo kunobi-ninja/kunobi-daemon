@@ -211,3 +211,260 @@ async fn async_pending_io_and_cancellation_remain_observable_until_transport_dro
     assert_eq!(observations.snapshot().read.pending, 0);
     assert_eq!(observations.snapshot().connections, 0);
 }
+
+/// Admission and observation counters against plain models, over generated
+/// operation sequences.
+mod properties {
+    use super::*;
+    use kunobi_daemon::{
+        admission::{Permit, PoolSnapshot},
+        observation::Direction,
+    };
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+
+    fn config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    const POOLS: [Pool; 3] = [Pool::Handshake, Pool::Application, Pool::Control];
+
+    #[derive(Clone, Debug)]
+    enum AdmissionOp {
+        Acquire(usize),
+        /// Drop one held permit of the pool, if any.
+        Release(usize, usize),
+    }
+
+    fn admission_op() -> impl Strategy<Value = AdmissionOp> {
+        prop_oneof![
+            2 => (0usize..3).prop_map(AdmissionOp::Acquire),
+            1 => (0usize..3, any::<usize>())
+                .prop_map(|(pool, index)| AdmissionOp::Release(pool, index)),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum QueueOp {
+        Record(Event),
+        Take,
+    }
+
+    fn queue_op() -> impl Strategy<Value = QueueOp> {
+        let event = proptest::sample::select(vec![
+            Event::Rejected,
+            Event::DrainStarted,
+            Event::DrainCompleted,
+            Event::HandoffStarted,
+        ]);
+        prop_oneof![3 => event.prop_map(QueueOp::Record), 1 => Just(QueueOp::Take)]
+    }
+
+    /// A byte count the transport accepts, or the error it fails with.
+    fn outcome() -> impl Strategy<Value = Result<usize, io::ErrorKind>> {
+        prop_oneof![
+            3 => (0usize..64).prop_map(Ok),
+            1 => proptest::sample::select(vec![
+                io::ErrorKind::Interrupted,
+                io::ErrorKind::WouldBlock,
+                io::ErrorKind::BrokenPipe,
+                io::ErrorKind::ConnectionReset,
+                io::ErrorKind::TimedOut,
+            ])
+            .prop_map(Err),
+        ]
+    }
+
+    /// Answers each call from a script; more calls than scripted see EOF.
+    struct Scripted {
+        reads: VecDeque<Result<usize, io::ErrorKind>>,
+        writes: VecDeque<Result<usize, io::ErrorKind>>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.reads.pop_front().unwrap_or(Ok(0))?;
+            let n = n.min(buf.len());
+            buf[..n].fill(7);
+            Ok(n)
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.writes.pop_front().unwrap_or(Ok(0))?;
+            Ok(n.min(buf.len()))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What the wrapper must count for a script: bytes moved, and failures
+    /// other than the retryable Interrupted and WouldBlock.
+    fn expected(
+        script: &[Result<usize, io::ErrorKind>],
+        buffer: usize,
+    ) -> (u64, Vec<io::ErrorKind>) {
+        let bytes = script.iter().flatten().map(|&n| n.min(buffer) as u64).sum();
+        let failures = script
+            .iter()
+            .filter_map(|outcome| outcome.err())
+            .filter(|kind| !matches!(kind, io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock))
+            .collect();
+        (bytes, failures)
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn each_pool_admits_up_to_its_own_limit_and_counts_every_refusal(
+            limits in [0usize..4, 0usize..4, 0usize..4],
+            ops in proptest::collection::vec(admission_op(), 0..64),
+        ) {
+            let admission = Arc::new(Admission::new(Limits {
+                handshakes: limits[0],
+                application: limits[1],
+                control: limits[2],
+            }));
+            let mut held: [Vec<Permit>; 3] = Default::default();
+            let mut rejected = [0u64; 3];
+            for op in ops {
+                match op {
+                    AdmissionOp::Acquire(pool) => match admission.try_acquire(POOLS[pool]) {
+                        Some(permit) => {
+                            prop_assert!(held[pool].len() < limits[pool]);
+                            held[pool].push(permit);
+                        }
+                        None => {
+                            prop_assert_eq!(held[pool].len(), limits[pool]);
+                            rejected[pool] += 1;
+                        }
+                    },
+                    AdmissionOp::Release(pool, index) => {
+                        if !held[pool].is_empty() {
+                            let index = index % held[pool].len();
+                            drop(held[pool].swap_remove(index));
+                        }
+                    }
+                }
+                for (index, pool) in POOLS.into_iter().enumerate() {
+                    prop_assert_eq!(
+                        admission.snapshot(pool),
+                        PoolSnapshot {
+                            limit: limits[index],
+                            active: held[index].len(),
+                            rejected: rejected[index],
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_event_queue_keeps_the_first_events_up_to_capacity_and_counts_the_rest(
+            capacity in 0usize..5,
+            ops in proptest::collection::vec(queue_op(), 0..48),
+        ) {
+            let observations = Observations::new(capacity);
+            let mut queued = Vec::new();
+            let mut lost = 0;
+            for op in ops {
+                match op {
+                    QueueOp::Record(event) => {
+                        observations.record(event);
+                        // Zero capacity disables recording; nothing counts as lost.
+                        if capacity > 0 {
+                            if queued.len() < capacity {
+                                queued.push(event);
+                            } else {
+                                lost += 1;
+                            }
+                        }
+                    }
+                    QueueOp::Take => {
+                        let taken = observations.take_events();
+                        prop_assert!(
+                            taken.windows(2).all(|pair| pair[0].elapsed <= pair[1].elapsed)
+                        );
+                        let taken: Vec<Event> =
+                            taken.into_iter().map(|timed| timed.event).collect();
+                        prop_assert_eq!(taken, std::mem::take(&mut queued));
+                    }
+                }
+                prop_assert_eq!(observations.snapshot().lost_events, lost);
+            }
+        }
+
+        #[test]
+        fn observed_io_passes_results_through_and_counts_exactly_what_moved(
+            reads in proptest::collection::vec(outcome(), 0..16),
+            writes in proptest::collection::vec(outcome(), 0..16),
+        ) {
+            const BUFFER: usize = 32;
+            let observations = Arc::new(Observations::new(256));
+            let mut observed = ObservedIo::new(
+                Scripted {
+                    reads: reads.iter().copied().collect(),
+                    writes: writes.iter().copied().collect(),
+                },
+                Arc::clone(&observations),
+            );
+            let mut buffer = [0; BUFFER];
+            for scripted in &reads {
+                let result = observed.read(&mut buffer).map_err(|error| error.kind());
+                prop_assert_eq!(result, scripted.map(|n| n.min(BUFFER)));
+            }
+            for scripted in &writes {
+                let result = observed.write(&buffer).map_err(|error| error.kind());
+                prop_assert_eq!(result, scripted.map(|n| n.min(BUFFER)));
+            }
+
+            let (read_bytes, read_failures) = expected(&reads, BUFFER);
+            let (write_bytes, write_failures) = expected(&writes, BUFFER);
+            let snapshot = observations.snapshot();
+            prop_assert_eq!(snapshot.connections, 1);
+            for (progress, bytes, failures) in [
+                (snapshot.read, read_bytes, &read_failures),
+                (snapshot.write, write_bytes, &write_failures),
+            ] {
+                prop_assert_eq!(progress.bytes, bytes);
+                prop_assert_eq!(progress.errors, failures.len() as u64);
+                prop_assert_eq!(progress.pending, 0);
+                prop_assert_eq!(progress.busy_for, None);
+                prop_assert_eq!(progress.since_progress.is_some(), bytes > 0);
+            }
+
+            drop(observed);
+            prop_assert_eq!(observations.snapshot().connections, 0);
+            let events: Vec<Event> = observations
+                .take_events()
+                .into_iter()
+                .map(|timed| timed.event)
+                .collect();
+            let failed = |direction: Direction| -> Vec<io::ErrorKind> {
+                events
+                    .iter()
+                    .filter_map(|event| match *event {
+                        Event::IoFailed { direction: seen, kind } if seen == direction => {
+                            Some(kind)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            prop_assert_eq!(failed(Direction::Read), read_failures);
+            prop_assert_eq!(failed(Direction::Write), write_failures);
+            // The first empty read reports the close; later ones do not repeat it.
+            let closes = events.iter().filter(|event| **event == Event::ReadClosed).count();
+            prop_assert_eq!(closes, usize::from(reads.contains(&Ok(0))));
+            prop_assert_eq!(events.first(), Some(&Event::Connected));
+            prop_assert_eq!(events.last(), Some(&Event::Disconnected));
+        }
+    }
+}

@@ -283,3 +283,79 @@ mod proofs {
         }
     }
 }
+
+/// The promises of the Kani harness above, which explores six rounds of
+/// durations under 8 ms, over long budgets and many rounds.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn budget() -> impl Strategy<Value = Duration> {
+        prop_oneof![
+            Just(Duration::ZERO),
+            (0u64..10_000_000).prop_map(Duration::from_micros)
+        ]
+    }
+
+    /// Mostly short steps, so a wait often runs for many rounds.
+    fn step() -> impl Strategy<Value = Duration> {
+        prop_oneof![
+            4 => (0u64..200_000).prop_map(Duration::from_micros),
+            1 => (0u64..5_000_000).prop_map(Duration::from_micros),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn an_observer_never_claims_what_its_evidence_does_not_show(
+            commit in budget(),
+            proof in budget(),
+            rounds in proptest::collection::vec(
+                (step(), any::<bool>(), step(), any::<bool>()),
+                1..128,
+            ),
+        ) {
+            let budget = Budget { commit, proof };
+            let mut watch = Watch::new(budget);
+            let mut elapsed = Duration::ZERO;
+            let mut seen_commit = false;
+
+            for (before_read, committed, probing, proven) in rounds {
+                elapsed += before_read;
+                watch.record(elapsed, committed);
+                seen_commit |= committed;
+                if committed {
+                    prop_assert!(watch.until() <= elapsed + budget.proof);
+                }
+                elapsed += probing;
+                let decision = watch.decide(elapsed, proven);
+
+                prop_assert_eq!(decision == Decision::Current, proven);
+                if decision == Decision::Committed {
+                    prop_assert!(seen_commit && !proven);
+                }
+                if decision == Decision::NotCommitted {
+                    prop_assert!(!seen_commit && elapsed >= budget.commit);
+                }
+                if elapsed >= budget.commit {
+                    prop_assert_ne!(decision, Decision::Wait);
+                }
+                if let Some(at) = watch.committed_at
+                    && elapsed >= at + budget.proof
+                {
+                    prop_assert_ne!(decision, Decision::Wait);
+                }
+                if decision != Decision::Wait {
+                    break;
+                }
+            }
+        }
+    }
+}
