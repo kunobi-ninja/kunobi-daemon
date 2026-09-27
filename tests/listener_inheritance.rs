@@ -39,6 +39,11 @@ fn a_child_spawned_by_the_crate_never_keeps_a_dropped_listener() {
 
 /// Stands for a spawn the crate does not own, such as the application's own.
 #[test]
+#[cfg_attr(
+    target_vendor = "apple",
+    ignore = "macOS creates a socket, then marks it close-on-exec; only the \
+              crate's own spawns wait for that"
+)]
 fn a_child_spawned_elsewhere_never_keeps_a_dropped_listener() {
     assert_no_child_keeps_a_dropped_listener(Command::spawn);
 }
