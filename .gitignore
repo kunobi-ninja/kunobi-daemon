@@ -1,3 +1,4 @@
 /target/
 /tools/proto-gen/target/
 /mutants.out*
+/benches/target/
