@@ -123,7 +123,7 @@ fn start(
         .spawn(move || {
             // The caller may stop waiting sooner; the child still gets to run.
             let busy_until = deadline.max(Instant::now() + runaway);
-            let result = spawn_when_free(&mut command, busy_until).and_then(|child| {
+            let result = spawn_when_free(&mut command, busy_until, || {}).and_then(|child| {
                 let limit = deadline.max(Instant::now() + runaway);
                 reap(child, limit)
             });
@@ -133,18 +133,24 @@ fn start(
 }
 
 /// Spawn `command`, retrying while its executable is busy until `until`.
+/// `on_busy` runs after each refused attempt.
 ///
 /// Linux refuses to exec a file that any process holds open for writing
 /// (`ETXTBSY`). Warmup runs right after a new executable is written, and in a
 /// multi-threaded process a child forked by another thread holds a copy of
 /// the writer's descriptor until that child execs. The window is short.
-fn spawn_when_free(command: &mut Command, until: Instant) -> io::Result<Child> {
+fn spawn_when_free(
+    command: &mut Command,
+    until: Instant,
+    mut on_busy: impl FnMut(),
+) -> io::Result<Child> {
     let mut pause = Duration::from_millis(1);
     loop {
         match command.spawn() {
             Err(error)
                 if error.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < until =>
             {
+                on_busy();
                 std::thread::sleep(pause.min(until.saturating_duration_since(Instant::now())));
                 pause = (pause * 2).min(Duration::from_millis(50));
             }
@@ -207,14 +213,20 @@ mod tests {
 
         // While this process holds the file open for writing, exec fails.
         let mut command = Command::new(&shim);
-        let busy = spawn_when_free(&mut command, Instant::now()).unwrap_err();
+        let busy = spawn_when_free(&mut command, Instant::now(), || {}).unwrap_err();
         assert_eq!(busy.kind(), io::ErrorKind::ExecutableFileBusy);
 
-        // Once the writer closes, a retry succeeds.
+        // The writer closes only after a retrying spawn was refused, so the
+        // retry is what succeeds.
+        let (refused, first_refusal) = mpsc::channel();
         let retrying = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
-            spawn_when_free(&mut command, deadline).and_then(|mut child| child.wait())
+            spawn_when_free(&mut command, deadline, || {
+                let _ = refused.send(());
+            })
+            .and_then(|mut child| child.wait())
         });
+        first_refusal.recv().unwrap();
         drop(writer);
         assert!(retrying.join().unwrap().unwrap().success());
     }
