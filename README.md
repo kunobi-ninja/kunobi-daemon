@@ -17,7 +17,8 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
   leases and retirement. `retry` bounds persisted candidate campaigns.
 - `wire` and `control`: Buffa Protobuf negotiation, typed health and drain replies.
 - `local` and `transport`: optional OS peer checks, setup deadlines, half-close,
-  byte pumps and replaceable writers.
+  byte pumps and replaceable writers. `Outstanding` ends a session once every
+  request is answered where the transport has no half-close.
 - `launch`: clients that may start the daemon, including `DaemonCommand` for a
   daemon fully detached from its caller. Off by default; needs `local`.
 - `admission` and `observation`: independent capacity pools and local telemetry data.

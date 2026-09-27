@@ -138,6 +138,28 @@ this transaction. They must not wrap it in a competing restart loop. Support for
 older binaries retains their agreed lock and wire contracts until the minimum
 supported client version permits removal.
 
+## Ending the requests
+
+When a relay's client stops sending, the peer must learn that no more requests
+will come, while replies to requests already sent must still arrive.
+`WriterSlot::shutdown` half-closes the connection for that, and the peer answers
+what it has and then closes. A Windows named pipe has no half-close:
+`WindowsWriter::shutdown_write` flushes and returns `Unsupported`, and
+`WriterSlot::shutdown` and `close` return that error instead of dropping it.
+
+Without the signal the session ends from the relay side. `Outstanding` tracks
+the requests sent to the peer. After the client leaves, the relay waits in
+`Outstanding::wait_settled` until every one is settled, then closes the
+connection. A consumer settles a request only once its whole reply, including
+any record delimiter, has been flushed to the client. The wait also holds off
+while failures are still being reported (`fail`) and while the session moves
+between peers (`transition`). After more requests than its capacity it cannot
+prove it is settled, and waits until the requests are failed or cleared. Each
+request counts separately, even when a client reuses its key. A settlement
+names the epoch its peer connection started in, and failing or clearing the
+requests starts a new one, so a late reply from a failed peer cannot settle a
+newer request.
+
 ## Protocol and observation boundaries
 
 The binary lifecycle protocol uses Buffa Protobuf. Application message schemas and

@@ -93,7 +93,7 @@ fn close_releases_a_writer_waiting_for_a_replacement() {
             let slot = Arc::clone(&slot);
             thread::spawn(move || slot.write_observed(b"req\n", || {}))
         };
-        slot.close();
+        slot.close().unwrap();
         writer.join().unwrap();
     });
 }
@@ -132,7 +132,7 @@ fn a_write_racing_close_never_reaches_a_closed_peer() {
             let slot = Arc::clone(&slot);
             thread::spawn(move || slot.write_observed(b"a\n", || {}))
         };
-        slot.close();
+        slot.close().unwrap();
         writer.join().unwrap();
         let received = peer.received();
         assert!(received.is_empty() || received == b"a\n");

@@ -619,7 +619,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
                 let mut line = String::new();
                 if client.read_line(&mut line).unwrap() == 0 {
                     client_gone.store(true, Ordering::Release);
-                    writer.shutdown();
+                    let _ = writer.shutdown();
                     return;
                 }
                 let id: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -637,7 +637,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
     loop {
         match pump_downstream(&mut &*peer, &mut out) {
             PumpExit::ClientGone => {
-                writer.close();
+                let _ = writer.close();
                 return Ok(());
             }
             PumpExit::PeerClosed => {}
@@ -649,7 +649,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
         }
         out.client.flush()?;
         if client_gone.load(Ordering::Acquire) {
-            writer.close();
+            let _ = writer.close();
             upstream.join().unwrap();
             return Ok(());
         }
