@@ -33,8 +33,8 @@ exclude_globs = [
 exclude_re = [
     # Kani harnesses (`#[cfg(kani)] mod proofs`) are compiled only by
     # `cargo kani`, which the Kani proofs job runs. The code they verify stays
-    # in scope here.
-    '^src/(replacement|selection|wire)\.rs:.*\bproofs::',
+    # in scope here. Any file, so a new harness needs no entry of its own.
+    '^src/.*\.rs:.*\bproofs::',
     # Test-only helpers behind `#[cfg(all(test, feature = "launch"))]`.
     # cargo-mutants skips `#[cfg(test)]` but does not recognise `test` inside
     # `all(...)`, so it would mutate the tests' own fixtures.

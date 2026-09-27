@@ -86,8 +86,9 @@ jobs:
       - run: cargo install cargo-xwin --locked --version 0.23.1
       - run: cargo xwin build --locked --all-features --all-targets --target x86_64-pc-windows-msvc
 
-  # Model-checks the replacement state machine and wire negotiation for every
-  # input, not only the cases a test was written for. Same verifier as kache.
+  # Model-checks the replacement and selection rules, wire negotiation,
+  # admission budgets and retry budgets for every input, not only
+  # the cases a test was written for. Same verifier as kache.
   kani:
     name: Kani proofs
     runs-on: ubuntu-latest
