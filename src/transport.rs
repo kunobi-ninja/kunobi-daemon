@@ -990,9 +990,7 @@ mod tests {
             })
         };
         attempted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        // The peer is already gone, so the half-close fails; waiting writers
-        // are released anyway.
-        assert!(slot.close().is_err());
+        slot.close().unwrap();
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         task.join().unwrap();
         let unused = Arc::new(Mutex::new(Vec::new()));
