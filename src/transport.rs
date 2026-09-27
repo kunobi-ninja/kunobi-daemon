@@ -4,11 +4,12 @@
 //! authentication, request IDs, and protocol bootstrap remain with the caller.
 
 #[cfg(loom)]
-use loom::sync::{Condvar, Mutex};
+use loom::sync::{Condvar, Mutex, MutexGuard};
+use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::sync::TryLockError;
 #[cfg(not(loom))]
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// A transport writer that can close requests while preserving incoming replies.
 pub trait WriteHalf: Write + Send + 'static {
@@ -113,19 +114,27 @@ impl<W: WriteHalf> WriterSlot<W> {
     /// Public for the coordinator: when a reconnect completes after the
     /// upstream thread has already exited, nobody else is left to signal the
     /// replacement connection that no request will ever come.
-    pub fn shutdown(&self) {
+    ///
+    /// An error means the peer did not learn that the requests ended, for
+    /// example because the transport has no half-close. End the session
+    /// another way, such as [`Outstanding::wait_settled`].
+    pub fn shutdown(&self) -> io::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.ended = true;
-        let _ = state.writer.shutdown_write();
+        state.writer.shutdown_write()
     }
 
     /// Stop accepting bytes and wake writers waiting for a replacement.
     /// This cannot interrupt a transport write that is already blocked.
-    pub fn close(&self) {
+    ///
+    /// Waiting writers are released even when the half-close fails; the error
+    /// only reports that the peer did not learn that the requests ended.
+    pub fn close(&self) -> io::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
-        let _ = state.writer.shutdown_write();
+        let result = state.writer.shutdown_write();
         self.changed.notify_all();
+        result
     }
 
     /// Write once. On ambiguity, discard the window and wait until the main
@@ -262,6 +271,149 @@ impl<R, W: std::io::Write> std::io::Write for SplitIo<R, W> {
     }
 }
 
+/// Requests sent to the peer whose replies have not yet reached the client.
+///
+/// When the client stops sending, [`WriterSlot::shutdown`] half-closes the
+/// connection so the peer answers what it has and then closes. A transport
+/// without a half-close, such as a Windows named pipe, cannot deliver that
+/// signal, and both ends would wait for each other. There the session instead
+/// ends once every outstanding request is settled: [`Outstanding::wait_settled`]
+/// returns, and the caller closes the connection.
+///
+/// The caller decides what a key is (for example a JSON-RPC id) and calls
+/// [`Outstanding::settle`] only after the reply has been written and flushed
+/// to the client, including any record delimiter. Settling earlier lets the
+/// session end with part of a reply unsent.
+pub struct Outstanding<K> {
+    state: Mutex<OutstandingState<K>>,
+    changed: Condvar,
+    capacity: usize,
+}
+
+struct OutstandingState<K> {
+    keys: BTreeSet<K>,
+    /// A request arrived while the set was full, so an empty set no longer
+    /// proves that every reply was delivered.
+    overflowed: bool,
+    /// [`Failing`] guards alive: keys taken, their errors still being written.
+    failing: usize,
+    /// [`Transition`] guards alive: the session is moving between peers.
+    transitions: usize,
+}
+
+impl<K: Ord> Outstanding<K> {
+    /// Track at most `capacity` keys. Beyond it the set can no longer prove
+    /// that it is settled, until the requests are failed.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(OutstandingState {
+                keys: BTreeSet::new(),
+                overflowed: false,
+                failing: 0,
+                transitions: 0,
+            }),
+            changed: Condvar::new(),
+            capacity,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, OutstandingState<K>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a request sent to the peer.
+    pub fn begin(&self, key: K) {
+        let mut state = self.lock();
+        if state.keys.len() < self.capacity {
+            state.keys.insert(key);
+        } else {
+            state.overflowed = true;
+        }
+    }
+
+    /// Record that the reply for `key` has fully reached the client.
+    pub fn settle(&self, key: &K) {
+        let mut state = self.lock();
+        state.keys.remove(key);
+        self.changed.notify_all();
+    }
+
+    /// Record that the peer proved every request settled, for example with a
+    /// handoff receipt after all replies reached the client.
+    pub fn clear(&self) {
+        let mut state = self.lock();
+        state.keys.clear();
+        state.overflowed = false;
+        self.changed.notify_all();
+    }
+
+    /// Take every outstanding request to report it as failed, because the
+    /// peer that owned it is gone. The set does not count as settled until
+    /// the returned guard drops, so the caller can finish writing the
+    /// failures first. Untracked requests fail with the session, so this also
+    /// clears an overflow.
+    pub fn fail(&self) -> Failing<'_, K> {
+        let mut state = self.lock();
+        state.failing += 1;
+        state.overflowed = false;
+        let keys = std::mem::take(&mut state.keys);
+        Failing { owner: self, keys }
+    }
+
+    /// Hold off [`Outstanding::wait_settled`] while the session moves to
+    /// another peer, so it does not end with a replacement half-connected.
+    pub fn transition(&self) -> Transition<'_, K> {
+        self.lock().transitions += 1;
+        Transition(self)
+    }
+
+    /// Block until every tracked request is settled, no failures are still
+    /// being reported and no transition is in progress. After an overflow
+    /// this waits until the requests are failed or cleared.
+    pub fn wait_settled(&self) {
+        let mut state = self.lock();
+        while state.overflowed
+            || state.failing > 0
+            || state.transitions > 0
+            || !state.keys.is_empty()
+        {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Requests taken by [`Outstanding::fail`], still being reported.
+pub struct Failing<'a, K: Ord> {
+    owner: &'a Outstanding<K>,
+    keys: BTreeSet<K>,
+}
+
+impl<K: Ord> Failing<'_, K> {
+    /// The requests to report as failed.
+    pub fn keys(&self) -> &BTreeSet<K> {
+        &self.keys
+    }
+}
+
+impl<K: Ord> Drop for Failing<'_, K> {
+    fn drop(&mut self) {
+        let mut state = self.owner.lock();
+        state.failing -= 1;
+        self.owner.changed.notify_all();
+    }
+}
+
+/// A session transition in progress; see [`Outstanding::transition`].
+pub struct Transition<'a, K: Ord>(&'a Outstanding<K>);
+
+impl<K: Ord> Drop for Transition<'_, K> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.transitions -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,7 +514,7 @@ mod tests {
         received.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
         assert_eq!(slot.try_pause(), Some(22));
-        slot.shutdown();
+        slot.shutdown().unwrap();
         slot.replace_paused(CountingSink::default(), 0);
         assert_eq!(
             slot.state
@@ -381,7 +533,7 @@ mod tests {
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let slot = WriterSlot::new(ShutdownSink(Arc::clone(&shutdowns)));
 
-        slot.shutdown();
+        slot.shutdown().unwrap();
 
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
@@ -766,7 +918,9 @@ mod tests {
             })
         };
         attempted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        slot.close();
+        // The peer is already gone, so the half-close fails; waiting writers
+        // are released anyway.
+        assert!(slot.close().is_err());
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         task.join().unwrap();
         let unused = Arc::new(Mutex::new(Vec::new()));
@@ -777,5 +931,82 @@ mod tests {
         });
         slot.write_or_wait_for_replacement(b"after close");
         assert!(unused.lock().unwrap().is_empty());
+    }
+
+    /// Whether `wait_settled` returns within `within`, observed from another
+    /// thread so a wrong answer fails the test instead of hanging it.
+    fn settles(outstanding: &Arc<Outstanding<u32>>, within: Duration) -> bool {
+        let (done, settled) = mpsc::channel();
+        let waiter = Arc::clone(outstanding);
+        std::thread::spawn(move || {
+            waiter.wait_settled();
+            let _ = done.send(());
+        });
+        settled.recv_timeout(within).is_ok()
+    }
+
+    const NOT_YET: Duration = Duration::from_millis(100);
+    const SOON: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn outstanding_settles_when_its_last_request_is_settled() {
+        let outstanding = Arc::new(Outstanding::new(8));
+        assert!(settles(&outstanding, SOON), "an empty set is settled");
+        outstanding.begin(1);
+        outstanding.begin(2);
+        outstanding.settle(&1);
+        assert!(!settles(&outstanding, NOT_YET));
+        outstanding.settle(&2);
+        assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn an_overflowed_set_is_never_settled_until_its_requests_fail() {
+        // Past capacity a request is not tracked, so an empty set could hide
+        // a reply still on its way.
+        let outstanding = Arc::new(Outstanding::new(2));
+        for key in 0..3 {
+            outstanding.begin(key);
+        }
+        outstanding.settle(&0);
+        outstanding.settle(&1);
+        assert!(!settles(&outstanding, NOT_YET));
+        drop(outstanding.fail());
+        assert!(
+            settles(&outstanding, SOON),
+            "failing the session clears the overflow"
+        );
+    }
+
+    #[test]
+    fn failed_requests_are_not_settled_until_their_report_is_written() {
+        let outstanding = Arc::new(Outstanding::new(8));
+        outstanding.begin(7);
+        let failing = outstanding.fail();
+        assert_eq!(failing.keys().iter().copied().collect::<Vec<_>>(), [7]);
+        assert!(
+            !settles(&outstanding, NOT_YET),
+            "settled while failures were still being written"
+        );
+        drop(failing);
+        assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn a_transition_holds_off_settling() {
+        let outstanding = Arc::new(Outstanding::new(8));
+        let transition = outstanding.transition();
+        assert!(!settles(&outstanding, NOT_YET));
+        drop(transition);
+        assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn a_receipt_clears_requests_and_an_overflow() {
+        let outstanding = Arc::new(Outstanding::new(1));
+        outstanding.begin(1);
+        outstanding.begin(2);
+        outstanding.clear();
+        assert!(settles(&outstanding, SOON));
     }
 }

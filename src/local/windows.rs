@@ -149,8 +149,16 @@ impl Write for WindowsWriter {
 }
 
 impl WriteHalf for WindowsWriter {
+    /// Flush, then report that the peer was not told: a named pipe has no
+    /// half-close, and closing this handle would not end the stream while the
+    /// reader still holds the pipe. End the session with
+    /// [`crate::transport::Outstanding`] instead.
     fn shutdown_write(&mut self) -> io::Result<()> {
-        self.flush()
+        self.flush()?;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a named pipe has no half-close",
+        ))
     }
 }
 
@@ -500,6 +508,37 @@ mod tests {
 
     use super::*;
     use crate::local::test_handshake as handshake;
+
+    #[test]
+    fn a_named_pipe_reports_that_it_cannot_half_close_and_keeps_its_replies() {
+        // shutdown_write used to flush and return Ok, so a relay believed its
+        // peer knew the requests had ended, and both ends waited for each other.
+        let endpoint = format!("daemon-transport-no-half-close-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(endpoint.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut peer = listener.accept().unwrap();
+            let mut request = [0; 8];
+            peer.read_exact(&mut request).unwrap();
+            peer.write_all(b"reply\n").unwrap();
+            request
+        });
+        let transport = WindowsDuplex::connect(&endpoint).unwrap();
+        let (mut read, mut write) = transport.split().unwrap();
+        write.write_all(b"request\n").unwrap();
+        let error = write.shutdown_write().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            &server.join().unwrap(),
+            b"request\n",
+            "the flush still delivers the request"
+        );
+        let mut reply = [0; 6];
+        read.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply\n");
+    }
 
     #[test]
     fn setup_write_deadline_bounds_a_nonreading_named_pipe() {
