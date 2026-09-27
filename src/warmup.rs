@@ -67,7 +67,8 @@ pub fn warm_executable(path: &Path) -> io::Result<()> {
 /// Stdio is detached. The child must exit without connecting to a daemon or
 /// taking its locks. A child still running at the budget is not killed:
 /// this returns `TimedOut` and leaves it to finish in the background, up to
-/// [`RUNAWAY_LIMIT`].
+/// [`RUNAWAY_LIMIT`]. On Linux, a spawn refused because the file is still open
+/// for writing somewhere (`ETXTBSY`) is retried within the same limit.
 pub fn warm_spawn(path: &Path, args: &[impl AsRef<OsStr>]) -> io::Result<()> {
     warm_spawn_until(path, args, Instant::now() + SPAWN_BUDGET)
 }
@@ -120,13 +121,42 @@ fn start(
     std::thread::Builder::new()
         .name("kunobi-daemon-warmup".into())
         .spawn(move || {
-            let result = command.spawn().and_then(|child| {
+            // The caller may stop waiting sooner; the child still gets to run.
+            let busy_until = deadline.max(Instant::now() + runaway);
+            let result = spawn_when_free(&mut command, busy_until, || {}).and_then(|child| {
                 let limit = deadline.max(Instant::now() + runaway);
                 reap(child, limit)
             });
             let _ = report.send(result);
         })?;
     Ok(exited)
+}
+
+/// Spawn `command`, retrying while its executable is busy until `until`.
+/// `on_busy` runs after each refused attempt.
+///
+/// Linux refuses to exec a file that any process holds open for writing
+/// (`ETXTBSY`). Warmup runs right after a new executable is written, and in a
+/// multi-threaded process a child forked by another thread holds a copy of
+/// the writer's descriptor until that child execs. The window is short.
+fn spawn_when_free(
+    command: &mut Command,
+    until: Instant,
+    mut on_busy: impl FnMut(),
+) -> io::Result<Child> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < until =>
+            {
+                on_busy();
+                std::thread::sleep(pause.min(until.saturating_duration_since(Instant::now())));
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Wait for `child` to exit, killing it at `limit`. The standard library has
@@ -168,5 +198,36 @@ mod tests {
         let exited = start(Path::new("/bin/sleep"), &["30"], Instant::now(), runaway).unwrap();
         let error = exited.recv().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_executable_is_retried_until_it_is_free() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim.sh");
+        let mut writer = File::create(&shim).unwrap();
+        writer.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // While this process holds the file open for writing, exec fails.
+        let mut command = Command::new(&shim);
+        let busy = spawn_when_free(&mut command, Instant::now(), || {}).unwrap_err();
+        assert_eq!(busy.kind(), io::ErrorKind::ExecutableFileBusy);
+
+        // The writer closes only after a retrying spawn was refused, so the
+        // retry is what succeeds.
+        let (refused, first_refusal) = mpsc::channel();
+        let retrying = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            spawn_when_free(&mut command, deadline, || {
+                let _ = refused.send(());
+            })
+            .and_then(|mut child| child.wait())
+        });
+        first_refusal.recv().unwrap();
+        drop(writer);
+        assert!(retrying.join().unwrap().unwrap().success());
     }
 }
