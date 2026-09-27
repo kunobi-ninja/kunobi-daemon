@@ -132,3 +132,166 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+
+  # Changed-line mutation testing: every mutant cargo-mutants makes from a line
+  # this PR adds or modifies must fail a test. The plan lists the mutants, the
+  # shards test them, and "Mutation testing" is the one check to require.
+  mutation-plan:
+    name: Mutation plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      # Installs the tools pinned in mise.toml (cargo-mutants).
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - id: plan
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PLAN_DIR: ${{ runner.temp }}/mutants
+        run: |
+          set -euo pipefail
+          mkdir -p "$PLAN_DIR"
+          # Nothing to test must never be the result of a diff that could not
+          # be produced or read, so every step below fails loudly on its own.
+          git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+
+          # Added or modified library source. A deleted file or a pure rename
+          # (R100) has no new lines to mutate.
+          changed="$(
+            git diff --name-status "$base" HEAD -- 'src/*.rs' |
+              awk -F '\t' '$1 ~ /^[AMT]/ { print $2 } $1 ~ /^R/ && $1 != "R100" { print $3 }'
+          )"
+          if [ -z "$changed" ]; then
+            echo "::notice title=Mutation testing skipped::This PR adds or changes no Rust source under src/."
+            echo 'count=0' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"index":0,"display":1,"total":1}]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'Changed Rust source:\n%s\n' "$changed"
+
+          # cargo-mutants matches the new side of the diff against this tree
+          # by its "+++ b/<path>" header. Pin git's default format whatever the
+          # runner's config says, and check every changed file is there: one
+          # it cannot match would silently contribute no mutants.
+          git -c diff.noprefix=false -c diff.mnemonicPrefix=false \
+            diff --no-color --no-ext-diff "$base" HEAD > "$PLAN_DIR/pr.diff"
+          while IFS= read -r file; do
+            if ! grep -qxF "+++ b/$file" "$PLAN_DIR/pr.diff"; then
+              echo "::error title=Mutation plan::$file changed but the diff has no '+++ b/$file' header"
+              exit 1
+            fi
+          done <<< "$changed"
+
+          # --level error keeps log lines off stdout, which then holds only
+          # the JSON list. cargo-mutants prints nothing when the changed lines
+          # contain no mutants (comments, tests, signatures, excluded code).
+          status=0
+          cargo mutants --in-diff "$PLAN_DIR/pr.diff" --list --json --level error \
+            > "$PLAN_DIR/mutants.json" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Mutation plan::cargo mutants could not use the PR diff (exit $status; 5: it does not match the tree, 6: it could not be parsed)"
+            exit 1
+          fi
+          count="$(python3 -c '
+          import json, sys
+          text = open(sys.argv[1]).read()
+          mutants = json.loads(text) if text.strip() else []
+          assert isinstance(mutants, list), "expected a JSON list of mutants"
+          print(len(mutants))
+          ' "$PLAN_DIR/mutants.json")"
+          echo "changed-line mutants: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice title=Mutation testing skipped::The changed lines in src/ produce no mutants."
+          fi
+
+          # About 20 mutants per shard, at most 12 shards. Round-robin in the
+          # shards spreads slow mutants evenly.
+          shards=$(( count == 0 ? 1 : (count + 19) / 20 ))
+          shards=$(( shards > 12 ? 12 : shards ))
+          matrix="$(python3 -c '
+          import json, sys
+          total = int(sys.argv[1])
+          print(json.dumps({"include": [
+              {"index": i, "display": i + 1, "total": total} for i in range(total)
+          ]}, separators=(",", ":")))
+          ' "$shards")"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-diff
+          path: ${{ runner.temp }}/mutants/pr.diff
+          if-no-files-found: error
+          retention-days: 14
+
+  mutation-diff:
+    name: Mutation testing (${{ matrix.display }}/${{ matrix.total }})
+    needs: mutation-plan
+    if: github.event_name == 'pull_request' && needs.mutation-plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    # A shard holds at most 20 mutants below 240 and about 85 for a PR that
+    # touches the whole crate; each takes 10 to 30 s.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.mutation-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      # Installs the tools pinned in mise.toml (cargo-mutants, cargo-nextest).
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mutation-diff
+          path: ${{ runner.temp }}/mutants
+      # Every shard runs the unmutated baseline first: it sets the test
+      # timeout and fails the shard if the tests already fail.
+      - name: Test mutants of the changed lines
+        env:
+          OUT: ${{ runner.temp }}/mutants
+          SHARD: ${{ matrix.index }}
+          SHARDS: ${{ matrix.total }}
+          PLANNED: ${{ needs.mutation-plan.outputs.count }}
+        run: |
+          set -euo pipefail
+          test -s "$OUT/pr.diff"
+          status=0
+          cargo mutants --in-diff "$OUT/pr.diff" \
+            --shard "$SHARD/$SHARDS" --sharding round-robin \
+            --output "$OUT" || status=$?
+          # Round-robin gives shard k every mutant i with i % n == k.
+          expected=$(( PLANNED / SHARDS + (SHARD < PLANNED % SHARDS ? 1 : 0) ))
+          python3 scripts/mutation-verdict.py "$OUT" "$status" "$expected"
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-out-${{ matrix.display }}
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: warn
+          retention-days: 14
+
+  mutation:
+    name: Mutation testing
+    needs: [mutation-plan, mutation-diff]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          PLAN: ${{ needs.mutation-plan.result }}
+          COUNT: ${{ needs.mutation-plan.outputs.count }}
+          SHARDS: ${{ needs.mutation-diff.result }}
+        run: |
+          echo "plan: $PLAN; mutants: ${COUNT:-none}; shards: $SHARDS"
+          test "$PLAN" = success
+          if [ "$COUNT" = 0 ]; then exit 0; fi
+          test "$SHARDS" = success
