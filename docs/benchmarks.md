@@ -46,7 +46,6 @@ profiles are written under `benches/target/gungraun/`; open them with
 | | `frames` | `Session::send` and `Session::receive` for each kind of `Control` message |
 | | `control_service` | `ControlService::handle` answering a health probe |
 | `startup.rs` | `paths` | `ServiceIdentity::paths` and `SocketDir` checks |
-| | `windows_launch` | The Windows command line and environment block, compiled from the same source on Linux |
 
 Every benchmark runs over in-memory readers and writers, without descriptors,
 threads or sleeps, and repeats its operation enough times that the per-call
