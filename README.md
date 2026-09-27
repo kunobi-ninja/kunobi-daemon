@@ -126,6 +126,32 @@ an ambiguously accepted request. Run it with `cargo test --test process_handoff`
 
 Apache-2.0. See [LICENSE](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/LICENSE).
 
+### Mutation testing
+
+[cargo-mutants](https://mutants.rs/) makes small changes to the library, such
+as flipping a comparison or returning a default value, and runs the tests
+against each one. Every mutant made from the lines a PR changes must fail a
+test; a weekly run covers the whole crate. `mise install` provides the pinned
+version, and `.cargo/mutants.toml` holds the settings. To check your branch
+before pushing:
+
+```sh
+mise install
+git diff origin/main... > pr.diff
+cargo mutants --in-diff pr.diff
+```
+
+Without `--in-diff` it tests every mutant in the crate, a long run on one
+machine.
+CI runs on Linux, so on macOS a Linux-only branch can show missed mutants that
+CI does not.
+
+A missed mutant is a change to the code that no test noticed. Add or tighten a
+test so that it fails for the change shown in `mutants.out/missed.txt`. If the
+change cannot be observed, for example because it lands in a macOS or Windows
+branch that the Linux CI job does not compile, exclude that mutant in
+`.cargo/mutants.toml` with a comment saying why.
+
 ## Binary lifecycle protocol
 
 The optional [`wire` and `wire-async` features](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/docs/wire.md) provide bounded

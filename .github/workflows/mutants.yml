@@ -1,0 +1,50 @@
+name: Mutants
+
+# Every mutant in the crate, weekly and on demand. PRs are gated only on the
+# mutants of the lines they change (ci.yml); this run finds the gaps elsewhere
+# and reports them without blocking anyone.
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mutants:
+    name: Mutants (${{ matrix.shard }}/16)
+    runs-on: ubuntu-latest
+    # About 1,000 mutants at 10 to 30 s each: roughly 20 minutes per shard,
+    # with room for a slow runner or a run of timeouts.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      # Installs the tools pinned in mise.toml (cargo-mutants, cargo-nextest).
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - name: Test this shard's mutants
+        env:
+          OUT: ${{ runner.temp }}/mutants
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          status=0
+          cargo mutants --shard "$((SHARD - 1))/16" --sharding round-robin \
+            --output "$OUT" || status=$?
+          python3 scripts/mutation-verdict.py "$OUT" "$status"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: warn
+          retention-days: 30

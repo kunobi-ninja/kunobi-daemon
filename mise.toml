@@ -8,3 +8,15 @@
 # sort newest, so a floating version resolves to the wrong artifact. The
 # version is the full tag.
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
+
+# Mutation testing (see .cargo/mutants.toml). The repo mixes tag series
+# ("v27.1.0" and older "cargo-mutants-v26.1.x"), so this pins the full tag as
+# nextest does above.
+[tools."github:sourcefrog/cargo-mutants"]
+version = "v27.1.0"
+
+# Upstream publishes no arm64 macOS build. Without this, mise refuses the x86_64
+# asset and `mise install` fails on Apple silicon, the macOS CI runner included.
+# The x86_64 binary runs under Rosetta 2.
+[tools."github:sourcefrog/cargo-mutants".platforms]
+macos-arm64 = { asset_pattern = "cargo-mutants-x86_64-apple-darwin.tar.gz" }
