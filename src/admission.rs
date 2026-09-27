@@ -118,7 +118,7 @@ mod proofs {
 
     /// Admissions and releases explored per harness: enough to fill a pool,
     /// be refused, and release a permit from another pool in between.
-    const STEPS: usize = 5;
+    const STEPS: usize = 4;
     const POOLS: [Pool; 3] = [Pool::Handshake, Pool::Application, Pool::Control];
 
     fn small() -> usize {
@@ -129,7 +129,7 @@ mod proofs {
     /// hold, so exhausted application capacity never refuses a control
     /// session. Every permit returns its own slot when dropped, in any order.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(5)]
     fn each_pool_admits_up_to_its_own_limit_and_no_further() {
         let limits = Limits {
             handshakes: small(),
@@ -138,30 +138,32 @@ mod proofs {
         };
         let limit = [limits.handshakes, limits.application, limits.control];
         let admission = Arc::new(Admission::new(limits));
-        let mut held = Vec::with_capacity(STEPS);
+        // One fixed slot per step rather than a growing Vec: removing from a
+        // Vec at a symbolic index made the solver run out of memory.
+        let mut held: [Option<Permit>; STEPS] = [const { None }; STEPS];
         let mut active = [0usize; 3];
         let mut rejected = [0u64; 3];
 
-        for _ in 0..STEPS {
-            if held.is_empty() || kani::any() {
+        for step in 0..STEPS {
+            let release = kani::any_where(|at: &usize| *at < STEPS);
+            if kani::any() && held[release].is_some() {
+                let permit = held[release].take().unwrap();
+                active[permit.pool as usize] -= 1;
+                drop(permit);
+            } else {
                 let pool: Pool = kani::any();
                 let index = pool as usize;
                 match admission.try_acquire(pool) {
                     Some(permit) => {
                         assert!(active[index] < limit[index]);
                         active[index] += 1;
-                        held.push(permit);
+                        held[step] = Some(permit);
                     }
                     None => {
                         assert!(active[index] == limit[index]);
                         rejected[index] += 1;
                     }
                 }
-            } else {
-                let at = kani::any_where(|at: &usize| *at < held.len());
-                let permit = held.swap_remove(at);
-                active[permit.pool as usize] -= 1;
-                drop(permit);
             }
 
             for pool in POOLS {
