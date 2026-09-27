@@ -295,3 +295,83 @@ jobs:
           test "$PLAN" = success
           if [ "$COUNT" = 0 ]; then exit 0; fi
           test "$SHARDS" = success
+
+  # Instruction counts under Valgrind do not depend on the runner's load, so
+  # they can gate a shared CI machine. One job measures the parent commit and
+  # then this one: for a pull request that is the base branch tip and the merge
+  # result, for a push to main the previous and the new main. Only pull
+  # requests fail on a regression. See docs/benchmarks.md.
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Adds pipefail, so a failed `cargo metadata` stops the step.
+        shell: bash
+    env:
+      # Shared by both checkouts: dependencies build once, and the second run
+      # finds the baseline the first one saved.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/benches/target
+      GUNGRAUN_HOME: ${{ github.workspace }}/benches/target/gungraun
+      # Largest instruction-count growth, in percent, a pull request may add
+      # to any benchmark.
+      BENCH_LIMIT: "5"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The commit and its first parent.
+          fetch-depth: 2
+      - run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: cargo fmt --manifest-path benches/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path benches/Cargo.toml --all-targets -- -D warnings
+      # The runner refuses to run a library of another version, so install
+      # exactly the version the lockfile resolves.
+      - name: Install gungraun-runner
+        id: runner
+        run: |
+          version="$(cargo metadata --locked --format-version 1 --manifest-path benches/Cargo.toml |
+            jq -r '.packages[] | select(.name == "gungraun") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cargo install --locked gungraun-runner --version "$version"
+      - name: Measure the parent commit
+        id: base
+        env:
+          RUNNER_VERSION: ${{ steps.runner.outputs.version }}
+        run: |
+          base="$(git rev-parse HEAD^1)"
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          cd "$RUNNER_TEMP/base"
+          if [ ! -f benches/Cargo.toml ]; then
+            echo "The parent commit has no benchmarks; every benchmark is new."
+            exit 0
+          fi
+          version="$(cargo metadata --locked --format-version 1 --manifest-path benches/Cargo.toml |
+            jq -r '.packages[] | select(.name == "gungraun") | .version')"
+          if [ "$version" != "$RUNNER_VERSION" ]; then
+            echo "::notice::The parent commit uses gungraun $version; no comparison this time."
+            exit 0
+          fi
+          cargo bench --locked --manifest-path benches/Cargo.toml -- --save-baseline=base
+      - name: Measure this commit
+        run: |
+          limits=()
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            limits=("--callgrind-limits=ir=${BENCH_LIMIT}%")
+          fi
+          cargo bench --locked --manifest-path benches/Cargo.toml -- \
+            --baseline=base --save-summary=json "${limits[@]}"
+      # Also after a failed measurement, so the table shows what regressed.
+      - name: Report
+        if: success() || failure()
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          limit=()
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            limit=(--limit "$BENCH_LIMIT")
+          fi
+          python3 scripts/bench-report.py "$GUNGRAUN_HOME" "${limit[@]}" \
+            --baseline "the parent commit, $BASE_SHA" >> "$GITHUB_STEP_SUMMARY"

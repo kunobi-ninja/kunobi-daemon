@@ -120,6 +120,10 @@ warnings`, and `cargo test`. CI checks Linux, macOS, native Windows, a
 concurrent upgraders, stale replies, cancellation, multiple drain observers,
 and file ownership across real child processes.
 
+The [benchmarks](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/docs/benchmarks.md)
+count instructions on the transport, wire and startup paths under Valgrind. CI
+fails a pull request that grows any of them by more than 5%.
+
 The [process handoff suite](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/tests/README.md) also checks that a relay keeps its
 client session through replacement, preserves late replies and never replays
 an ambiguously accepted request. Run it with `cargo test --test process_handoff`.

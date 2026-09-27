@@ -5,7 +5,7 @@ the byte path between a client and its daemon, framed protocol messages, and
 the work a client does before it connects. They use
 [Gungraun](https://github.com/gungraun/gungraun), which runs each benchmark
 once under Valgrind's Callgrind. An instruction count does not depend on the
-machine's load, so two runs of the same code agree.
+machine's load, so CI can gate on it.
 
 ## Run them locally
 
@@ -52,3 +52,25 @@ Every benchmark runs over in-memory readers and writers, without descriptors,
 threads or sleeps, and repeats its operation enough times that the per-call
 cost dominates. Setup is not counted. The numbers are instruction counts, not
 wall-clock latency, and they do not include the kernel's side of real I/O.
+
+## The CI gate
+
+The `Benchmarks` job in `.github/workflows/ci.yml` measures two commits in one
+job with the same toolchain and runner:
+
+1. On a pull request, the base branch tip and the merge result. On a push to
+   `main`, the previous and the new `main`.
+2. The first run saves a baseline; the second compares with it.
+3. A pull request fails when any benchmark's instruction count grows by more
+   than 5%. `BENCH_LIMIT` in the workflow sets the threshold.
+4. The job summary lists every benchmark with its base count, head count and
+   change, whether or not the gate failed.
+
+A benchmark that the base does not have is reported as new and never fails the
+gate. The comparison is also skipped, with a notice, when the base commit uses
+a different Gungraun version, because the runner only runs its own version.
+
+The threshold applies to each benchmark on its own, so an improvement in one
+cannot hide a regression in another. When the growth is expected, for example a
+correctness fix that must do more work, explain it in the pull request; the
+table shows reviewers which paths grew and by how much.

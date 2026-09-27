@@ -131,7 +131,8 @@ isolation and application operation 1 coexisting with lifecycle operation 1.
 
 The [benchmarks](benchmarks.md) count the instructions for the handshake and
 for sending and receiving each kind of `Control` message over an in-memory
-transport. They do not measure socket latency or complete upgrade time.
+transport. CI fails a pull request that grows any of them by more than 5%. They
+do not measure socket latency or complete upgrade time.
 
 Regenerate the schemas with `cargo run --locked --manifest-path tools/proto-gen/Cargo.toml`.
 The generator requires `protoc`; normal builds do not. Check freshness with the
