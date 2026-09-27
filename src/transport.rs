@@ -411,13 +411,16 @@ impl<K: Ord> Outstanding<K> {
     /// this waits until the requests are failed or cleared.
     pub fn wait_settled(&self) {
         let mut state = self.lock();
-        while state.overflowed
-            || state.failing > 0
-            || state.transitions > 0
-            || !state.keys.is_empty()
-        {
+        while !state.settled() {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+impl<K> OutstandingState<K> {
+    /// What [`Outstanding::wait_settled`] waits for.
+    fn settled(&self) -> bool {
+        !self.overflowed && self.failing == 0 && self.transitions == 0 && self.keys.is_empty()
     }
 }
 
@@ -1118,5 +1121,195 @@ mod tests {
         outstanding.begin(2);
         outstanding.clear();
         assert!(settles(&outstanding, SOON));
+    }
+}
+
+/// `Outstanding` against a plain model: a multiset of keys for the current
+/// epoch, an overflow flag, and counts of live report and transition guards.
+/// Random operation sequences reach key reuse, stale settlements and overflow
+/// in orders no example test lists.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Begin(u8),
+        /// Settle `key` with the epoch captured `age` fails or clears ago.
+        Settle {
+            age: usize,
+            key: u8,
+        },
+        Clear,
+        /// Take the requests. `hold` keeps the report guard alive for later steps.
+        Fail {
+            hold: bool,
+        },
+        FinishReport(usize),
+        StartTransition,
+        EndTransition(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        // Few keys, so clients reuse them.
+        let key = 0u8..4;
+        prop_oneof![
+            4 => key.clone().prop_map(Op::Begin),
+            3 => key.clone().prop_map(|key| Op::Settle { age: 0, key }),
+            1 => (1usize..4, key).prop_map(|(age, key)| Op::Settle { age, key }),
+            1 => Just(Op::Clear),
+            1 => any::<bool>().prop_map(|hold| Op::Fail { hold }),
+            1 => any::<usize>().prop_map(Op::FinishReport),
+            1 => Just(Op::StartTransition),
+            1 => any::<usize>().prop_map(Op::EndTransition),
+        ]
+    }
+
+    #[derive(Default)]
+    struct Model {
+        epoch: usize,
+        keys: BTreeMap<u8, usize>,
+        overflowed: bool,
+        reports: usize,
+        transitions: usize,
+    }
+
+    impl Model {
+        fn settled(&self) -> bool {
+            !self.overflowed && self.reports == 0 && self.transitions == 0 && self.keys.is_empty()
+        }
+
+        /// Every request in flight, once per request, in key order.
+        fn outstanding(&self) -> Vec<u8> {
+            self.keys
+                .iter()
+                .flat_map(|(&key, &count)| std::iter::repeat_n(key, count))
+                .collect()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn outstanding_matches_a_multiset_per_epoch(
+            capacity in 0usize..5,
+            ops in proptest::collection::vec(op(), 0..64),
+        ) {
+            let outstanding = Arc::new(Outstanding::new(capacity));
+            let mut model = Model::default();
+            // The epoch observed while the model was at each epoch number.
+            let mut epochs = vec![outstanding.epoch()];
+            let mut reports = Vec::new();
+            let mut transitions = Vec::new();
+
+            for op in &ops {
+                match *op {
+                    Op::Begin(key) => {
+                        outstanding.begin(key);
+                        if model.keys.values().sum::<usize>() < capacity {
+                            *model.keys.entry(key).or_insert(0) += 1;
+                        } else {
+                            model.overflowed = true;
+                        }
+                    }
+                    Op::Settle { age, key } => {
+                        let captured = model.epoch.saturating_sub(age);
+                        outstanding.settle(epochs[captured], &key);
+                        // A reply from before the last fail or clear settles nothing.
+                        if captured == model.epoch
+                            && let Some(count) = model.keys.get_mut(&key)
+                        {
+                            *count -= 1;
+                            if *count == 0 {
+                                model.keys.remove(&key);
+                            }
+                        }
+                    }
+                    Op::Clear => {
+                        outstanding.clear();
+                        model.keys.clear();
+                        model.overflowed = false;
+                        model.epoch += 1;
+                    }
+                    Op::Fail { hold } => {
+                        let failing = outstanding.fail();
+                        prop_assert_eq!(
+                            failing.keys().copied().collect::<Vec<_>>(),
+                            model.outstanding(),
+                            "fail() must report each request in flight exactly once"
+                        );
+                        model.keys.clear();
+                        model.overflowed = false;
+                        model.epoch += 1;
+                        if hold {
+                            reports.push(failing);
+                            model.reports += 1;
+                        }
+                    }
+                    Op::FinishReport(index) => {
+                        if !reports.is_empty() {
+                            drop(reports.swap_remove(index % reports.len()));
+                            model.reports -= 1;
+                        }
+                    }
+                    Op::StartTransition => {
+                        transitions.push(outstanding.transition());
+                        model.transitions += 1;
+                    }
+                    Op::EndTransition(index) => {
+                        if !transitions.is_empty() {
+                            drop(transitions.swap_remove(index % transitions.len()));
+                            model.transitions -= 1;
+                        }
+                    }
+                }
+                if model.epoch == epochs.len() {
+                    let epoch = outstanding.epoch();
+                    prop_assert!(
+                        !epochs.contains(&epoch),
+                        "a fail or clear reused an earlier epoch"
+                    );
+                    epochs.push(epoch);
+                }
+                prop_assert_eq!(
+                    outstanding.lock().settled(),
+                    model.settled(),
+                    "after {:?}",
+                    op
+                );
+            }
+
+            drop(reports);
+            drop(transitions);
+            model.reports = 0;
+            model.transitions = 0;
+            prop_assert_eq!(outstanding.lock().settled(), model.settled());
+
+            // Failing whatever is left ends the session: an overflow included.
+            let failing = outstanding.fail();
+            prop_assert_eq!(
+                failing.keys().copied().collect::<Vec<_>>(),
+                model.outstanding()
+            );
+            drop(failing);
+            let (done, settled) = mpsc::channel();
+            let waiter = Arc::clone(&outstanding);
+            std::thread::spawn(move || {
+                waiter.wait_settled();
+                let _ = done.send(());
+            });
+            prop_assert!(
+                settled.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "wait_settled did not return after every request failed"
+            );
+        }
     }
 }
