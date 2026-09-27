@@ -167,5 +167,8 @@ or cancel work.
 it. Call it when the daemon starts and after a replacement commit (drivers can
 list paths on `replacement::Driver::warmup_paths`; missing files do not fail
 the commit). `warm_spawn` is the extra step for macOS's per-path first-exec
-cache: the child argv must exit without connecting or taking locks. Do not
-poll on a timer; the miss that costs ~100 ms is a new path, not eviction.
+cache: the child argv must exit without connecting or taking locks. It waits
+up to `SPAWN_BUDGET`; a child still running then, usually because macOS is
+checking a new executable, is left to finish and killed only at
+`RUNAWAY_LIMIT`. Do not poll on a timer; the miss that costs ~100 ms is a new
+path, not eviction.

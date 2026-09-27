@@ -252,4 +252,7 @@ cannot hold a pre-spawned shim on those stdio pipes. After `Commit`,
 ignores I/O errors so publication stays authoritative. Call
 `warm_executable` on daemon start for the same sibling path. Use `warm_spawn`
 only with an argv that exits before discovery (`--warmup` in the consumer).
-Prefault is not a keepalive loop.
+Its caller waits at most `SPAWN_BUDGET`, but the child is not killed then:
+macOS's first-run check of a new executable is the work being paid for, and
+it can outlast the budget. A reaper thread lets the child finish and kills it
+only at `RUNAWAY_LIMIT`. Prefault is not a keepalive loop.
