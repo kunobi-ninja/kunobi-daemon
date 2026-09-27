@@ -4,3 +4,11 @@
 retries = 2
 flaky-result = "fail"
 fail-fast = false
+
+# Used by cargo-mutants (.cargo/mutants.toml). One failing test catches a
+# mutant, so the run stops there and terminates tests still running (the two
+# listener-inheritance tests take about 6 s each). No retries: a retry only
+# reruns a test the mutant already broke.
+[profile.mutants]
+retries = 0
+fail-fast = { max-fail = 1, terminate = "immediate" }
