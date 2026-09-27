@@ -5,7 +5,7 @@
 
 #[cfg(loom)]
 use loom::sync::{Condvar, Mutex, MutexGuard};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::TryLockError;
 #[cfg(not(loom))]
@@ -212,14 +212,18 @@ fn copy_flushing<R: Read, W: Write>(from: &mut R, to: &mut W, buf: &mut [u8]) ->
 
 /// Forward opaque request bytes, flushing each window, then half-close the peer.
 /// The response direction remains open for a late reply after client EOF.
+///
+/// A copy error is returned first. Otherwise the half-close error is: for
+/// example `Unsupported` on a named pipe, where the peer was not told that the
+/// requests ended and the caller must end the session with [`Outstanding`].
 pub fn pump_upstream<R: Read, W: WriteHalf>(client_in: &mut R, sock_w: &mut W) -> io::Result<()> {
     let mut buf = vec![0u8; BUFFER_SIZE];
     let result = copy_flushing(client_in, sock_w, &mut buf);
     // Signal end-of-request-stream whichever way we got here. If the client
     // vanished mid-write the broker still needs to stop waiting for more, so
     // this is deliberately not on the success path only.
-    let _ = sock_w.shutdown_write();
-    result
+    let shutdown = sock_w.shutdown_write();
+    result.and(shutdown)
 }
 
 /// Forward opaque response bytes, flushing even a newline-free tail.
@@ -291,7 +295,11 @@ pub struct Outstanding<K> {
 }
 
 struct OutstandingState<K> {
-    keys: BTreeSet<K>,
+    /// Each key with the number of its requests in flight. A client may reuse
+    /// a key before the first reply arrives, and each request needs its own.
+    keys: BTreeMap<K, usize>,
+    /// Requests in flight, counting every duplicate.
+    tracked: usize,
     /// A request arrived while the set was full, so an empty set no longer
     /// proves that every reply was delivered.
     overflowed: bool,
@@ -302,12 +310,13 @@ struct OutstandingState<K> {
 }
 
 impl<K: Ord> Outstanding<K> {
-    /// Track at most `capacity` keys. Beyond it the set can no longer prove
-    /// that it is settled, until the requests are failed.
+    /// Track at most `capacity` requests. Beyond it the set can no longer
+    /// prove that it is settled, until the requests are failed or cleared.
     pub fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(OutstandingState {
-                keys: BTreeSet::new(),
+                keys: BTreeMap::new(),
+                tracked: 0,
                 overflowed: false,
                 failing: 0,
                 transitions: 0,
@@ -324,17 +333,24 @@ impl<K: Ord> Outstanding<K> {
     /// Record a request sent to the peer.
     pub fn begin(&self, key: K) {
         let mut state = self.lock();
-        if state.keys.len() < self.capacity {
-            state.keys.insert(key);
+        if state.tracked < self.capacity {
+            *state.keys.entry(key).or_insert(0) += 1;
+            state.tracked += 1;
         } else {
             state.overflowed = true;
         }
     }
 
-    /// Record that the reply for `key` has fully reached the client.
+    /// Record that one reply for `key` has fully reached the client.
     pub fn settle(&self, key: &K) {
         let mut state = self.lock();
-        state.keys.remove(key);
+        if let Some(count) = state.keys.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                state.keys.remove(key);
+            }
+            state.tracked -= 1;
+        }
         self.changed.notify_all();
     }
 
@@ -343,6 +359,7 @@ impl<K: Ord> Outstanding<K> {
     pub fn clear(&self) {
         let mut state = self.lock();
         state.keys.clear();
+        state.tracked = 0;
         state.overflowed = false;
         self.changed.notify_all();
     }
@@ -356,6 +373,7 @@ impl<K: Ord> Outstanding<K> {
         let mut state = self.lock();
         state.failing += 1;
         state.overflowed = false;
+        state.tracked = 0;
         let keys = std::mem::take(&mut state.keys);
         Failing { owner: self, keys }
     }
@@ -385,13 +403,13 @@ impl<K: Ord> Outstanding<K> {
 /// Requests taken by [`Outstanding::fail`], still being reported.
 pub struct Failing<'a, K: Ord> {
     owner: &'a Outstanding<K>,
-    keys: BTreeSet<K>,
+    keys: BTreeMap<K, usize>,
 }
 
 impl<K: Ord> Failing<'_, K> {
-    /// The requests to report as failed.
-    pub fn keys(&self) -> &BTreeSet<K> {
-        &self.keys
+    /// The keys of the requests to report as failed, each once.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.keys.keys()
     }
 }
 
@@ -797,6 +815,32 @@ mod tests {
     }
 
     #[test]
+    fn upstream_reports_a_half_close_the_transport_cannot_make() {
+        // A named pipe has no half-close. Returning Ok here told the caller the
+        // peer knew the requests had ended, and both ends waited for each other.
+        struct NoHalfClose(Vec<u8>);
+        impl Write for NoHalfClose {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl WriteHalf for NoHalfClose {
+            fn shutdown_write(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+        }
+        let mut src = io::Cursor::new(b"request".to_vec());
+        let mut sink = NoHalfClose(Vec::new());
+        let error = pump_upstream(&mut src, &mut sink).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(sink.0, b"request", "the request is still delivered");
+    }
+
+    #[test]
     fn upstream_reports_the_write_error_even_though_shutdown_also_failed() {
         // Both fail here. The caller must still learn the transfer failed rather
         // than seeing the shutdown error swallow it into an Ok.
@@ -983,12 +1027,25 @@ mod tests {
         let outstanding = Arc::new(Outstanding::new(8));
         outstanding.begin(7);
         let failing = outstanding.fail();
-        assert_eq!(failing.keys().iter().copied().collect::<Vec<_>>(), [7]);
+        assert_eq!(failing.keys().copied().collect::<Vec<_>>(), [7]);
         assert!(
             !settles(&outstanding, NOT_YET),
             "settled while failures were still being written"
         );
         drop(failing);
+        assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn a_reused_key_needs_one_settle_per_request() {
+        // A client may reuse an id before the first reply arrives. Counting it
+        // once would end the session with the second reply still on its way.
+        let outstanding = Arc::new(Outstanding::new(8));
+        outstanding.begin(1);
+        outstanding.begin(1);
+        outstanding.settle(&1);
+        assert!(!settles(&outstanding, NOT_YET));
+        outstanding.settle(&1);
         assert!(settles(&outstanding, SOON));
     }
 
