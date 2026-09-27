@@ -288,6 +288,11 @@ impl<R, W: std::io::Write> std::io::Write for SplitIo<R, W> {
 /// [`Outstanding::settle`] only after the reply has been written and flushed
 /// to the client, including any record delimiter. Settling earlier lets the
 /// session end with part of a reply unsent.
+///
+/// Settlements carry the [`Epoch`] in which the peer connection delivering
+/// them started. [`Outstanding::fail`] and [`Outstanding::clear`] start a new
+/// epoch, so a late reply from a failed peer cannot settle a newer request that
+/// reuses its key.
 pub struct Outstanding<K> {
     state: Mutex<OutstandingState<K>>,
     changed: Condvar,
@@ -300,6 +305,8 @@ struct OutstandingState<K> {
     keys: BTreeMap<K, usize>,
     /// Requests in flight, counting every duplicate.
     tracked: usize,
+    /// Bumped whenever the tracked requests are failed or cleared.
+    epoch: u64,
     /// A request arrived while the set was full, so an empty set no longer
     /// proves that every reply was delivered.
     overflowed: bool,
@@ -317,6 +324,7 @@ impl<K: Ord> Outstanding<K> {
             state: Mutex::new(OutstandingState {
                 keys: BTreeMap::new(),
                 tracked: 0,
+                epoch: 0,
                 overflowed: false,
                 failing: 0,
                 transitions: 0,
@@ -341,9 +349,20 @@ impl<K: Ord> Outstanding<K> {
         }
     }
 
-    /// Record that one reply for `key` has fully reached the client.
-    pub fn settle(&self, key: &K) {
+    /// The current epoch. Capture it when a peer connection starts and pass it
+    /// to [`Outstanding::settle`] for every reply that connection delivers.
+    pub fn epoch(&self) -> Epoch {
+        Epoch(self.lock().epoch)
+    }
+
+    /// Record that one reply for `key`, delivered by a connection that started
+    /// in `epoch`, has fully reached the client. A reply from before the last
+    /// [`Outstanding::fail`] or [`Outstanding::clear`] settles nothing.
+    pub fn settle(&self, epoch: Epoch, key: &K) {
         let mut state = self.lock();
+        if epoch.0 != state.epoch {
+            return;
+        }
         if let Some(count) = state.keys.get_mut(key) {
             *count -= 1;
             if *count == 0 {
@@ -360,6 +379,7 @@ impl<K: Ord> Outstanding<K> {
         let mut state = self.lock();
         state.keys.clear();
         state.tracked = 0;
+        state.epoch += 1;
         state.overflowed = false;
         self.changed.notify_all();
     }
@@ -374,6 +394,7 @@ impl<K: Ord> Outstanding<K> {
         state.failing += 1;
         state.overflowed = false;
         state.tracked = 0;
+        state.epoch += 1;
         let keys = std::mem::take(&mut state.keys);
         Failing { owner: self, keys }
     }
@@ -400,6 +421,10 @@ impl<K: Ord> Outstanding<K> {
     }
 }
 
+/// Which set of requests a settlement belongs to; see [`Outstanding::epoch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epoch(u64);
+
 /// Requests taken by [`Outstanding::fail`], still being reported.
 pub struct Failing<'a, K: Ord> {
     owner: &'a Outstanding<K>,
@@ -407,9 +432,12 @@ pub struct Failing<'a, K: Ord> {
 }
 
 impl<K: Ord> Failing<'_, K> {
-    /// The keys of the requests to report as failed, each once.
+    /// The key of every request to report as failed: once per request, so a
+    /// key reused by two requests appears twice.
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.keys.keys()
+        self.keys
+            .iter()
+            .flat_map(|(key, &count)| std::iter::repeat_n(key, count))
     }
 }
 
@@ -998,9 +1026,9 @@ mod tests {
         assert!(settles(&outstanding, SOON), "an empty set is settled");
         outstanding.begin(1);
         outstanding.begin(2);
-        outstanding.settle(&1);
+        outstanding.settle(outstanding.epoch(), &1);
         assert!(!settles(&outstanding, NOT_YET));
-        outstanding.settle(&2);
+        outstanding.settle(outstanding.epoch(), &2);
         assert!(settles(&outstanding, SOON));
     }
 
@@ -1012,8 +1040,8 @@ mod tests {
         for key in 0..3 {
             outstanding.begin(key);
         }
-        outstanding.settle(&0);
-        outstanding.settle(&1);
+        outstanding.settle(outstanding.epoch(), &0);
+        outstanding.settle(outstanding.epoch(), &1);
         assert!(!settles(&outstanding, NOT_YET));
         drop(outstanding.fail());
         assert!(
@@ -1043,10 +1071,37 @@ mod tests {
         let outstanding = Arc::new(Outstanding::new(8));
         outstanding.begin(1);
         outstanding.begin(1);
-        outstanding.settle(&1);
+        outstanding.settle(outstanding.epoch(), &1);
         assert!(!settles(&outstanding, NOT_YET));
-        outstanding.settle(&1);
+        outstanding.settle(outstanding.epoch(), &1);
         assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn a_late_reply_from_a_failed_peer_does_not_settle_a_newer_request() {
+        let outstanding = Arc::new(Outstanding::new(8));
+        let old_peer = outstanding.epoch();
+        outstanding.begin(1);
+        drop(outstanding.fail());
+        // The client reuses the key with the replacement peer.
+        outstanding.begin(1);
+        outstanding.settle(old_peer, &1);
+        assert!(
+            !settles(&outstanding, NOT_YET),
+            "a stale reply settled the new request"
+        );
+        outstanding.settle(outstanding.epoch(), &1);
+        assert!(settles(&outstanding, SOON));
+    }
+
+    #[test]
+    fn a_reused_key_is_reported_once_per_failed_request() {
+        let outstanding = Outstanding::new(8);
+        outstanding.begin(1);
+        outstanding.begin(1);
+        outstanding.begin(2);
+        let failing = outstanding.fail();
+        assert_eq!(failing.keys().copied().collect::<Vec<_>>(), [1, 1, 2]);
     }
 
     #[test]

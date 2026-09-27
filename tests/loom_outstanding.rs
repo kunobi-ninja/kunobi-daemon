@@ -17,7 +17,8 @@ fn a_settle_on_another_thread_always_wakes_the_waiter() {
         let outstanding = Arc::new(Outstanding::new(4));
         outstanding.begin(1u32);
         let settler = Arc::clone(&outstanding);
-        let settle = thread::spawn(move || settler.settle(&1));
+        let epoch = outstanding.epoch();
+        let settle = thread::spawn(move || settler.settle(epoch, &1));
         outstanding.wait_settled();
         settle.join().unwrap();
     });
