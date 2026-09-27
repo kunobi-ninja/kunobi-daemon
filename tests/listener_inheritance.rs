@@ -22,8 +22,6 @@ const SPAWNS: usize = 1000;
 const LIVE_CHILDREN: usize = 64;
 /// Threads binding and dropping a listener, each on its own socket.
 const BINDERS: usize = 4;
-/// Upper bound on one binder's loop, in case the spawns are slow.
-const MAX_BINDS: usize = 100_000;
 /// On Linux a spawn can return just before the child closes its close-on-exec
 /// descriptors. A listener still accepting this long after it was dropped is
 /// held by a running child, which sleeps far longer than this. Generous, so a
@@ -99,7 +97,8 @@ fn assert_no_child_keeps_a_dropped_listener(spawn: Spawn) {
 /// Acquire and drop a listener until the spawns end, probing after each drop.
 fn bind_and_drop(socket: &Path, race: &Race) -> Result<usize, String> {
     let mut binds = 0;
-    while !race.over.load(SeqCst) && binds < MAX_BINDS {
+    // Bounded by the spawns: the loop ends when they do.
+    while !race.over.load(SeqCst) {
         match unix_socket::acquire(socket) {
             Ok(Bound::Won(listener)) => drop(listener),
             other => {
@@ -131,11 +130,6 @@ fn bind_and_drop(socket: &Path, race: &Race) -> Result<usize, String> {
             }
         }
         std::fs::remove_file(socket).map_err(|error| format!("bind {binds}: unlink: {error}"))?;
-    }
-    if !race.over.load(SeqCst) {
-        return Err(format!(
-            "stopped after {binds} binds, before the spawns ended, so the rest ran without this binder"
-        ));
     }
     Ok(binds)
 }
