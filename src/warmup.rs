@@ -146,7 +146,12 @@ fn spawn_when_free(
 ) -> io::Result<Child> {
     let mut pause = Duration::from_millis(1);
     loop {
-        match command.spawn() {
+        // Released before any retry wait; see `crate::spawn_lock`.
+        let spawned = {
+            let _spawn = crate::spawn_lock::spawning();
+            command.spawn()
+        };
+        match spawned {
             Err(error)
                 if error.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < until =>
             {

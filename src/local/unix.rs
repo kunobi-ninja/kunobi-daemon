@@ -58,13 +58,16 @@ pub fn restore_child_waiting() -> io::Result<()> {
 /// Rust may wait for a failed exec's child inside `Command::spawn`. Ignoring
 /// SIGCHLD during that wait makes it panic instead of returning the exec error.
 /// The peer also inherits normal waiting without a fork-only pre-exec hook.
+///
+/// The spawn waits while this crate creates a listening socket, so the child
+/// cannot inherit one that is not yet close-on-exec; see
+/// [`crate::local::unix_socket::acquire`].
 pub fn spawn_with_child_waiting(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
     // Signal dispositions are process-wide. Serialize relay launches until
     // both the previous policy and any exits during this window are handled.
-    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _spawn = SPAWN.lock().unwrap_or_else(|error| error.into_inner());
+    let _spawn = crate::spawn_lock::spawning();
     let previous = child_disposition(0)?;
     let child = command.spawn();
     child_disposition(previous)?;

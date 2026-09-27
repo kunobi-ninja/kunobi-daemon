@@ -53,12 +53,25 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 }
 fn bind_private(socket: &Path) -> io::Result<UnixListener> {
     // The 0700 parent excludes other users during bind; never alter global umask.
-    let listener = UnixListener::bind(socket)?;
+    let listener = crate::spawn_lock::without_spawns(|| UnixListener::bind(socket))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 /// Serialize stale-socket recovery. Only ConnectionRefused permits reclaiming
 /// an existing socket; permission failures and unrelated files are preserved.
+///
+/// # Spawning while binding
+///
+/// Linux creates the socket close-on-exec in one step. macOS takes two, and a
+/// child spawned by another thread between them inherits the listener. It
+/// keeps accepting for the child's whole life, after the returned listener is
+/// dropped or this process exits, so a successor gets `AlreadyRunning`.
+///
+/// Every spawn this crate makes waits while the socket is created:
+/// [`super::unix::spawn_with_child_waiting`], the `launch` spawns built on it,
+/// and [`crate::warmup`]. Other spawns can still capture it. A process that
+/// spawns another way while it may be binding should have each child close,
+/// or mark close-on-exec, every descriptor above stderr before it execs.
 pub fn acquire(socket: &Path) -> Result<Bound<UnixListener>, BindError> {
     // Before creating the directory or taking the lock: a path that cannot be
     // bound should leave nothing behind.
