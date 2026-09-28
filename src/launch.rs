@@ -39,6 +39,15 @@
 //! [`DaemonChild::wait_until_live`] probes it until it serves, and stops early
 //! when it exits first: the OS reports the exit as an event, so a daemon that
 //! fails at startup does not cost the caller its whole budget.
+//!
+//! # Knowing when it is ready
+//!
+//! [`DaemonCommand::readiness_channel`] gives the daemon a channel to say when
+//! it is ready and to report progress on the way (see
+//! [`crate::readiness::channel`]). A daemon that dies during startup is then
+//! noticed at once, and the launcher's deadline becomes the longest silence it
+//! accepts instead of a total. The daemon's word is not a proof: probe it
+//! before using it.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -50,6 +59,7 @@ use std::time::{Duration, Instant};
 
 use crate::local::ProcessHandle;
 use crate::readiness;
+use crate::readiness::channel::{Channel, ENV};
 
 /// Gap between unsuccessful liveness probes. Same cadence as [`readiness`].
 pub const POLL: Duration = readiness::POLL_INTERVAL;
@@ -127,6 +137,10 @@ enum EnvChange {
 /// open because of it. It is also taken out of the caller's job object when
 /// that job allows it.
 ///
+/// A [readiness channel](DaemonCommand::readiness_channel) is the one
+/// exception on Unix: its descriptor also survives the exec. On Windows the
+/// daemon opens that channel by name and inherits nothing for it.
+///
 /// # Job objects on Windows
 ///
 /// A job can forbid its processes' children from leaving it, and cargo's does:
@@ -144,6 +158,7 @@ pub struct DaemonCommand {
     current_dir: Option<PathBuf>,
     stdout: DaemonOutput,
     stderr: DaemonOutput,
+    readiness: bool,
 }
 
 impl DaemonCommand {
@@ -156,6 +171,7 @@ impl DaemonCommand {
             current_dir: None,
             stdout: DaemonOutput::Null,
             stderr: DaemonOutput::Null,
+            readiness: false,
         }
     }
 
@@ -208,6 +224,47 @@ impl DaemonCommand {
         self
     }
 
+    /// Give the daemon a readiness channel; [`DaemonChild::take_readiness`]
+    /// returns the launcher's end.
+    ///
+    /// The daemon takes its end with
+    /// [`Notifier::from_env`](crate::readiness::channel::Notifier::from_env),
+    /// which finds it through the [`ENV`] variable. Without this call the
+    /// daemon gets no channel, and [`ENV`] is removed from its environment in
+    /// case the caller's own has it.
+    ///
+    /// On Unix the channel is a pipe. On macOS the standard library creates a
+    /// pipe and then marks it close-on-exec, so a child that another thread
+    /// spawns in between, other than through this crate, can inherit it and
+    /// hide the daemon's exit. The crate's own spawns wait while the pipe is
+    /// created, as they do for a listener; see `local::unix_socket::acquire`
+    /// for what other spawns need. On Windows it is a named pipe the
+    /// daemon opens by name, and the launcher also watches the daemon's
+    /// process, so a daemon that exits before it connects is reported at once.
+    ///
+    /// ```no_run
+    /// use kunobi_daemon::launch::DaemonCommand;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut daemon = DaemonCommand::new("/usr/local/bin/exampled")
+    ///     .readiness_channel()
+    ///     .spawn()?;
+    /// let mut channel = daemon.take_readiness().expect("asked for above");
+    /// // Up to ten seconds between messages, however long the start takes.
+    /// if let Err(reason) = channel.wait(Duration::from_secs(10)) {
+    ///     let doing = channel.last_progress().unwrap_or_default();
+    ///     return Err(format!("{reason} (last progress: {doing:?})").into());
+    /// }
+    /// // Ready is the daemon's word: probe its endpoint before relying on it.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn readiness_channel(&mut self) -> &mut Self {
+        self.readiness = true;
+        self
+    }
+
     /// Start the daemon.
     ///
     /// Returns once the OS has created the process. Whether it goes on to
@@ -215,6 +272,7 @@ impl DaemonCommand {
     pub fn spawn(&self) -> io::Result<DaemonChild> {
         #[cfg(unix)]
         {
+            use std::os::fd::AsRawFd;
             let mut command = Command::new(&self.program);
             command.args(&self.args).stdin(Stdio::null());
             for change in &self.env {
@@ -228,16 +286,35 @@ impl DaemonCommand {
             }
             command.stdout(unix_stdio(&self.stdout)?);
             command.stderr(unix_stdio(&self.stderr)?);
-            crate::local::unix::spawn_in_new_session_watched(&mut command)
-                .map(|(inner, exit)| DaemonChild { inner, exit })
+            let readiness = if self.readiness {
+                let (reader, child_end) = crate::local::unix::ready_pipe()?;
+                command.env(ENV, child_end.as_raw_fd().to_string());
+                Some((Channel::start(reader)?, child_end))
+            } else {
+                command.env_remove(ENV);
+                None
+            };
+            let keep = readiness
+                .as_ref()
+                .map(|(_, child_end)| child_end.as_raw_fd());
+            let (inner, exit) =
+                crate::local::unix::spawn_in_new_session_watched(&mut command, keep)?;
+            // Dropping this copy of the daemon's end leaves the daemon the
+            // only writer, so its exit ends the channel.
+            Ok(DaemonChild {
+                inner,
+                exit,
+                readiness: readiness.map(|(channel, _child_end)| channel),
+            })
         }
         #[cfg(windows)]
         {
             use crate::local::command_line::EnvChange as WideChange;
+            use crate::local::windows::ready;
             use crate::local::windows_spawn::{Spawn, Target, spawn};
             use std::os::windows::ffi::OsStrExt;
             let wide = |text: &OsString| text.encode_wide().collect::<Vec<u16>>();
-            let env: Vec<WideChange> = self
+            let mut env: Vec<WideChange> = self
                 .env
                 .iter()
                 .map(|change| match change {
@@ -245,6 +322,19 @@ impl DaemonCommand {
                     EnvChange::Remove(name) => WideChange::Remove(wide(name)),
                 })
                 .collect();
+            let name: Vec<u16> = ENV.encode_utf16().collect();
+            // The daemon opens the channel by name, so it inherits no handle
+            // for it and neither can any other child of this process.
+            let readiness = if self.readiness {
+                let (pipe_name, pipe) = ready::create()?;
+                env.push(WideChange::Set(name, pipe_name.encode_utf16().collect()));
+                let (started, process) = std::sync::mpsc::channel();
+                let channel = Channel::start(ready::Reader::new(pipe, process))?;
+                Some((channel, started))
+            } else {
+                env.push(WideChange::Remove(name));
+                None
+            };
             fn target(output: &DaemonOutput) -> Target<'_> {
                 match output {
                     DaemonOutput::Null => Target::Null,
@@ -259,9 +349,25 @@ impl DaemonCommand {
                 stdout: target(&self.stdout),
                 stderr: target(&self.stderr),
             })?;
-            // The child's own handle keeps its PID from being reused.
-            match ProcessHandle::open(inner.id()) {
-                Ok(exit) => Ok(DaemonChild { inner, exit }),
+            let handles = (|| {
+                let exit = ProcessHandle::open(inner.id())?;
+                // Before the daemon connects, its exit is the only event
+                // that can end the channel. Clone its owned process handle.
+                let readiness = match readiness {
+                    Some((channel, started)) => {
+                        let _ = started.send(inner.watch()?);
+                        Some(channel)
+                    }
+                    None => None,
+                };
+                Ok((exit, readiness))
+            })();
+            match handles {
+                Ok((exit, readiness)) => Ok(DaemonChild {
+                    inner,
+                    exit,
+                    readiness,
+                }),
                 Err(error) => {
                     let _ = inner.kill();
                     Err(error)
@@ -294,6 +400,7 @@ pub struct DaemonChild {
     #[cfg(windows)]
     inner: crate::local::windows_spawn::WindowsChild,
     exit: ProcessHandle,
+    readiness: Option<Channel>,
 }
 
 /// How [`DaemonChild::wait_until_live`] ended.
@@ -316,6 +423,12 @@ impl DaemonChild {
     /// The daemon's process ID.
     pub fn id(&self) -> u32 {
         self.inner.id()
+    }
+
+    /// The launcher's end of the readiness channel, the first time it is
+    /// asked for. `None` without [`DaemonCommand::readiness_channel`].
+    pub fn take_readiness(&mut self) -> Option<Channel> {
+        self.readiness.take()
     }
 
     /// True when the daemon was left in the caller's job object because that
@@ -833,6 +946,191 @@ mod tests {
         };
         let mut command = Command::new(bin);
         let mut child = spawn_detached(&mut command).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    // ── Readiness channel ───────────────────────────────────────────
+
+    use crate::readiness::channel::{NotReady, Notifier};
+
+    /// Long enough never to pass in a test that expects an answer first.
+    const SILENCE: Duration = Duration::from_secs(60);
+
+    fn progress_then_ready(mut notifier: Notifier) -> io::Result<()> {
+        notifier.progress("")?;
+        notifier.progress("loading")?;
+        notifier.ready()
+    }
+
+    /// Run by the readiness tests as the daemon, which reports what it found
+    /// in the file the test names. Does nothing in a normal test run.
+    #[test]
+    #[ignore = "helper process for the readiness tests"]
+    #[allow(unsafe_code)]
+    fn readiness_helper() {
+        let (Some(mode), Some(out)) = (
+            std::env::var_os("KDAEMON_READY_HELPER"),
+            std::env::var_os("KDAEMON_READY_HELPER_OUT"),
+        ) else {
+            return;
+        };
+        // SAFETY: this process runs this one test; libtest's main thread only
+        // waits for it and does not touch the environment. The launcher that
+        // set the variable is the test that started this process.
+        let taken = unsafe { Notifier::from_env() };
+        // Taking the channel removes the variable, so nothing else sees it.
+        let left = std::env::var_os(ENV).is_some();
+        // SAFETY: as above.
+        let again = unsafe { Notifier::from_env() };
+        let report = match (mode.to_str(), taken) {
+            _ if left => "the variable was left in the environment".to_owned(),
+            _ if !matches!(again, Ok(None)) => format!("taken twice: {again:?}"),
+            (Some("progress-then-ready"), Ok(Some(notifier))) => {
+                match progress_then_ready(notifier) {
+                    Ok(()) => "sent".to_owned(),
+                    Err(error) => error.to_string(),
+                }
+            }
+            (Some("exit-before-ready"), Ok(Some(_notifier))) => "exiting".to_owned(),
+            (Some("no-channel"), Ok(None)) => "no channel".to_owned(),
+            (mode, taken) => format!("unexpected: {mode:?} {taken:?}"),
+        };
+        std::fs::write(out, report).unwrap();
+    }
+
+    /// This test binary as a daemon running [`readiness_helper`] in `mode`.
+    fn readiness_helper_daemon(mode: &str, out: &Path) -> DaemonCommand {
+        let mut command = DaemonCommand::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "launch::tests::readiness_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KDAEMON_READY_HELPER", mode)
+            .env("KDAEMON_READY_HELPER_OUT", out.as_os_str());
+        command
+    }
+
+    /// A daemon that runs for 30 seconds unless it is killed, and says nothing.
+    fn silent_daemon() -> DaemonCommand {
+        #[cfg(unix)]
+        {
+            let mut command = DaemonCommand::new("/bin/sleep");
+            command.arg("30");
+            command
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            let mut command =
+                DaemonCommand::new(PathBuf::from(root).join("System32").join("PING.EXE"));
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        }
+    }
+
+    #[test]
+    fn a_daemon_reports_progress_then_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report");
+        let mut child = readiness_helper_daemon("progress-then-ready", &out)
+            .readiness_channel()
+            .spawn()
+            .unwrap();
+        let mut channel = child.take_readiness().expect("the channel was asked for");
+        assert!(
+            child.take_readiness().is_none(),
+            "the channel is taken once"
+        );
+        assert_eq!(channel.wait(SILENCE), Ok(()));
+        assert_eq!(channel.progress_reports(), 2);
+        assert_eq!(channel.last_progress().as_deref(), Some("loading"));
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "sent");
+    }
+
+    #[test]
+    fn a_daemon_that_exits_before_ready_is_noticed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report");
+        let mut child = readiness_helper_daemon("exit-before-ready", &out)
+            .readiness_channel()
+            .spawn()
+            .unwrap();
+        let mut channel = child.take_readiness().unwrap();
+        // Both observers follow the same daemon: opening its exit handle
+        // must neither lose the readiness descriptor nor keep it alive.
+        assert!(
+            child
+                .exit_handle()
+                .wait_until(Instant::now() + SILENCE)
+                .unwrap()
+        );
+        assert_eq!(channel.wait(SILENCE), Err(NotReady::Died));
+        assert_eq!(
+            child
+                .wait_until_live(Instant::now() + SILENCE, || false)
+                .unwrap(),
+            Startup::Exited,
+        );
+        child.wait().unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "exiting");
+    }
+
+    #[test]
+    fn a_killed_daemon_ends_its_channel() {
+        let mut child = silent_daemon().readiness_channel().spawn().unwrap();
+        let mut channel = child.take_readiness().unwrap();
+        // The daemon holds its end while it runs.
+        assert_eq!(channel.wait(Duration::ZERO), Err(NotReady::Silent));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The launcher kept no copy of the daemon's end, so the kill ends it.
+        assert_eq!(channel.wait(SILENCE), Err(NotReady::Died));
+    }
+
+    #[test]
+    fn without_opting_in_the_daemon_gets_no_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report");
+        let mut command = readiness_helper_daemon("no-channel", &out);
+        // A value in the caller's own environment never reaches the daemon.
+        command.env(ENV, "5");
+        let mut child = command.spawn().unwrap();
+        assert!(child.take_readiness().is_none());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "no channel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_with_a_readiness_channel_still_does_not_keep_the_callers_pipe_open() {
+        let (read, write) = crate::local::unix::inheritable_pipe();
+        let mut command = DaemonCommand::new("/bin/sleep");
+        command.arg("30").readiness_channel();
+        let mut child = command.spawn().unwrap();
+        drop(write);
+        let eof = reaches_eof_within(read, Duration::from_secs(5));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(eof, "the channel's exception let the caller's pipe through");
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn a_daemon_s_readiness_can_be_awaited() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report");
+        let mut child = readiness_helper_daemon("progress-then-ready", &out)
+            .readiness_channel()
+            .spawn()
+            .unwrap();
+        let mut channel = child.take_readiness().unwrap();
+        assert_eq!(channel.wait_async(SILENCE).await, Ok(()));
+        assert_eq!(channel.progress_reports(), 2);
         assert!(child.wait().unwrap().success());
     }
 }

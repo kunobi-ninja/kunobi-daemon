@@ -340,22 +340,25 @@ pub(crate) fn interrupt_process_group(pgid: u32) -> io::Result<()> {
 pub fn spawn_in_new_session(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
-    in_new_session(command);
+    in_new_session(command, None);
     spawn_with_child_waiting(command)
 }
 
 /// [`spawn_in_new_session`], with the child's exit handle opened before
-/// anything can reap the child.
+/// anything can reap the child. `keep` preserves the readiness channel across
+/// exec; the caller owns it and closes its copy after the spawn.
 #[cfg(feature = "launch")]
 pub(crate) fn spawn_in_new_session_watched(
     command: &mut std::process::Command,
+    keep: Option<RawFd>,
 ) -> io::Result<(std::process::Child, super::ProcessHandle)> {
-    in_new_session(command);
+    in_new_session(command, keep);
     spawn_then(command, super::ProcessHandle::for_child)
 }
 
-/// Make `command` lead a new session with only its standard descriptors.
-fn in_new_session(command: &mut std::process::Command) {
+/// Make `command` lead a new session, preserving only standard descriptors
+/// and the optional readiness channel.
+fn in_new_session(command: &mut std::process::Command, keep: Option<RawFd>) {
     use std::os::unix::process::CommandExt;
     // Computed here, in the parent: getrlimit is not on the async-signal-safe
     // list, and the child may only make such calls between fork and exec.
@@ -368,6 +371,12 @@ fn in_new_session(command: &mut std::process::Command) {
             return Err(io::Error::last_os_error());
         }
         mark_inherited_descriptors_cloexec(descriptor_limit);
+        if let Some(fd) = keep {
+            // SAFETY: F_SETFD with no flags only clears close-on-exec on this
+            // one descriptor, which the fork copied from the parent's open
+            // channel end. A number that is not open fails with EBADF.
+            checked(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })?;
+        }
         Ok(())
     };
     // SAFETY: the hook runs in the forked child between fork and exec. It
@@ -377,6 +386,97 @@ fn in_new_session(command: &mut std::process::Command) {
     unsafe {
         command.pre_exec(prepare);
     }
+}
+
+/// A libc call's result, or the error it set. Only -1 reports failure.
+///
+/// Safe in a pre-exec hook: it reads `errno` and allocates nothing.
+fn checked(result: libc::c_int) -> io::Result<libc::c_int> {
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+/// A readiness channel: the launcher's end, and the daemon's end as a
+/// close-on-exec descriptor above stderr.
+///
+/// The daemon's end is moved to 3 or above, because a child's standard
+/// streams are set up before the descriptor sweep and would replace a channel
+/// at 0, 1 or 2, which a caller with a closed standard stream can be handed.
+///
+/// # Spawning while creating the pipe
+///
+/// Linux creates the pipe close-on-exec in one step (`pipe2`). macOS takes
+/// two, and a child spawned by another thread between them inherits both
+/// ends. A child holding the write end keeps the channel open for its whole
+/// life, so the launcher sees neither the daemon's exit nor its end of the
+/// channel.
+///
+/// The pipe is created while no spawn by this crate is under way, as a
+/// listener is in [`crate::local::unix_socket::acquire`]. Other spawns can
+/// still capture it. A process that spawns another way while it may be
+/// launching a daemon should have each child close, or mark close-on-exec,
+/// every descriptor above stderr before it execs.
+#[cfg(feature = "launch")]
+pub(crate) fn ready_pipe() -> io::Result<(std::io::PipeReader, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (reader, writer) = crate::spawn_lock::without_spawns(std::io::pipe)?;
+    let writer = OwnedFd::from(writer);
+    // SAFETY: F_DUPFD_CLOEXEC only duplicates this process's open `writer`
+    // onto the lowest free number from 3 up, close-on-exec in the same step.
+    let raised = checked(unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) })?;
+    // SAFETY: fcntl returned a new open descriptor that nothing else owns.
+    Ok((reader, unsafe { OwnedFd::from_raw_fd(raised) }))
+}
+
+/// Take over the daemon's end of a readiness channel, named by the decimal
+/// descriptor number `value`.
+///
+/// Refuses, without touching it, anything but the write end of a pipe above
+/// stderr. The descriptor becomes close-on-exec, so programs the daemon
+/// starts do not hold the channel open.
+///
+/// # Safety
+///
+/// A descriptor `value` names must be this process's channel end, which
+/// nothing else in the process owns or closes: the returned writer closes it
+/// when dropped. The checks catch a value that names no pipe, not one that
+/// names some other pipe's write end.
+pub(crate) unsafe fn take_ready_descriptor(value: &str) -> io::Result<std::io::PipeWriter> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let refuse = |message: &'static str| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let fd: RawFd = value
+        .parse()
+        .map_err(|_| refuse("the readiness channel is not a descriptor number"))?;
+    if fd <= 2 {
+        return Err(refuse("a standard stream is not a readiness channel"));
+    }
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes a `stat` into this valid slot, or fails with EBADF
+    // for a number that is not an open descriptor and writes nothing.
+    checked(unsafe { libc::fstat(fd, status.as_mut_ptr()) })?;
+    // SAFETY: fstat succeeded, so it initialised `status`.
+    let status = unsafe { status.assume_init() };
+    if (status.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+        return Err(refuse("the readiness channel is not a pipe"));
+    }
+    // SAFETY: F_GETFL only reads the open file's status flags.
+    let flags = checked(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+    if (flags & libc::O_ACCMODE) != libc::O_WRONLY {
+        return Err(refuse(
+            "the readiness channel is not the write end of a pipe",
+        ));
+    }
+    // SAFETY: F_SETFD sets only this descriptor's close-on-exec flag, the
+    // only descriptor flag there is.
+    checked(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    // SAFETY: the descriptor is open (checked above), and the caller
+    // guarantees that nothing else in this process owns it.
+    Ok(std::io::PipeWriter::from(unsafe {
+        OwnedFd::from_raw_fd(fd)
+    }))
 }
 
 /// The highest descriptor number to consider, from the soft RLIMIT_NOFILE.
@@ -728,6 +828,14 @@ fn bounded_io(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_minus_one_is_a_failed_call() {
+        assert_eq!(super::checked(0).unwrap(), 0);
+        assert_eq!(super::checked(1).unwrap(), 1);
+        assert_eq!(super::checked(3).unwrap(), 3);
+        assert!(super::checked(-1).is_err());
+    }
+
     use super::*;
     use std::os::unix::net::UnixListener;
 
@@ -782,6 +890,77 @@ mod tests {
         assert!(process_has_exited(pid));
     }
 
+    /// Hand `fd` back to an owner after a refused take.
+    fn reclaim(fd: RawFd) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: the test owned `fd` and the refused take did not close it.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+
+    #[test]
+    fn only_the_write_end_of_a_pipe_is_taken_as_a_readiness_channel() {
+        use std::os::fd::{IntoRawFd, OwnedFd};
+        for value in ["", "x", "-1", "0", "1", "2"] {
+            // SAFETY: refused before any descriptor is touched.
+            let error = unsafe { take_ready_descriptor(value) }.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{value:?}");
+        }
+
+        let file = tempfile::tempfile().unwrap().into_raw_fd();
+        // SAFETY: the test owns `file`, and a refused take leaves it alone.
+        let error = unsafe { take_ready_descriptor(&file.to_string()) }.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        reclaim(file);
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        let read_end = OwnedFd::from(reader).into_raw_fd();
+        // SAFETY: the test owns `read_end`, and a refused take leaves it alone.
+        let error = unsafe { take_ready_descriptor(&read_end.to_string()) }.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        reclaim(read_end);
+        drop(writer);
+    }
+
+    #[test]
+    fn a_taken_readiness_channel_is_not_inherited_and_carries_messages() {
+        use std::os::fd::{IntoRawFd, OwnedFd};
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let write_end = OwnedFd::from(writer);
+        // SAFETY: clears close-on-exec on an open descriptor this test owns,
+        // as the launcher's child sees its channel end after the exec.
+        let cleared = unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_ne!(cleared, -1);
+        let write_end = write_end.into_raw_fd();
+        // SAFETY: the test gave up ownership of `write_end` just above.
+        let mut pipe = unsafe { take_ready_descriptor(&write_end.to_string()) }.unwrap();
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        let flags = unsafe { libc::fcntl(write_end, libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "programs the daemon starts would hold it"
+        );
+        pipe.write_all(b"ready\n").unwrap();
+        let mut received = [0u8; 6];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ready\n");
+    }
+
+    #[cfg(feature = "launch")]
+    #[test]
+    fn a_readiness_pipe_leaves_the_standard_streams_alone() {
+        let (_reader, child_end) = ready_pipe().unwrap();
+        let fd = child_end.as_raw_fd();
+        assert!(fd > 2, "{fd}");
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "another child could inherit it"
+        );
+    }
+
     #[test]
     fn the_signal_fallback_reports_alive_exited_and_unknown() {
         use super::super::ProcessState;
@@ -809,7 +988,7 @@ mod tests {
     #[test]
     fn a_new_session_child_is_watched_from_its_spawn() {
         let mut command = std::process::Command::new("true");
-        let (mut child, mut exit) = spawn_in_new_session_watched(&mut command).unwrap();
+        let (mut child, mut exit) = spawn_in_new_session_watched(&mut command, None).unwrap();
         assert_eq!(exit.pid(), child.id());
         exit.wait().unwrap();
         assert!(child.wait().unwrap().success());

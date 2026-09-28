@@ -174,6 +174,12 @@ impl WindowsChild {
         self.in_callers_job
     }
 
+    /// A second handle to the process, for a thread that waits on its exit
+    /// while this one may be dropped.
+    pub(crate) fn watch(&self) -> io::Result<OwnedHandle> {
+        self.process.try_clone()
+    }
+
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.wait_for(0)
     }

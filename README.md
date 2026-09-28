@@ -21,6 +21,8 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
   request is answered where the transport has no half-close.
 - `launch`: clients that may start the daemon, including `DaemonCommand` for a
   daemon fully detached from its caller. Off by default; needs `local`.
+- `readiness::channel`: an optional channel over which a daemon started by
+  `DaemonCommand` says when it is ready and reports progress.
 - `admission` and `observation`: independent capacity pools and local telemetry data.
 
 See [Daemon lifecycle and replacement](https://github.com/kunobi-ninja/kunobi-daemon/blob/main/docs/architecture.md) for the transition
@@ -62,6 +64,50 @@ checking the PID, and says so.
 never folds an access-denied query into either answer. Alive describes the PID,
 which the OS reuses, so confirm the daemon through its endpoint before trusting
 it.
+
+## Knowing when a started daemon is ready
+
+Ask for a readiness channel when building the command, and wait on it instead
+of polling a probe against a fixed deadline:
+
+```rust,ignore
+let mut daemon = DaemonCommand::new(program).readiness_channel().spawn()?;
+let mut channel = daemon.take_readiness().expect("asked for above");
+channel.wait(Duration::from_secs(10))?; // the longest silence, not the total
+// Then probe the endpoint: the daemon's word is not a proof.
+```
+
+The daemon takes its end with `readiness::channel::Notifier::from_env()`
+(`local` feature), which returns `None` when no launcher asked for a channel.
+It may call `progress` while it starts and calls `ready` once it serves.
+`from_env` is `unsafe`. Call it early, before other threads touch the
+environment, because it removes the variable. On Unix call it only in a
+process started with a readiness channel, because it adopts the descriptor the
+variable names, as with systemd's `LISTEN_FDS`.
+
+```rust,ignore
+// SAFETY: first thing in main, in a daemon started with a readiness channel.
+if let Ok(Some(mut notifier)) = unsafe { Notifier::from_env() } {
+    let _ = notifier.progress("opening the cache");
+    // ... bind and start serving ...
+    let _ = notifier.ready();
+}
+```
+
+Each message restarts the launcher's silence bound, so a slow start that keeps
+reporting progress is not cut off. A daemon that exits or closes the channel
+before `ready` is reported as `NotReady::Died` at once. A malformed message
+fails the wait. `selection::Evidence` users wrap their evidence in
+`readiness::channel::Signaled`, which wakes each round on the channel instead
+of a poll interval and keeps the selection rules: only a fresh probe reports a
+candidate current.
+
+On Unix the channel is a pipe whose write end is the only descriptor above
+stderr that survives the exec. On Windows it is a named pipe with a random
+name that only the current user can open; the daemon opens it by name, so no
+handle is inherited, and the launcher also watches the daemon's process to
+notice an exit before it connects. The protocol is one ASCII line per
+message: `ready`, `progress` or `progress <detail>`.
 
 ## Request draining
 

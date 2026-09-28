@@ -56,6 +56,17 @@ process and generation against its protocol/build policy. `readiness` bounds tha
 verifier by an absolute deadline. Blocking probes must honor their supplied budget;
 async probes are also enclosed by the timeout.
 
+A daemon started through `launch::DaemonCommand` can also say when a probe is
+worth making, over the optional `readiness::channel`. It writes `ready` once
+serving and may report `progress` before that. The launcher's bound is the
+longest silence between messages, not a total, and the channel ending before
+`ready` reports the daemon dead at once instead of at the deadline. The
+signal is not a proof either: a fresh probe still follows it. On Unix the
+channel's write end is the one controlled exception to closing descriptors
+above stderr across the exec. On Windows the daemon opens a named pipe that
+only the current user can open, so it inherits nothing, and the launcher
+watches its process as well as the pipe.
+
 A process that launches or awaits a candidate without holding the upgrade lock
 uses `selection` instead of its own loop. Each round reads the published
 selection before probing, so a probe that reached the incumbent is never paired
@@ -68,6 +79,11 @@ wait between rounds; a source that can be woken replaces it without changing
 these rules. A candidate's exit is such a source: `Candidate::exit_handle`
 gives a `local::ProcessHandle` to wait on between probes, so a candidate that
 dies before it is ready ends the wait at once instead of after the budget.
+
+`readiness::channel::Signaled` is one: before the daemon says it
+is ready, a round starts on the channel's news. A dead or silent channel ends
+the wait only when that round's probe also fails, so a probe that reaches
+another instance still reports it current.
 
 `Lifecycle` owns one irreversible admission gate. Acquire a request guard at the
 application's operation boundary and keep it until the reply has been delivered or
