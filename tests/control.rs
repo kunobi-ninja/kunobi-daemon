@@ -100,7 +100,7 @@ async fn stalled_handshake_is_bounded_without_starting_drain() {
 
 fn watch_offer() -> wire::Hello {
     let mut offer = offer();
-    offer.supported |= capability::WATCH;
+    offer.supported |= capability::WATCH | capability::APPLICATION;
     offer
 }
 
@@ -121,6 +121,7 @@ async fn watch_streams_ready_committed_selection_and_drain_without_idle_polling(
             .selection_committed(4, "wrong-build".into())
             .is_err()
     );
+    service.selection_committed(3, "incumbent".into()).unwrap();
     service.selection_committed(3, "incumbent".into()).unwrap();
     let (client, server) = tokio::io::duplex(1024);
     let serving = Arc::clone(&service);
@@ -307,7 +308,7 @@ async fn watch_releases_a_subscriber_that_stops_reading() {
 async fn invalid_watch_events_are_terminal_and_cannot_resume_the_stream() {
     use buffa::Message;
     use kunobi_daemon::control::WatchClient;
-    for fault in 0..11 {
+    for fault in 0..21 {
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
             let mut session = wire::AsyncSession::accept(server, &watch_offer())
@@ -323,6 +324,14 @@ async fn invalid_watch_events_are_terminal_and_cannot_resume_the_stream() {
                 selected_build: "selected".into(),
                 ..Default::default()
             };
+            if fault == 18 {
+                event.selected_generation = None;
+                event.selected_build.clear();
+            }
+            if fault == 19 || fault == 20 {
+                event.draining = true;
+                event.retiring = fault == 20;
+            }
             let mut reply = wire::Control {
                 operation: operation::WATCH,
                 request_id: request.request_id,
@@ -350,6 +359,20 @@ async fn invalid_watch_events_are_terminal_and_cannot_resume_the_stream() {
                     event.selected_generation = None;
                     event.selected_build.clear();
                 }
+                11 => reply.generation += 1,
+                12 => reply.kind = wire::MessageKind::Application.into(),
+                13 => reply.operation = operation::HEALTH,
+                14 => reply.offset = Some(0),
+                15 => event.change = wire::LifecycleChange::Ready.into(),
+                16 => event.change = wire::LifecycleChange::Draining.into(),
+                17 => event.change = wire::LifecycleChange::Retiring.into(),
+                18 => {
+                    event.change = wire::LifecycleChange::SelectionChanged.into();
+                    event.selected_generation = None;
+                    event.selected_build.clear();
+                }
+                19 => event.draining = false,
+                20 => event.retiring = false,
                 _ => unreachable!(),
             }
             reply.payload = event.encode_to_vec();
@@ -458,4 +481,131 @@ async fn cancelling_a_watch_read_requires_reconnection() {
     drop(client);
     // The peer may observe either EOF or a broken pipe if readiness was in flight.
     let _ = task.await.unwrap();
+}
+
+#[tokio::test]
+async fn watch_initial_snapshot_has_coherent_identity_and_selection() {
+    use buffa::Message;
+    use kunobi_daemon::control::WatchClient;
+    for fault in 0..6 {
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let mut session = wire::AsyncSession::accept(server, &watch_offer())
+                .await
+                .unwrap();
+            let request = session.receive().await.unwrap();
+            let mut event = wire::LifecycleEvent {
+                sequence: 1,
+                process_id: 123,
+                generation: 4,
+                build: "own".into(),
+                selected_generation: Some(4),
+                selected_build: "own".into(),
+                ..Default::default()
+            };
+            match fault {
+                0 => event.sequence = 2,
+                1 => {
+                    event.change = wire::LifecycleChange::Ready.into();
+                    event.ready = true;
+                }
+                2 => event.process_id = 0,
+                3 => event.selected_generation = None,
+                4 => event.selected_build = "wrong-build".into(),
+                _ => {} // The selected serving generation must also be accepted.
+            }
+            session
+                .send(&wire::Control {
+                    operation: operation::WATCH,
+                    request_id: request.request_id,
+                    generation: 4,
+                    payload: event.encode_to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        });
+        let result = WatchClient::connect(
+            client,
+            &watch_offer(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        if fault == 5 {
+            assert!(result.unwrap().is_some());
+        } else {
+            assert!(result.is_err(), "accepted invalid initial snapshot {fault}");
+        }
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn watch_checks_its_own_offer_and_needs_no_unrelated_capabilities() {
+    use kunobi_daemon::control::WatchClient;
+    let (client, _server) = tokio::io::duplex(128);
+    let result =
+        WatchClient::connect(client, &offer(), Instant::now() + Duration::from_millis(20)).await;
+    assert_eq!(
+        result.err().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let mut only_watch = watch_offer();
+    only_watch.supported = capability::WATCH;
+    only_watch.required = capability::WATCH;
+    let server_offer = only_watch.clone();
+    let (client, server) = tokio::io::duplex(1024);
+    let task = tokio::spawn(async move {
+        ControlService::new(Arc::new(Lifecycle::default()), 4, "own".into(), 0)
+            .serve(
+                server,
+                &server_offer,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+    });
+    let client = WatchClient::connect(client, &only_watch, Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn watch_request_fields_are_validated_before_subscribing() {
+    for case in 0..5 {
+        let (client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            ControlService::new(Arc::new(Lifecycle::default()), 4, "own".into(), 0)
+                .serve(
+                    server,
+                    &watch_offer(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        });
+        let mut session = wire::AsyncSession::connect(client, &watch_offer())
+            .await
+            .unwrap();
+        let mut request = request(operation::WATCH);
+        match case {
+            0 => request.token.push(1),
+            1 => request.offset = Some(0),
+            2 => request.generation = 3,
+            3 => request.generation = 4,
+            _ => {}
+        }
+        session.send(&request).await.unwrap();
+        if case >= 3 {
+            assert_eq!(session.receive().await.unwrap().generation, 4);
+            drop(session);
+            task.await.unwrap().unwrap();
+        } else {
+            assert_eq!(
+                task.await.unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
 }

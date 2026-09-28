@@ -368,3 +368,119 @@ async fn stateful_readiness_retains_the_probe_and_bounds_a_stalled_peer() {
     assert_eq!(result, None);
     assert_eq!(probe.0, 3);
 }
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn async_warming_occurs_once_after_commit_and_never_for_unchanged_selection() {
+    struct Warming {
+        last: Option<Step>,
+        calls: std::cell::Cell<usize>,
+        unchanged: bool,
+    }
+    impl replacement::AsyncDriver for Warming {
+        type Error = Infallible;
+        async fn perform(
+            &mut self,
+            step: Step,
+            _: Option<tokio::time::Instant>,
+        ) -> Result<Progress, Infallible> {
+            self.last = Some(step);
+            Ok(if self.unchanged {
+                Progress::Unchanged
+            } else {
+                Progress::Done
+            })
+        }
+        fn warmup_paths(&self) -> Vec<std::path::PathBuf> {
+            assert_eq!(
+                self.last,
+                Some(Step::Commit),
+                "warming preceded the commit or repeated after it"
+            );
+            self.calls.set(self.calls.get() + 1);
+            vec![]
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let lock = ProcessLock::try_acquire(dir.path().join("upgrade.lock"))
+        .unwrap()
+        .unwrap();
+    for mode in [Mode::Exclusive, Mode::Overlap] {
+        for unchanged in [false, true] {
+            let mut driver = Warming {
+                last: None,
+                calls: 0.into(),
+                unchanged,
+            };
+            replacement::run_async(&lock, mode, budgets(), &mut driver)
+                .await
+                .unwrap();
+            assert_eq!(driver.calls.get(), if unchanged { 0 } else { 1 });
+        }
+    }
+}
+
+#[cfg(all(feature = "async", feature = "local", unix))]
+#[tokio::test(flavor = "current_thread")]
+async fn warming_opens_its_paths_without_blocking_the_async_worker() {
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Warming(std::path::PathBuf);
+    impl replacement::AsyncDriver for Warming {
+        type Error = Infallible;
+        async fn perform(
+            &mut self,
+            _: Step,
+            _: Option<tokio::time::Instant>,
+        ) -> Result<Progress, Infallible> {
+            Ok(Progress::Done)
+        }
+        fn warmup_paths(&self) -> Vec<std::path::PathBuf> {
+            vec![self.0.clone()]
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("warming-fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (scheduled, schedule) = std::sync::mpsc::channel();
+    let writer_path = fifo.clone();
+    // Opening a FIFO for read blocks until a writer connects. The writer waits
+    // for another async future to run first, with a watchdog to fail rather
+    // than hang if warming blocks the runtime or is accidentally removed.
+    let writer = std::thread::spawn(move || {
+        let runtime_progressed = schedule.recv_timeout(Duration::from_secs(2)).is_ok();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(_writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&writer_path)
+            {
+                return (runtime_progressed, true);
+            }
+            if Instant::now() >= deadline {
+                return (runtime_progressed, false);
+            }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded watchdog for the FIFO test's native writer."
+            )]
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let lock = ProcessLock::try_acquire(dir.path().join("upgrade.lock"))
+        .unwrap()
+        .unwrap();
+    let mut driver = Warming(fifo);
+    let (outcome, ()) = tokio::join!(biased;
+        replacement::run_async(&lock, Mode::Exclusive, budgets(), &mut driver),
+        async { let _ = scheduled.send(()); },
+    );
+    assert_eq!(outcome.unwrap(), Outcome::Complete);
+    assert_eq!(writer.join().unwrap(), (true, true));
+}

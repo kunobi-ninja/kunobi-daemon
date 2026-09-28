@@ -195,7 +195,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WatchClient<S> {
             }
             let request = Control {
                 operation: operation::WATCH,
-                request_id: 1,
                 ..Default::default()
             };
             session.send(&request).await?;
