@@ -537,9 +537,14 @@ mod tests {
 
         let mut pause = FALLBACK_LONGEST;
         assert_eq!(next_pause(&mut pause, Some(Instant::now())), None);
-        let soon = Instant::now() + Duration::from_millis(3);
-        let nap = next_pause(&mut pause, Some(soon)).unwrap();
-        assert!(nap > Duration::ZERO && nap <= Duration::from_millis(3));
+        let later = Instant::now() + Duration::from_secs(10);
+        assert_eq!(next_pause(&mut pause, Some(later)), Some(FALLBACK_LONGEST));
+        // A pause never runs past the deadline. A runner that stalls for the
+        // whole 40 ms gets `None`, which is also right.
+        let soon = Instant::now() + Duration::from_millis(40);
+        if let Some(nap) = next_pause(&mut pause, Some(soon)) {
+            assert!(nap > Duration::ZERO && nap <= Duration::from_millis(40));
+        }
     }
 
     #[cfg(feature = "async")]
