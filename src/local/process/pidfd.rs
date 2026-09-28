@@ -11,11 +11,6 @@ use std::time::Instant;
 
 use super::{Opened, millis_until};
 
-/// `poll` bits meaning the process exited. Newer kernels add POLLHUP once
-/// the process has also been reaped.
-const EXITED: libc::c_short = libc::POLLIN | libc::POLLHUP;
-/// `poll` bits meaning the descriptor itself failed.
-const FAILED: libc::c_short = libc::POLLERR | libc::POLLNVAL;
 
 #[derive(Debug)]
 pub(super) struct Event {
@@ -95,13 +90,18 @@ fn poll_timeout(deadline: Option<Instant>) -> libc::c_int {
 }
 
 /// Whether the returned events report an exit. None at all is a timeout.
+///
+/// POLLIN means the process exited; newer kernels add POLLHUP once it has
+/// also been reaped. POLLERR or POLLNVAL means the descriptor itself failed.
+/// Each bit is tested on its own: OR-ing disjoint flags into one mask gives
+/// the same value as XOR, a change no test could tell apart.
 fn exited_from(revents: libc::c_short) -> io::Result<bool> {
-    if revents & FAILED != 0 {
+    if revents & libc::POLLERR != 0 || revents & libc::POLLNVAL != 0 {
         return Err(io::Error::other(format!(
             "polling the pidfd failed with events {revents:#x}"
         )));
     }
-    Ok(revents & EXITED != 0)
+    Ok(revents & libc::POLLIN != 0 || revents & libc::POLLHUP != 0)
 }
 
 fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {

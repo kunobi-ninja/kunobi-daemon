@@ -499,6 +499,8 @@ fn cancel_and_reap(
     }
 }
 
+pub use super::process::{process_has_exited, process_state};
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -632,8 +634,6 @@ mod tests {
         server.join().unwrap();
     }
 }
-
-pub use super::process::{process_has_exited, process_state};
 
 static SESSION_END: AtomicBool = AtomicBool::new(false);
 
