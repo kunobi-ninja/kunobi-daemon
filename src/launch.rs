@@ -607,6 +607,10 @@ mod tests {
                 Instant::now() < stale_deadline,
                 "closed listener stayed live"
             );
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded test probe waits for the closed Unix listener to stop accepting."
+            )]
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!wait_until_live(
@@ -638,6 +642,10 @@ mod tests {
         let delayed_socket = sock.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let delayed = std::thread::spawn(move || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The fixture binds after startup to exercise retrying a failed liveness probe."
+            )]
             std::thread::sleep(Duration::from_millis(250));
             let listener = std::os::unix::net::UnixListener::bind(delayed_socket).unwrap();
             let _ = stop_rx.recv_timeout(Duration::from_secs(2));
@@ -671,6 +679,10 @@ mod tests {
         let child = sleeper();
         std::fs::write(&out, child.id().to_string()).unwrap();
         // Stay alive until the signal ends this process.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The signal-test helper must stay alive until the parent sends SIGINT."
+        )]
         std::thread::sleep(Duration::from_secs(30));
     }
 
@@ -703,6 +715,10 @@ mod tests {
                 break pid;
             }
             assert!(Instant::now() < deadline, "helper never started the daemon");
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The cross-process fixture reports its daemon PID through a file, with a deadline."
+            )]
             std::thread::sleep(Duration::from_millis(20));
         };
         // Opened while the daemon certainly runs, so it follows that process.

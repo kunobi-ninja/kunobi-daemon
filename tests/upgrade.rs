@@ -21,11 +21,13 @@ async fn each_upgrade_phase_consumes_the_original_budget() {
         &dir.path().join("upgrade.lock"),
         start + Duration::from_secs(1),
         || async {
+            #[expect(clippy::disallowed_methods, reason = "Paused Tokio time consumes the probe share of the common upgrade budget.")]
             tokio::time::sleep(Duration::from_millis(400)).await;
             Ok::<_, Infallible>(None::<u8>)
         },
         |_| true,
         || async {
+            #[expect(clippy::disallowed_methods, reason = "Paused Tokio time consumes the replacement share of the common upgrade budget.")]
             tokio::time::sleep(Duration::from_millis(400)).await;
             Ok(())
         },

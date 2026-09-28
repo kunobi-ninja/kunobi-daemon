@@ -138,6 +138,10 @@ fn bind_and_drop(socket: &Path, race: &Race) -> Result<usize, String> {
 fn keeps_accepting(socket: &Path) -> Result<bool, String> {
     let deadline = Instant::now() + SETTLE;
     loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The test probes that an inherited listener stays live across the settle interval."
+        )]
         std::thread::sleep(PROBE_INTERVAL);
         match UnixStream::connect(socket) {
             Ok(_) if Instant::now() >= deadline => return Ok(true),
@@ -155,6 +159,10 @@ fn spawn_children(spawn: Spawn, race: &Race) -> io::Result<()> {
     let mut result = Ok(());
     for _ in 0..SPAWNS {
         while race.checking.load(SeqCst) > 0 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The race fixture pauses spawning while the checker measures listener inheritance."
+            )]
             std::thread::sleep(PROBE_INTERVAL);
         }
         if race.over.load(SeqCst) {

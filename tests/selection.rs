@@ -171,6 +171,10 @@ fn a_proof_returned_after_the_round_deadline_is_rejected() {
             Ok(false)
         }
         fn probe(&mut self, deadline: Instant) -> Result<Option<()>, ()> {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The fixture returns a proof after its deadline to verify that it is rejected."
+            )]
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             Ok(Some(()))
         }
@@ -278,6 +282,10 @@ mod asynchronous {
         async fn probe(&mut self) -> Result<Option<()>, ()> {
             self.probes += 1;
             if self.probes == 1 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Paused Tokio time moves the commit during a failed probe."
+                )]
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 self.committed = true;
                 return Ok(None);

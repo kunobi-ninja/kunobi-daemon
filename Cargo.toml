@@ -55,6 +55,7 @@ missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 
 [lints.clippy]
+disallowed_methods = "deny"
 # Nearly all of this crate's unsafe is FFI into Win32 and libc, where the
 # invariant lives in the platform's documentation rather than in Rust's types.
 # A block without that justification written down should fail the build.

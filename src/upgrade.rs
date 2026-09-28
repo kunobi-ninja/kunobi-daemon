@@ -80,6 +80,7 @@ where
             {
                 break guard;
             }
+            #[expect(clippy::disallowed_methods, reason = "The cross-process upgrade lock exposes try_acquire but no async wake source.")]
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
         if let Some(current) = probe().await.map_err(UpgradeError::Probe)?
@@ -94,6 +95,7 @@ where
             {
                 return Ok(current);
             }
+            #[expect(clippy::disallowed_methods, reason = "The application probe exposes no readiness event; the outer timeout bounds retries.")]
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })

@@ -117,6 +117,7 @@ pub async fn connect(root: &Path) -> io::Result<Option<(Identity, Peer)>> {
 pub async fn wait_file(path: &Path) {
     timeout(BUDGET, async {
         while !path.exists() {
+            #[expect(clippy::disallowed_methods, reason = "The cross-process fixture communicates progress through files, with a timeout.")]
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -190,6 +191,7 @@ impl Fixture {
                 {
                     return id;
                 }
+                #[expect(clippy::disallowed_methods, reason = "The fixture waits for the endpoint to serve the expected process, with a timeout.")]
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -230,27 +232,26 @@ impl Fixture {
             .is_none()
     }
     pub async fn exited_cleanly(&self, pid: u32) {
-        timeout(BUDGET, async {
-            loop {
-                let status = self
-                    .children
-                    .lock()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|c| c.child.id() == pid)
-                    .unwrap()
-                    .child
-                    .try_wait()
-                    .unwrap();
-                if let Some(status) = status {
-                    assert!(status.success(), "daemon failed: {status}");
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("daemon did not finish draining");
+        let mut exit = {
+            let children = self.children.lock().unwrap();
+            let child = &children.iter().find(|c| c.child.id() == pid).unwrap().child;
+            kunobi_daemon::local::ProcessHandle::for_child(child).unwrap()
+        };
+        timeout(BUDGET, exit.exited())
+            .await
+            .expect("daemon did not finish draining")
+            .unwrap();
+        let status = self
+            .children
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c.child.id() == pid)
+            .unwrap()
+            .child
+            .wait()
+            .unwrap();
+        assert!(status.success(), "daemon failed: {status}");
     }
     pub async fn request_drain(&self) -> io::Result<()> {
         if let Some((_, mut peer)) = connect(self.root()).await? {
@@ -288,6 +289,10 @@ async fn daemon(root: PathBuf, build: u64) -> io::Result<()> {
             if let Some(owner) = ProcessLock::try_acquire(root.join("run.lock"))? {
                 return Ok::<_, io::Error>(owner);
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The fixture waits for the cross-process owner lock, with a timeout."
+            )]
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -534,6 +539,10 @@ fn connect_sync(
         if std::time::Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The fixture probes the selected daemon until its deadline."
+        )]
         std::thread::sleep(Duration::from_millis(5));
     }
 }

@@ -63,6 +63,10 @@ pub trait Duplex: Sized {
                     if remaining.is_zero() {
                         return Err(error);
                     }
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "A missing endpoint has no event to await; retry connects within the caller deadline."
+                    )]
                     std::thread::sleep(RETRY_INTERVAL.min(remaining));
                 }
             }

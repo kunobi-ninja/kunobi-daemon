@@ -118,6 +118,10 @@ fn bind<L>(
             Next::Contended => return Ok(Bound::AlreadyRunning),
             Next::Retry(pause) => {
                 retries_used += 1;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Windows can retain a retiring pipe name briefly; the retry policy bounds this backoff."
+                )]
                 std::thread::sleep(pause);
             }
             Next::Fail => return Err(BindError::Io(error)),
@@ -180,6 +184,10 @@ pub async fn acquire_tokio(
             Next::Contended => return Ok(Bound::AlreadyRunning),
             Next::Retry(pause) => {
                 retries_used += 1;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Windows can retain a retiring pipe name briefly; the retry policy bounds this backoff."
+                )]
                 tokio::time::sleep(pause).await;
             }
             Next::Fail => return Err(BindError::Io(error)),
