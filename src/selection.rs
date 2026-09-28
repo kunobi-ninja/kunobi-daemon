@@ -23,6 +23,8 @@
 //! Polling is the default wait between rounds. A source that can be woken
 //! overrides [`Evidence::wait`], or `AsyncEvidence::wait` with the `async`
 //! feature, without changing the decision rules.
+//! [`crate::readiness::channel::Signaled`] is one: it wakes on a launched
+//! daemon's readiness channel.
 use std::time::{Duration, Instant};
 
 use crate::readiness::POLL_INTERVAL;

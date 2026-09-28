@@ -1,5 +1,10 @@
 //! Deadline-bounded live probes. A connect or discovery record is not a proof.
+//!
+//! A daemon started through `launch::DaemonCommand` can also say when a probe
+//! is worth making, over a [`channel`]. Its word is not a proof either.
 use std::time::{Duration, Instant};
+
+pub mod channel;
 
 /// Default interval between unsuccessful probes. A successful fast path does not sleep.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(25);
