@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use super::{Opened, millis_until};
 
-
 #[derive(Debug)]
 pub(super) struct Event {
     pidfd: OwnedFd,
