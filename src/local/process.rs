@@ -234,6 +234,10 @@ impl ProcessHandle {
                 let mut pause = crate::backoff::FIRST;
                 while !pid_exited(self.pid)? {
                     let nap = crate::backoff::next_pause(&mut pause, None).expect("no deadline");
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "Only the PID fallback polls; supported platforms await the OS exit event."
+                    )]
                     tokio::time::sleep(nap).await;
                 }
             }

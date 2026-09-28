@@ -26,6 +26,10 @@ pub(crate) fn poll(
         let Some(nap) = next_pause(&mut pause, deadline) else {
             return Ok(false);
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "OS exit events are unavailable on this fallback path; bound polling with backoff."
+        )]
         std::thread::sleep(nap);
     }
 }

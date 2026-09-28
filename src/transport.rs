@@ -1065,6 +1065,10 @@ mod tests {
         let deadline = Instant::now() + SOON;
         while outstanding.lock().waiters == before {
             assert!(Instant::now() < deadline, "the waiter never blocked");
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The test waits for condvar waiter registration, with a deadline."
+            )]
             std::thread::sleep(Duration::from_millis(1));
         }
         settled

@@ -375,19 +375,19 @@ mod tests {
         let stood_down = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicUsize::new(0));
 
+        let acquired = Arc::new(std::sync::Barrier::new(15));
         let handles: Vec<_> = (0..15)
             .map(|_| {
                 let sock = Arc::clone(&sock);
                 let won = Arc::clone(&won);
                 let stood_down = Arc::clone(&stood_down);
                 let failed = Arc::clone(&failed);
+                let acquired = Arc::clone(&acquired);
                 std::thread::spawn(move || {
-                    match acquire(&sock) {
-                        Ok(Bound::Won(l)) => {
+                    let outcome = acquire(&sock);
+                    match &outcome {
+                        Ok(Bound::Won(_)) => {
                             won.fetch_add(1, Ordering::SeqCst);
-                            // Hold it, so the losers meet a LIVE socket.
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            drop(l);
                         }
                         Ok(Bound::AlreadyRunning) => {
                             stood_down.fetch_add(1, Ordering::SeqCst);
@@ -396,6 +396,10 @@ mod tests {
                             failed.fetch_add(1, Ordering::SeqCst);
                         }
                     }
+                    // Keep the winning listener alive until every contender
+                    // has inspected it, regardless of how it is scheduled.
+                    acquired.wait();
+                    drop(outcome);
                 })
             })
             .collect();

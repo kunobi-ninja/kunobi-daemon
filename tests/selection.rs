@@ -67,6 +67,15 @@ const BUDGET: Budget = Budget {
 };
 
 #[test]
+fn default_evidence_wait_prevents_immediate_repeated_probes() {
+    let start = Instant::now();
+    Script::new().wait(start + Duration::from_secs(60));
+    // A scheduling delay can only lengthen this wait. No upper wall-clock
+    // bound or exact probe count is needed to reject a busy loop.
+    assert!(start.elapsed() >= kunobi_daemon::readiness::POLL_INTERVAL);
+}
+
+#[test]
 fn a_commit_during_a_probe_of_the_incumbent_waits_for_the_candidate_s_own_proof() {
     // The candidate commits while round 0 is still probing the incumbent, and
     // answers from round 1. Pairing round 0's stale probe with the new record
@@ -171,6 +180,10 @@ fn a_proof_returned_after_the_round_deadline_is_rejected() {
             Ok(false)
         }
         fn probe(&mut self, deadline: Instant) -> Result<Option<()>, ()> {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The fixture returns a proof after its deadline to verify that it is rejected."
+            )]
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             Ok(Some(()))
         }
@@ -278,6 +291,10 @@ mod asynchronous {
         async fn probe(&mut self) -> Result<Option<()>, ()> {
             self.probes += 1;
             if self.probes == 1 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Paused Tokio time moves the commit during a failed probe."
+                )]
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 self.committed = true;
                 return Ok(None);

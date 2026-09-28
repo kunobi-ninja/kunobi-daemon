@@ -880,6 +880,10 @@ mod tests {
         };
         // Wait until the test has put this process in its job.
         while !Path::new(&go).exists() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The helper waits for the parent to assign its job and write the signal file."
+            )]
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut command = crate::launch::DaemonCommand::new(system32("PING.EXE"));
@@ -890,6 +894,10 @@ mod tests {
             format!("{} {}", child.id(), u8::from(child.in_callers_job())),
         )
         .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The job-test helper must remain alive until its parent terminates it."
+        )]
         std::thread::sleep(Duration::from_secs(30));
     }
 
@@ -928,6 +936,10 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "helper never started the daemon"
             );
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The cross-process fixture reports its daemon PID through a file, with a deadline."
+            )]
             std::thread::sleep(Duration::from_millis(20));
         };
         let _ = helper.kill();

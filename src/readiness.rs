@@ -29,6 +29,10 @@ pub fn wait_until<T, E>(
         if proof.is_some() {
             return Ok(proof);
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "A generic probe exposes no event; polling is bounded by the caller deadline."
+        )]
         std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
@@ -66,6 +70,10 @@ pub async fn wait_until_async<P: AsyncProbe>(
         if proof.is_some() {
             return Ok(proof);
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "A generic probe exposes no event; polling is bounded by the caller deadline."
+        )]
         tokio::time::sleep_until((tokio::time::Instant::now() + POLL_INTERVAL).min(deadline)).await;
     }
 }

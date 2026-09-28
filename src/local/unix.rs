@@ -1088,6 +1088,10 @@ mod tests {
             .unwrap();
         let (mut read, mut write) = transport.split().unwrap();
         read.clear_read_deadline().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The test must read after the cleared socket deadline has passed."
+        )]
         std::thread::sleep(Duration::from_millis(5));
         write.write_all(b"long job").unwrap();
         let mut bytes = [0; 8];
@@ -1243,6 +1247,10 @@ mod tests {
                     break;
                 }
                 connection.flush().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "The fixture trickles bytes to verify the handshake uses one total deadline."
+                )]
                 std::thread::sleep(Duration::from_millis(30));
             }
         });

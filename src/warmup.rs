@@ -156,6 +156,10 @@ fn spawn_when_free(
                 if error.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < until =>
             {
                 on_busy();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "ETXTBSY has no readiness event; retry with backoff until the caller deadline."
+                )]
                 std::thread::sleep(pause.min(until.saturating_duration_since(Instant::now())));
                 pause = (pause * 2).min(Duration::from_millis(50));
             }

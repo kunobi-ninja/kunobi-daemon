@@ -207,6 +207,10 @@ async fn async_exclusive_drain_can_last_hours_without_spending_candidate_startup
             self.0.push(step);
             if step == Step::Drain {
                 assert!(deadline.is_none());
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Paused Tokio time simulates a long drain without a real wait."
+                )]
                 tokio::time::sleep(Duration::from_secs(7200)).await;
             } else {
                 assert!(deadline.unwrap() > tokio::time::Instant::now());

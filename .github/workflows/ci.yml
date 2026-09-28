@@ -28,6 +28,8 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features wire,local,launch --all-targets -- -D warnings
       # A link to a module or item that exists only on one platform or behind a
       # feature breaks the docs everywhere else, docs.rs (Linux) included.
       - run: cargo doc --locked --all-features --no-deps

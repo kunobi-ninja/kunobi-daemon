@@ -1223,6 +1223,10 @@ mod tests {
             connection.write_all(b"ready\n").unwrap();
             connection.flush().unwrap();
             send_rx.recv().unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The test must receive data after the cleared pipe deadline has passed."
+            )]
             std::thread::sleep(Duration::from_millis(650));
             connection.write_all(b"x").unwrap();
         });

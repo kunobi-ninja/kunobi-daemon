@@ -227,6 +227,10 @@ pub fn run<D: Driver>(
             let wait = deadline.map_or(crate::readiness::POLL_INTERVAL, |limit| {
                 crate::readiness::POLL_INTERVAL.min(limit.saturating_duration_since(Instant::now()))
             });
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The replacement driver returned Pending without a wake source; retry within the phase budget."
+            )]
             std::thread::sleep(wait);
         }
     }
@@ -282,6 +286,10 @@ pub async fn run_async<D: AsyncDriver>(
             }
         } else {
             let wake = tokio::time::Instant::now() + crate::readiness::POLL_INTERVAL;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "The replacement driver returned Pending without a wake source; retry within the phase budget."
+            )]
             tokio::time::sleep_until(deadline.map_or(wake, |limit| limit.min(wake))).await;
         }
     }

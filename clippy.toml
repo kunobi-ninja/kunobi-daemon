@@ -1,0 +1,7 @@
+# Use events for readiness and process exit. Every remaining sleep must name
+# its fallback, retry policy, or timing-test requirement at the call site.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "Await an event, or document a bounded polling or timing-test requirement with #[expect]." },
+    { path = "tokio::time::sleep", reason = "Await an event, or document a bounded polling or timing-test requirement with #[expect]." },
+    { path = "tokio::time::sleep_until", reason = "Await an event, or document a bounded polling or timing-test requirement with #[expect]." },
+]

@@ -76,6 +76,10 @@ impl Generation {
     /// Refresh application discovery until this process can retire. This loop
     /// owns session wakeups and retirement; the callback reads application
     /// selection and may invoke the shared replacement transaction.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Discovery has no change notification; session changes wake the same select immediately."
+    )]
     pub async fn run_until_retired<F, Fut>(
         &self,
         interval: Duration,

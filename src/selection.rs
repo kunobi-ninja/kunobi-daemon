@@ -78,6 +78,10 @@ pub trait Evidence {
     /// The default sleeps for [`POLL_INTERVAL`]. A source that can be woken
     /// returns as soon as it has news.
     fn wait(&mut self, until: Instant) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Default evidence has no wake source; Signaled overrides this wait for channel events."
+        )]
         std::thread::sleep(POLL_INTERVAL.min(until.saturating_duration_since(Instant::now())));
     }
 }
@@ -129,6 +133,10 @@ pub trait AsyncEvidence {
     ///
     /// The default sleeps for [`POLL_INTERVAL`]. A source that can be woken
     /// completes as soon as it has news.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Default evidence has no wake source; Signaled overrides this wait for channel events."
+    )]
     fn wait(
         &mut self,
         until: tokio::time::Instant,
