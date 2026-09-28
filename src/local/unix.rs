@@ -65,16 +65,44 @@ pub fn restore_child_waiting() -> io::Result<()> {
 pub fn spawn_with_child_waiting(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
+    spawn_then(command, |_| Ok(())).map(|(child, ())| child)
+}
+
+/// Spawn as [`spawn_with_child_waiting`] does, and run `watch` on the child
+/// while SIGCHLD is still at its default. Until the child is waited for, its
+/// PID cannot name another process even if it has exited, so an exit handle
+/// opened here follows the child. With SIGCHLD ignored the kernel reaps the
+/// child as it exits, and the PID is free once that happens.
+///
+/// A failed `watch` stops the child and returns the error.
+fn spawn_then<T>(
+    command: &mut std::process::Command,
+    watch: impl FnOnce(&std::process::Child) -> io::Result<T>,
+) -> io::Result<(std::process::Child, T)> {
     // Signal dispositions are process-wide. Serialize relay launches until
     // both the previous policy and any exits during this window are handled.
     let _spawn = crate::spawn_lock::spawning();
     let previous = child_disposition(0)?;
-    let child = command.spawn();
+    let child = command.spawn().and_then(|child| watched(child, watch));
     child_disposition(previous)?;
     if previous == 1 {
         reap_exited_children();
     }
     child
+}
+
+fn watched<T>(
+    mut child: std::process::Child,
+    watch: impl FnOnce(&std::process::Child) -> io::Result<T>,
+) -> io::Result<(std::process::Child, T)> {
+    match watch(&child) {
+        Ok(watching) => Ok((child, watching)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
 }
 
 fn reap_exited_children() {
@@ -312,6 +340,22 @@ pub(crate) fn interrupt_process_group(pgid: u32) -> io::Result<()> {
 pub fn spawn_in_new_session(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
+    in_new_session(command);
+    spawn_with_child_waiting(command)
+}
+
+/// [`spawn_in_new_session`], with the child's exit handle opened before
+/// anything can reap the child.
+#[cfg(feature = "launch")]
+pub(crate) fn spawn_in_new_session_watched(
+    command: &mut std::process::Command,
+) -> io::Result<(std::process::Child, super::ProcessHandle)> {
+    in_new_session(command);
+    spawn_then(command, super::ProcessHandle::for_child)
+}
+
+/// Make `command` lead a new session with only its standard descriptors.
+fn in_new_session(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     // Computed here, in the parent: getrlimit is not on the async-signal-safe
     // list, and the child may only make such calls between fork and exec.
@@ -333,7 +377,6 @@ pub fn spawn_in_new_session(
     unsafe {
         command.pre_exec(prepare);
     }
-    spawn_with_child_waiting(command)
 }
 
 /// The highest descriptor number to consider, from the soft RLIMIT_NOFILE.
@@ -760,6 +803,34 @@ mod tests {
         ProcessHandle::for_child(&child).unwrap().wait().unwrap();
         assert_eq!(signal_state(child.id()), ProcessState::Exited);
         child.wait().unwrap();
+    }
+
+    #[cfg(feature = "launch")]
+    #[test]
+    fn a_new_session_child_is_watched_from_its_spawn() {
+        let mut command = std::process::Command::new("true");
+        let (mut child, mut exit) = spawn_in_new_session_watched(&mut command).unwrap();
+        assert_eq!(exit.pid(), child.id());
+        exit.wait().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_failed_watch_stops_the_child_and_returns_the_error() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let mut pid = None;
+        let error = spawn_then(&mut command, |child| {
+            pid = Some(child.id());
+            Err::<(), _>(io::Error::other("watch failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "watch failed");
+        // Stopped and reaped: no process has the PID any more.
+        assert_eq!(
+            process_state(pid.unwrap()),
+            super::super::ProcessState::Exited
+        );
     }
 
     #[test]

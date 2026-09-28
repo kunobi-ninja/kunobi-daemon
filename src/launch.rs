@@ -35,6 +35,10 @@
 //! hidden console of its own and an explicit list of the only handles it may
 //! inherit. Use it for a long-lived peer; keep [`spawn`] for short-lived
 //! children whose lifetime the caller controls.
+//!
+//! [`DaemonChild::wait_until_live`] probes it until it serves, and stops early
+//! when it exits first: the OS reports the exit as an event, so a daemon that
+//! fails at startup does not cost the caller its whole budget.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -44,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::local::ProcessHandle;
 use crate::readiness;
 
 /// Gap between unsuccessful liveness probes. Same cadence as [`readiness`].
@@ -223,8 +228,8 @@ impl DaemonCommand {
             }
             command.stdout(unix_stdio(&self.stdout)?);
             command.stderr(unix_stdio(&self.stderr)?);
-            crate::local::unix::spawn_in_new_session(&mut command)
-                .map(|inner| DaemonChild { inner })
+            crate::local::unix::spawn_in_new_session_watched(&mut command)
+                .map(|(inner, exit)| DaemonChild { inner, exit })
         }
         #[cfg(windows)]
         {
@@ -246,15 +251,22 @@ impl DaemonCommand {
                     DaemonOutput::File(file) => Target::File(file),
                 }
             }
-            spawn(&Spawn {
+            let mut inner = spawn(&Spawn {
                 program: &self.program,
                 args: &self.args,
                 env: &env,
                 current_dir: self.current_dir.as_deref(),
                 stdout: target(&self.stdout),
                 stderr: target(&self.stderr),
-            })
-            .map(|inner| DaemonChild { inner })
+            })?;
+            // The child's own handle keeps its PID from being reused.
+            match ProcessHandle::open(inner.id()) {
+                Ok(exit) => Ok(DaemonChild { inner, exit }),
+                Err(error) => {
+                    let _ = inner.kill();
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -272,12 +284,31 @@ fn unix_stdio(target: &DaemonOutput) -> io::Result<Stdio> {
 /// Dropping it leaves the daemon running, as dropping a `std::process::Child`
 /// does. A caller that never waits should keep SIGCHLD reaping in mind on
 /// Unix, as with any child.
+///
+/// Its [`ProcessHandle`] is opened at spawn, before anything can reap the
+/// daemon, so it follows the daemon even in a process that ignores SIGCHLD.
 #[derive(Debug)]
 pub struct DaemonChild {
     #[cfg(unix)]
     inner: Child,
     #[cfg(windows)]
     inner: crate::local::windows_spawn::WindowsChild,
+    exit: ProcessHandle,
+}
+
+/// How [`DaemonChild::wait_until_live`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startup {
+    /// A probe succeeded.
+    Live,
+    /// The daemon exited, and a probe made after its exit failed too. A
+    /// daemon that lost the bind election to another one exits as well, and
+    /// the probe after its exit then finds the winner, so this means no
+    /// daemon answered.
+    Exited,
+    /// The deadline passed with the daemon still running and no probe
+    /// successful.
+    TimedOut,
 }
 
 impl DaemonChild {
@@ -316,6 +347,57 @@ impl DaemonChild {
         self.inner.wait()
     }
 
+    /// Block until the daemon exits or `deadline` passes: its exit status,
+    /// or `None` while it still runs.
+    ///
+    /// The status comes from waiting for the child, so in a process that
+    /// ignores SIGCHLD, where the kernel discards it, this fails after the
+    /// exit. [`Self::exit_handle`] still reports the exit there.
+    pub fn wait_until(&mut self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+        if self.exit.wait_until(deadline)? {
+            self.inner.wait().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The daemon's exit as an event, for a caller that waits on it together
+    /// with other work, for example with `exited` under the `async` feature.
+    pub fn exit_handle(&mut self) -> &mut ProcessHandle {
+        &mut self.exit
+    }
+
+    /// Probe with `is_live` until it succeeds, the daemon exits, or
+    /// `deadline` passes.
+    ///
+    /// Between probes this waits on the daemon's exit rather than sleeping,
+    /// for [`POLL`] at most, so a daemon that dies during startup ends the
+    /// wait at once. `is_live` must attempt a connect or a protocol probe and
+    /// bound its own blocking. An error means the exit could not be observed;
+    /// the daemon may still be running.
+    pub fn wait_until_live(
+        &mut self,
+        deadline: Instant,
+        mut is_live: impl FnMut() -> bool,
+    ) -> io::Result<Startup> {
+        loop {
+            if is_live() {
+                return Ok(Startup::Live);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Startup::TimedOut);
+            }
+            if self.exit.wait_until(deadline.min(now + POLL))? {
+                return Ok(if is_live() {
+                    Startup::Live
+                } else {
+                    Startup::Exited
+                });
+            }
+        }
+    }
+
     /// Stop the daemon forcibly: SIGKILL on Unix, `TerminateProcess` on
     /// Windows. A daemon that already exited is not an error.
     pub fn kill(&mut self) -> io::Result<()> {
@@ -338,7 +420,10 @@ pub fn wait_until_live(deadline: Instant, mut is_live: impl FnMut() -> bool) -> 
 /// Detach-spawn `command`, then wait on `is_live` for `budget`.
 ///
 /// Exec failure is not fatal: another shim may already have started the peer.
-/// The caller logs `spawn_error` if it wants a diagnostic.
+/// The caller logs `spawn_error` if it wants a diagnostic. For the same
+/// reason the wait does not end when the spawned child exits: the peer
+/// another shim started may still be coming up. A caller that owns the only
+/// start uses [`DaemonCommand`] and [`DaemonChild::wait_until_live`].
 pub fn spawn_and_wait(
     command: &mut Command,
     budget: Duration,
@@ -499,26 +584,20 @@ mod tests {
             assert!(Instant::now() < deadline, "helper never started the daemon");
             std::thread::sleep(Duration::from_millis(20));
         };
+        // Opened while the daemon certainly runs, so it follows that process.
+        let mut daemon_exit = ProcessHandle::open(daemon).unwrap();
         crate::local::unix::interrupt_process_group(helper.id()).unwrap();
         let status = helper.wait().unwrap();
-        // A process SIGINT killed can still answer `kill(pid, 0)` as a zombie
-        // until it is reaped, so one look right away proves nothing. Watch it
-        // for a while: a daemon that shared the group turns up exited.
-        let settle = Instant::now() + Duration::from_secs(2);
-        let mut daemon_state = crate::local::process_state(daemon);
-        while daemon_state == crate::local::ProcessState::Alive && Instant::now() < settle {
-            std::thread::sleep(Duration::from_millis(20));
-            daemon_state = crate::local::process_state(daemon);
-        }
+        // A daemon that shared the group dies of the same SIGINT; give it
+        // time to.
+        let died = daemon_exit
+            .wait_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         let _ = Command::new("kill")
             .args(["-KILL", &daemon.to_string()])
             .status();
         assert!(!status.success(), "SIGINT did not reach the helper's group");
-        assert_eq!(
-            daemon_state,
-            crate::local::ProcessState::Alive,
-            "the daemon died with its caller's process group"
-        );
+        assert!(!died, "the daemon died with its caller's process group");
     }
 
     /// True if every write end is gone within `timeout`: a read then ends.
@@ -602,6 +681,137 @@ mod tests {
             .spawn()
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A FIFO that holds a daemon from [`held_daemon`] until released.
+    #[cfg(unix)]
+    struct Held {
+        fifo: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl Held {
+        /// Let the daemon exit. Blocks until it has opened the FIFO.
+        fn release(&self) {
+            std::fs::write(&self.fifo, b"go\n").unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Held {
+        /// Release a daemon a failed test left waiting, without blocking.
+        fn drop(&mut self) {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut fifo) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.fifo)
+            {
+                let _ = fifo.write_all(b"go\n");
+            }
+        }
+    }
+
+    /// A daemon that runs until [`Held::release`], then exits with code 3.
+    /// Opening a FIFO to read blocks until a writer opens it, so nothing but
+    /// the release lets it finish.
+    #[cfg(unix)]
+    fn held_daemon() -> (DaemonChild, Held) {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("release");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut command = DaemonCommand::new("/bin/sh");
+        command
+            .args(["-c", "read line < \"$1\"; exit 3", "sh"])
+            .arg(&fifo);
+        (command.spawn().unwrap(), Held { fifo, _dir: dir })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_exits_before_it_is_live_ends_the_wait() {
+        let (mut child, held) = held_daemon();
+        held.release();
+        let started = Instant::now();
+        let outcome = child
+            .wait_until_live(started + Duration::from_secs(60), || false)
+            .unwrap();
+        assert_eq!(outcome, Startup::Exited);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_daemon_is_reported_as_soon_as_a_probe_succeeds() {
+        let (mut child, held) = held_daemon();
+        let mut probes = 0;
+        let started = Instant::now();
+        let outcome = child
+            .wait_until_live(started + Duration::from_secs(60), || {
+                probes += 1;
+                probes == 3
+            })
+            .unwrap();
+        assert_eq!(outcome, Startup::Live);
+        assert_eq!(probes, 3);
+        assert!(started.elapsed() < Duration::from_secs(30));
+
+        assert!(child.wait_until(Instant::now()).unwrap().is_none());
+        held.release();
+        let status = child
+            .wait_until(Instant::now() + Duration::from_secs(30))
+            .unwrap()
+            .expect("the daemon exited once released");
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_never_becomes_live_times_out_without_busy_probing() {
+        let (mut child, held) = held_daemon();
+        let mut probes = 0;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let outcome = child
+            .wait_until_live(deadline, || {
+                probes += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(outcome, Startup::TimedOut);
+        assert!(Instant::now() >= deadline);
+        // The exit wait spaces the probes by up to POLL.
+        assert!(probes <= 20, "{probes} probes in 200 ms");
+        held.release();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_exits_while_another_serves_is_live() {
+        // A daemon that lost the bind election exits, and the probe made
+        // after its exit reaches the one that won.
+        let (mut child, held) = held_daemon();
+        held.release();
+        child.exit_handle().wait().unwrap();
+        assert_eq!(child.exit_handle().pid(), child.id());
+        let mut probes = 0;
+        let outcome = child
+            .wait_until_live(Instant::now() + Duration::from_secs(60), || {
+                probes += 1;
+                probes == 2
+            })
+            .unwrap();
+        assert_eq!(outcome, Startup::Live);
+        assert_eq!(child.wait().unwrap().code(), Some(3));
     }
 
     #[cfg(unix)]
