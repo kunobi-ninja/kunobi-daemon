@@ -165,23 +165,39 @@ fn spawn_when_free(
 }
 
 /// Wait for `child` to exit, killing it at `limit`. It runs off the caller's
-/// thread, which waits on a channel instead.
+/// thread, which waits on a channel instead. A child whose exit cannot be
+/// observed is killed and reaped too, never dropped still running.
 fn reap(mut child: Child, limit: Instant) -> io::Result<ExitStatus> {
-    if exits_by(&mut child, limit)? {
-        return child.wait();
-    }
+    let stopped = match exits_by(&mut child, limit) {
+        Ok(true) => return child.wait(),
+        Ok(false) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "warmup child killed at its runaway limit",
+        )),
+        Err(error) => Err(error),
+    };
     let _ = child.kill();
     child.wait()?;
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "warmup child killed at its runaway limit",
-    ))
+    stopped
 }
 
 /// Whether `child` exits by `limit`, told by the OS when it does.
 #[cfg(feature = "local")]
 fn exits_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
-    crate::local::ProcessHandle::for_child(child)?.wait_until(limit)
+    let opened = crate::local::ProcessHandle::for_child(child);
+    exits_by_watching(child, opened, limit)
+}
+
+/// [`exits_by`] with the result of opening the child's exit handle. A handle
+/// that could not be opened, for example for want of a descriptor, leaves
+/// the child to be asked directly.
+#[cfg(feature = "local")]
+fn exits_by_watching(
+    child: &mut Child,
+    opened: io::Result<crate::local::ProcessHandle>,
+    limit: Instant,
+) -> io::Result<bool> {
+    crate::local::wait_child(|| child.try_wait(), opened.ok().as_mut(), limit)
 }
 
 #[cfg(not(feature = "local"))]
@@ -189,21 +205,10 @@ use polled_exit_by as exits_by;
 
 /// Whether `child` exits by `limit`. Without the `local` feature there is no
 /// exit event, and the standard library has no timed wait for a child, so
-/// this checks with a backoff capped at 50ms.
+/// this asks the child with a growing pause.
 #[cfg(not(feature = "local"))]
 fn polled_exit_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
-    let mut pause = Duration::from_millis(1);
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
-        }
-        let left = limit.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(pause.min(left));
-        pause = (pause * 2).min(Duration::from_millis(50));
-    }
+    crate::backoff::poll(|| Ok(child.try_wait()?.is_some()), Some(limit))
 }
 
 pub(crate) fn prefault_all(paths: impl IntoIterator<Item = impl AsRef<Path>>) {
@@ -232,6 +237,27 @@ mod tests {
         let status = exited.recv().unwrap().unwrap();
         assert_eq!(status.code(), Some(4));
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_child_whose_exit_handle_cannot_be_opened_is_still_waited_for() {
+        let failed = || Err(io::Error::other("out of descriptors"));
+        let mut exits = Command::new("/bin/sh")
+            .args(["-c", "exit 4"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        assert!(exits_by_watching(&mut exits, failed(), deadline).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(exits.wait().unwrap().code(), Some(4));
+
+        let mut runs = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(!exits_by_watching(&mut runs, failed(), deadline).unwrap());
+        runs.kill().unwrap();
+        runs.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]

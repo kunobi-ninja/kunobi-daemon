@@ -354,11 +354,18 @@ impl DaemonChild {
     /// ignores SIGCHLD, where the kernel discards it, this fails after the
     /// exit. [`Self::exit_handle`] still reports the exit there.
     pub fn wait_until(&mut self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
-        if self.exit.wait_until(deadline)? {
+        if self.exits_by(deadline)? {
             self.inner.wait().map(Some)
         } else {
             Ok(None)
         }
+    }
+
+    /// Whether the daemon exits by `deadline`. Where the handle follows only
+    /// the PID, this asks the child instead: see
+    /// [`crate::local::ProcessHandle`]'s fallback.
+    fn exits_by(&mut self, deadline: Instant) -> io::Result<bool> {
+        crate::local::wait_child(|| self.inner.try_wait(), Some(&mut self.exit), deadline)
     }
 
     /// The daemon's exit as an event, for a caller that waits on it together
@@ -388,7 +395,7 @@ impl DaemonChild {
             if now >= deadline {
                 return Ok(Startup::TimedOut);
             }
-            if self.exit.wait_until(deadline.min(now + POLL))? {
+            if self.exits_by(deadline.min(now + POLL))? {
                 return Ok(if is_live() {
                     Startup::Live
                 } else {

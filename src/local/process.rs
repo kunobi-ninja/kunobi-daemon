@@ -1,9 +1,7 @@
 //! Process exit as an event: [`ProcessHandle`], and the PID checks built on it.
 
 use std::io;
-use std::process::Child;
-#[cfg(unix)]
-use std::time::Duration;
+use std::process::{Child, ExitStatus};
 use std::time::Instant;
 
 use super::ProcessState;
@@ -67,14 +65,6 @@ use self::windows::unknown_state as fallback_state;
 #[cfg(unix)]
 use super::unix::signal_state as fallback_state;
 
-/// First pause of the PID fallback, doubled after each check up to
-/// [`FALLBACK_LONGEST`].
-#[cfg(unix)]
-const FALLBACK_FIRST: Duration = Duration::from_millis(1);
-/// Longest pause of the PID fallback between two checks.
-#[cfg(unix)]
-const FALLBACK_LONGEST: Duration = Duration::from_millis(50);
-
 /// What opening a process found.
 enum Opened {
     /// The OS will report the process's exit through this event.
@@ -125,7 +115,10 @@ enum Source {
 /// pause that grows to 50 ms between checks. That fallback has the PID's two
 /// weaknesses: a PID reused by another process reads as still running, and,
 /// except on Linux, a child that exited but has not been waited for reads as
-/// running too. [`ProcessHandle::is_pid_only`] reports it.
+/// running too. [`ProcessHandle::is_pid_only`] reports it. The crate's waits
+/// for its own children (`launch::DaemonChild`, `Candidate` and the warmup
+/// reaper) then ask the child through `try_wait` instead, and do the same
+/// when the handle could not be opened at all.
 #[derive(Debug)]
 pub struct ProcessHandle {
     pid: u32,
@@ -238,9 +231,9 @@ impl ProcessHandle {
             Source::Exited => {}
             #[cfg(unix)]
             Source::Pid => {
-                let mut pause = FALLBACK_FIRST;
+                let mut pause = crate::backoff::FIRST;
                 while !pid_exited(self.pid)? {
-                    let nap = next_pause(&mut pause, None).expect("no deadline");
+                    let nap = crate::backoff::next_pause(&mut pause, None).expect("no deadline");
                     tokio::time::sleep(nap).await;
                 }
             }
@@ -308,35 +301,27 @@ fn pid_exited(pid: u32) -> io::Result<bool> {
 /// The PID fallback's blocking wait.
 #[cfg(unix)]
 fn pid_wait(pid: u32, deadline: Option<Instant>) -> io::Result<bool> {
-    let mut pause = FALLBACK_FIRST;
-    loop {
-        if pid_exited(pid)? {
-            return Ok(true);
-        }
-        let Some(nap) = next_pause(&mut pause, deadline) else {
-            return Ok(false);
-        };
-        std::thread::sleep(nap);
-    }
+    crate::backoff::poll(|| pid_exited(pid), deadline)
 }
 
-/// How long the PID fallback pauses before its next check, or `None` once
-/// `deadline` has passed. Each pause doubles the next, up to
-/// [`FALLBACK_LONGEST`].
-#[cfg(unix)]
-fn next_pause(pause: &mut Duration, deadline: Option<Instant>) -> Option<Duration> {
-    let nap = match deadline {
-        Some(deadline) => {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            left.min(*pause)
-        }
-        None => *pause,
-    };
-    *pause = FALLBACK_LONGEST.min(*pause * 2);
-    Some(nap)
+/// Wait until a child this process owns exits or `deadline` passes. True if
+/// it exited.
+///
+/// `exit` is the child's handle, or `None` if it could not be opened, and
+/// `try_wait` asks the child itself. Without an exit event, whether for want
+/// of a handle or because the handle only follows the PID, this polls
+/// `try_wait`: a PID check outside Linux reads an exited child that has not
+/// been waited for as running, but the child's parent can tell. That path
+/// reaps the child, and its status stays with it.
+pub(crate) fn wait_child(
+    mut try_wait: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    exit: Option<&mut ProcessHandle>,
+    deadline: Instant,
+) -> io::Result<bool> {
+    match exit {
+        Some(exit) if !exit.is_pid_only() => exit.wait_until(deadline),
+        _ => crate::backoff::poll(|| Ok(try_wait()?.is_some()), Some(deadline)),
+    }
 }
 
 #[cfg(test)]
@@ -526,25 +511,58 @@ mod tests {
         assert_eq!(reaper.join().unwrap().code(), Some(3));
     }
 
+    /// Whether the kernel still lists `pid`, as a process or a zombie.
+    #[cfg(target_os = "linux")]
+    fn listed(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn an_owned_child_is_waited_for_on_its_exit_event_and_left_unreaped() {
+        let mut child = blocked_child();
+        let mut exit = ProcessHandle::for_child(&child).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(!wait_child(|| child.try_wait(), Some(&mut exit), deadline).unwrap());
+        assert!(Instant::now() >= deadline);
+
+        release(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(wait_child(|| child.try_wait(), Some(&mut exit), deadline).unwrap());
+        // The event leaves the child for its owner to wait for.
+        #[cfg(target_os = "linux")]
+        assert!(listed(child.id()));
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    /// Outside Linux a PID check reads an exited, unreaped child as running,
+    /// so the wait asks the child and must end promptly everywhere.
     #[cfg(unix)]
     #[test]
-    fn the_pid_fallback_pauses_longer_each_time_up_to_its_limit() {
-        let mut pause = FALLBACK_FIRST;
-        let naps: Vec<u64> = (0..8)
-            .map(|_| next_pause(&mut pause, None).unwrap().as_millis() as u64)
-            .collect();
-        assert_eq!(naps, [1, 2, 4, 8, 16, 32, 50, 50]);
+    fn an_owned_child_whose_handle_follows_only_its_pid_is_asked_directly() {
+        let mut child = blocked_child();
+        let mut exit = pid_only(&child);
+        release(&mut child);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        assert!(wait_child(|| child.try_wait(), Some(&mut exit), deadline).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // Asked through try_wait, the child is reaped and keeps its status.
+        #[cfg(target_os = "linux")]
+        assert!(!listed(child.id()));
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
 
-        let mut pause = FALLBACK_LONGEST;
-        assert_eq!(next_pause(&mut pause, Some(Instant::now())), None);
-        let later = Instant::now() + Duration::from_secs(10);
-        assert_eq!(next_pause(&mut pause, Some(later)), Some(FALLBACK_LONGEST));
-        // A pause never runs past the deadline. A runner that stalls for the
-        // whole 40 ms gets `None`, which is also right.
-        let soon = Instant::now() + Duration::from_millis(40);
-        if let Some(nap) = next_pause(&mut pause, Some(soon)) {
-            assert!(nap > Duration::ZERO && nap <= Duration::from_millis(40));
-        }
+    #[test]
+    fn an_owned_child_without_a_handle_is_asked_directly() {
+        let mut child = blocked_child();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(!wait_child(|| child.try_wait(), None, deadline).unwrap());
+        assert!(Instant::now() >= deadline);
+
+        release(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(wait_child(|| child.try_wait(), None, deadline).unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(3));
     }
 
     #[cfg(feature = "async")]

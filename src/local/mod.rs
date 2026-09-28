@@ -119,6 +119,7 @@ pub use unix::UnixDuplex as PlatformDuplex;
 #[cfg(windows)]
 pub use windows::WindowsDuplex as PlatformDuplex;
 
+pub(crate) use process::wait_child;
 pub use process::{ProcessHandle, process_has_exited, process_state};
 // Same name, same signature on both platforms. Everything else in `unix` and
 // `windows` differs (uid and child-reaping helpers on one side, a session-end

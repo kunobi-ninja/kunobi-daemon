@@ -82,3 +82,33 @@ fn waiting_for_a_candidate_returns_when_it_exits_and_not_before() {
     assert!(status.success());
     assert!(dir.path().join("completed").exists());
 }
+
+#[cfg(feature = "local")]
+#[test]
+fn a_candidate_reaped_by_try_wait_still_reports_its_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "candidate_child", "--ignored"])
+        .env("DAEMON_CANDIDATE_TEST_DIR", dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut candidate = Candidate::new(child);
+    wait(|_| Ok(dir.path().join("ready").exists().then_some(())));
+    std::fs::write(dir.path().join("release"), b"release").unwrap();
+    // A verifier's own try_wait reaps the child and frees its PID.
+    let reaped = wait(|_| candidate.try_wait());
+    assert!(reaped.success());
+
+    // The handle was opened before that, so it does not look the PID up
+    // again, and the wait returns the status at once.
+    assert!(candidate.exit_handle().unwrap().has_exited().unwrap());
+    let started = Instant::now();
+    let status = candidate
+        .wait_until(started + Duration::from_secs(30))
+        .unwrap()
+        .expect("the candidate had already exited");
+    assert!(status.success());
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
