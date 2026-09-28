@@ -12,7 +12,7 @@ use buffa::Message;
 #[allow(missing_docs, clippy::derivable_impls)]
 mod generated;
 use crate::ServiceIdentity;
-pub use generated::{Control, Health, Hello, MessageKind};
+pub use generated::{Control, Health, Hello, LifecycleChange, LifecycleEvent, MessageKind};
 use std::io::{self, Read, Write};
 
 /// Identifies the binary transport, independently of application versions.
@@ -38,6 +38,8 @@ pub mod capability {
     pub const APPLICATION: u64 = 8;
     /// Typed in-memory Health payloads on HEALTH and DRAIN replies.
     pub const HEALTH_DETAILS: u64 = 16;
+    /// A bounded stream of lifecycle snapshots and changes on WATCH.
+    pub const WATCH: u64 = 32;
 }
 
 impl Health {
@@ -95,6 +97,8 @@ pub mod operation {
     pub const COMMIT: u32 = 6;
     /// Abandon a handoff attempt.
     pub const ABORT: u32 = 7;
+    /// Subscribe to lifecycle state; no further requests use this session.
+    pub const WATCH: u32 = 8;
 }
 
 impl Hello {
@@ -221,6 +225,7 @@ fn required_capability(message: &Control) -> io::Result<u64> {
         o::HEALTH => Ok(c::HEALTH),
         o::DRAIN => Ok(c::DRAIN),
         o::PREPARE..=o::ABORT => Ok(c::HANDOFF),
+        o::WATCH => Ok(c::WATCH),
         _ => Err(invalid("unknown control operation")),
     }
 }
@@ -247,7 +252,7 @@ fn encode_frame<M: Message>(
     Ok(())
 }
 
-fn decode_message<M: Message>(buffer: &[u8], limit: u32) -> io::Result<M> {
+pub(crate) fn decode_message<M: Message>(buffer: &[u8], limit: u32) -> io::Result<M> {
     buffa::DecodeOptions::new()
         .with_max_message_size(limit as usize)
         .with_recursion_limit(32)

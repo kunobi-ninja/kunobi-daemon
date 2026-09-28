@@ -137,3 +137,43 @@ do not measure socket latency or complete upgrade time.
 Regenerate the schemas with `cargo run --locked --manifest-path tools/proto-gen/Cargo.toml`.
 The generator requires `protoc`; normal builds do not. Check freshness with the
 same command followed by `-- --check`, then `python3 scripts/check-protobuf.py`.
+
+## Lifecycle subscriptions
+
+`WATCH` is operation 8 with capability bit 32. A client offers the capability
+without requiring it. `control::WatchClient::connect` returns `None` only when a
+successful handshake does not negotiate WATCH; the application may then poll
+its existing discovery source. Handshake errors, malformed events, and stream
+failures are errors, not reasons to downgrade. Authenticate the OS peer before
+connecting and compare its PID with the initial snapshot.
+
+A WATCH request has no payload, token, or offset. Its generation is zero or the
+serving generation. The connection carries no further client requests. Every
+response preserves the request ID and carries a `LifecycleEvent`. The first is
+`Snapshot`, numbered one. Later sequence numbers increase by one per delivered
+frame. `Ready`, `Draining`, `SelectionChanged`, and `Retiring` identify single
+changes; simultaneous/coalesced changes use `Snapshot`. Every event contains the
+complete state, including the serving identity and the selected generation/build.
+The selected generation is absent until the application reports a committed
+selection. It may be lower than the serving generation during candidate staging;
+being ready does not imply being selected.
+
+This is a current-state subscription, not a transition audit log. Slow observers
+may skip intermediate states. A watch channel retains the latest state without
+an unbounded queue. A blocked write expires after five seconds. Idle watchers
+have no heartbeat timer and disconnects release the serving task. Callers must
+account for long-lived watchers in their control-connection admission limits.
+The setup deadline bounds negotiation and reading the request; each event has
+its own write deadline.
+
+The application calls `ControlService::selection_committed` only **after** its
+selection publication succeeds, including whatever durability its own record
+requires. The method rejects older generations and changing the build at the
+same generation. It neither publishes the record nor makes a failed commit
+successful. `mark_retiring` closes admission and announces retirement; the
+application still drains existing requests and owns process shutdown.
+
+The async client retains its latest snapshot. Cancelling `changed()` or receiving
+an invalid event makes that client terminal: reconnect and obtain a new snapshot.
+Discovery remains the bootstrap and crash-recovery source. Existing consumers
+must opt into WATCH; upgrading the library alone does not stop their polling.

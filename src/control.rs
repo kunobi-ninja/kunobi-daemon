@@ -12,10 +12,14 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod watch;
+pub use watch::WatchClient;
+
 /// One process's lifecycle control, independent of application capacity and I/O.
 pub struct ControlService {
     lifecycle: Arc<Lifecycle>,
     ready: AtomicBool,
+    events: watch::Publisher,
     process_id: u32,
     generation: u64,
     build: String,
@@ -27,6 +31,7 @@ impl ControlService {
         Self {
             lifecycle,
             ready: AtomicBool::new(false),
+            events: watch::Publisher::new(),
             process_id: std::process::id(),
             generation,
             build,
@@ -36,7 +41,9 @@ impl ControlService {
 
     /// Mark application initialization complete. Drain always takes precedence.
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
+        if !self.ready.swap(true, Ordering::AcqRel) {
+            self.events.notify();
+        }
     }
 
     /// Read a bounded snapshot without waiting for storage, writers or draining.
@@ -83,6 +90,7 @@ impl ControlService {
     }
 
     /// Serve one authenticated connection under an absolute setup/control deadline.
+    /// WATCH continues beyond setup, with a five-second deadline per event write.
     ///
     /// No application operation is accepted here. The caller reserves control
     /// admission before invoking this method and drops the stream after an error.
@@ -92,18 +100,27 @@ impl ControlService {
         offer: &Hello,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
-        tokio::time::timeout_at(deadline, async {
+        let subscription = tokio::time::timeout_at(deadline, async {
             let mut session = wire::AsyncSession::accept(stream, offer).await?;
+            let request = session.receive().await?;
+            if request.operation == operation::WATCH && request.kind == MessageKind::Lifecycle {
+                self.validate_watch(&request)?;
+                return Ok(Some((session, request)));
+            }
             if session.agreement().capabilities & wire::capability::HEALTH_DETAILS == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "typed health not negotiated",
                 ));
             }
-            let request = session.receive().await?;
-            session.send(&self.handle(&request)?).await
+            session.send(&self.handle(&request)?).await?;
+            Ok(None)
         })
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        if let Some((session, request)) = subscription {
+            self.serve_watch(session, request).await?;
+        }
+        Ok(())
     }
 }

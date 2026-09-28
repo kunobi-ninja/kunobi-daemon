@@ -103,6 +103,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         Ok(message)
     }
 
+    /// Wait for a subscription peer to disconnect. No further requests are
+    /// legal on that connection. Unlike a framed receive, cancelling this
+    /// single-byte read before completion leaves the session usable.
+    pub(crate) async fn subscription_closed(&mut self) -> io::Result<()> {
+        self.usable()?;
+        let mut byte = [0];
+        let result = self.io.read(&mut byte).await;
+        self.failed = true;
+        match result? {
+            0 => Ok(()),
+            _ => Err(invalid("request after WATCH")),
+        }
+    }
+
     async fn send_message<M: Message>(&mut self, message: &M) -> io::Result<()> {
         self.usable()?;
         encode_frame(
