@@ -298,6 +298,7 @@ pub struct DaemonChild {
 
 /// How [`DaemonChild::wait_until_live`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Startup {
     /// A probe succeeded.
     Live,
