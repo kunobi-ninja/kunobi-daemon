@@ -293,6 +293,11 @@ impl<R, W: std::io::Write> std::io::Write for SplitIo<R, W> {
 /// them started. [`Outstanding::fail`] and [`Outstanding::clear`] start a new
 /// epoch, so a late reply from a failed peer cannot settle a newer request that
 /// reuses its key.
+///
+/// An update wakes blocked [`Outstanding::wait_settled`] callers only when it
+/// leaves the set settled and at least one caller is waiting, so settling a
+/// reply that leaves others outstanding, or that nobody waits on, costs no
+/// wake-up.
 pub struct Outstanding<K> {
     state: Mutex<OutstandingState<K>>,
     changed: Condvar,
@@ -314,6 +319,9 @@ struct OutstandingState<K> {
     failing: usize,
     /// [`Transition`] guards alive: the session is moving between peers.
     transitions: usize,
+    /// Callers blocked in [`Outstanding::wait_settled`]. Updates skip the
+    /// wake-up while this is zero.
+    waiters: usize,
 }
 
 impl<K: Ord> Outstanding<K> {
@@ -328,6 +336,7 @@ impl<K: Ord> Outstanding<K> {
                 overflowed: false,
                 failing: 0,
                 transitions: 0,
+                waiters: 0,
             }),
             changed: Condvar::new(),
             capacity,
@@ -336,6 +345,16 @@ impl<K: Ord> Outstanding<K> {
 
     fn lock(&self) -> MutexGuard<'_, OutstandingState<K>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wake every blocked [`Outstanding::wait_settled`] caller if `state` is
+    /// settled. Call it with the lock still held after an update: a waiter
+    /// registers and checks settledness under the same lock, so it is either
+    /// counted here or sees the settled state before it would block.
+    fn wake_if_settled(&self, state: &OutstandingState<K>) {
+        if state.must_wake() {
+            self.changed.notify_all();
+        }
     }
 
     /// Record a request sent to the peer.
@@ -369,8 +388,8 @@ impl<K: Ord> Outstanding<K> {
                 state.keys.remove(key);
             }
             state.tracked -= 1;
+            self.wake_if_settled(&state);
         }
-        self.changed.notify_all();
     }
 
     /// Record that the peer proved every request settled, for example with a
@@ -381,7 +400,7 @@ impl<K: Ord> Outstanding<K> {
         state.tracked = 0;
         state.epoch += 1;
         state.overflowed = false;
-        self.changed.notify_all();
+        self.wake_if_settled(&state);
     }
 
     /// Take every outstanding request to report it as failed, because the
@@ -411,9 +430,13 @@ impl<K: Ord> Outstanding<K> {
     /// this waits until the requests are failed or cleared.
     pub fn wait_settled(&self) {
         let mut state = self.lock();
+        // Registered under the lock that every update holds while it decides
+        // whether to wake, and released only after the wait ends.
+        state.waiters += 1;
         while !state.settled() {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+        state.waiters -= 1;
     }
 }
 
@@ -421,6 +444,12 @@ impl<K> OutstandingState<K> {
     /// What [`Outstanding::wait_settled`] waits for.
     fn settled(&self) -> bool {
         !self.overflowed && self.failing == 0 && self.transitions == 0 && self.keys.is_empty()
+    }
+
+    /// Whether the update that left this state must wake blocked callers:
+    /// only once it is settled and someone is waiting.
+    fn must_wake(&self) -> bool {
+        self.waiters > 0 && self.settled()
     }
 }
 
@@ -448,7 +477,7 @@ impl<K: Ord> Drop for Failing<'_, K> {
     fn drop(&mut self) {
         let mut state = self.owner.lock();
         state.failing -= 1;
-        self.owner.changed.notify_all();
+        self.owner.wake_if_settled(&state);
     }
 }
 
@@ -459,7 +488,7 @@ impl<K: Ord> Drop for Transition<'_, K> {
     fn drop(&mut self) {
         let mut state = self.0.lock();
         state.transitions -= 1;
-        self.0.changed.notify_all();
+        self.0.wake_if_settled(&state);
     }
 }
 
@@ -468,7 +497,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Counts flushes so the LineWriter rule can be asserted directly.
     #[derive(Default)]
@@ -1021,6 +1050,75 @@ mod tests {
     const NOT_YET: Duration = Duration::from_millis(100);
     const SOON: Duration = Duration::from_secs(5);
 
+    /// Start a waiter and return once it is blocked in `wait_settled`, so the
+    /// update that follows has to wake it instead of being seen on entry.
+    fn blocked_waiter(outstanding: &Arc<Outstanding<u32>>) -> mpsc::Receiver<()> {
+        let before = outstanding.lock().waiters;
+        let (done, settled) = mpsc::channel();
+        let waiter = Arc::clone(outstanding);
+        std::thread::spawn(move || {
+            waiter.wait_settled();
+            let _ = done.send(());
+        });
+        // The waiter registers and starts waiting in one critical section, so
+        // once the count moves it is parked on the condvar.
+        let deadline = Instant::now() + SOON;
+        while outstanding.lock().waiters == before {
+            assert!(Instant::now() < deadline, "the waiter never blocked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        settled
+    }
+
+    #[test]
+    fn each_update_that_settles_the_set_wakes_a_blocked_waiter() {
+        let outstanding = Arc::new(Outstanding::new(1));
+
+        outstanding.begin(1);
+        let woken = blocked_waiter(&outstanding);
+        outstanding.settle(outstanding.epoch(), &1);
+        assert!(woken.recv_timeout(SOON).is_ok(), "the last settle");
+
+        outstanding.begin(1);
+        outstanding.begin(2);
+        let woken = blocked_waiter(&outstanding);
+        outstanding.settle(outstanding.epoch(), &1);
+        assert!(
+            !outstanding.lock().must_wake(),
+            "a waiter is blocked but the set is overflowed"
+        );
+        assert!(
+            woken.recv_timeout(NOT_YET).is_err(),
+            "woke while the set was overflowed"
+        );
+        outstanding.clear();
+        assert!(woken.recv_timeout(SOON).is_ok(), "a receipt");
+
+        outstanding.begin(1);
+        let failing = outstanding.fail();
+        let woken = blocked_waiter(&outstanding);
+        drop(failing);
+        assert!(
+            woken.recv_timeout(SOON).is_ok(),
+            "a finished failure report"
+        );
+
+        let transition = outstanding.transition();
+        let woken = blocked_waiter(&outstanding);
+        drop(transition);
+        assert!(woken.recv_timeout(SOON).is_ok(), "the end of a transition");
+
+        assert_eq!(
+            outstanding.lock().waiters,
+            0,
+            "a waiter that returned is still counted, so every settle would wake"
+        );
+        assert!(
+            !outstanding.lock().must_wake(),
+            "settled with nobody waiting"
+        );
+    }
+
     #[test]
     fn outstanding_settles_when_its_last_request_is_settled() {
         let outstanding = Arc::new(Outstanding::new(8));
@@ -1283,6 +1381,11 @@ mod properties {
                     outstanding.lock().settled(),
                     model.settled(),
                     "after {:?}",
+                    op
+                );
+                prop_assert!(
+                    !outstanding.lock().must_wake(),
+                    "{:?} would wake with nobody waiting",
                     op
                 );
             }
