@@ -24,7 +24,7 @@ Features compose as the destination for shared process code:
 
 | Feature | Role |
 | --- | --- |
-| `local` | Blocking OS transport, bind, peer checks, session-end, spawn inherit guard |
+| `local` | Blocking OS transport, bind, peer checks, session-end, spawn inherit guard, process exit events |
 | `local-async` | Tokio listener (`windows_socket`) for a process that accepts |
 | `launch` | Client-side spawn primitives on top of `local` |
 | `replacement` / `readiness` | Exclusive or overlapping upgrade; bounded live probes |
@@ -65,7 +65,9 @@ authoritative and must not be rolled back, and `NotCommitted`, which may be
 discarded. The commit budget covers startup. The proof budget starts when a
 round reads the commit and bounds the probes after it. Polling is the default
 wait between rounds; a source that can be woken replaces it without changing
-these rules.
+these rules. A candidate's exit is such a source: `Candidate::exit_handle`
+gives a `local::ProcessHandle` to wait on between probes, so a candidate that
+dies before it is ready ends the wait at once instead of after the budget.
 
 `Lifecycle` owns one irreversible admission gate. Acquire a request guard at the
 application's operation boundary and keep it until the reply has been delivered or
@@ -180,7 +182,17 @@ state machine. Long writes must not prevent reading its observation snapshot.
 
 The `local` feature contains the OS-specific unsafe calls for peer credentials,
 process lifetime evidence, half-close and Windows overlapped I/O. Unsafe code is
-denied elsewhere. Unix listener acquisition secures the parent directory before
+denied elsewhere.
+
+Process exit is an event, not a PID check. `ProcessHandle` holds a pidfd on
+Linux, a kqueue registered for `NOTE_EXIT` on macOS and the BSDs, and a process
+handle on Windows. Each refers to the process, so a reused PID does not reach
+it. A child is watched from its spawn, before anything can reap it; another
+process is watched from a PID taken from a live connection's peer credentials,
+such as an incumbent about to retire. Where no event exists (Linux before 5.3,
+a seccomp policy that refuses `pidfd_open`, FreeBSD for another user's process),
+the handle falls back to checking the PID and reports that it did.
+`process_state` answers once for a PID on the same mechanism. Unix listener acquisition secures the parent directory before
 binding, then sets the socket to 0600 without changing the process-wide umask.
 A persistent bind lock serializes stale-socket recovery and inode-checked cleanup.
 Only a refused connection to an actual socket permits reclaiming that endpoint.

@@ -30,6 +30,8 @@ The default `async` feature adds Tokio-based lifecycle and generation support.
 Blocking clients use `default-features = false`; `wire` and `local` do not create
 a runtime. `wire-async` adds the async protocol and control handler.
 `local-async` adds the Tokio Windows listener with an explicit local-owner ACL.
+With `local` and `async` together, `local::ProcessHandle` can also wait for an
+exit on a Tokio runtime; on Unix that runtime needs I/O enabled.
 `launch` is the client-side start recipe on top of `local`. A daemon that only
 binds does not enable it.
 
@@ -49,9 +51,17 @@ leaves the ones that allow breakaway and stays in any enclosing job that does
 not, without that being reported. Starting the daemon from outside the job,
 through a scheduled task or a service, is the only way around it.
 
-`local::process_state` reports a PID as alive, exited or unknown, and never
-folds an access-denied query into either answer. Alive describes the PID, which
-the OS reuses, so confirm the daemon through its endpoint before trusting it.
+`local::ProcessHandle` waits for a process to exit without polling: a pidfd on
+Linux, a kqueue on macOS and the BSDs, a process handle on Windows. It follows
+the process it was opened on, not its PID, and offers blocking and async waits
+with deadlines. `launch::DaemonChild::wait_until_live` uses it to end a startup
+wait as soon as the daemon dies. On Linux before 5.3 the handle falls back to
+checking the PID, and says so.
+
+`local::process_state` answers once for a PID: alive, exited or unknown. It
+never folds an access-denied query into either answer. Alive describes the PID,
+which the OS reuses, so confirm the daemon through its endpoint before trusting
+it.
 
 ## Request draining
 
