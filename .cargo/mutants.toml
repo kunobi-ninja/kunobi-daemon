@@ -44,4 +44,7 @@ exclude_re = [
     # cargo-mutants skips `#[cfg(test)]` but does not recognise `test` inside
     # `all(...)`, so it would mutate the tests' own fixtures.
     '^src/local/unix\.rs:.*\b(interrupt_process_group|inheritable_pipe)\b',
+    # Built only without the `local` feature, and mutants are tested with all
+    # features. The `--no-default-features` test runs still exercise it.
+    '^src/warmup\.rs:.*\bpolled_exit_by\b',
 ]

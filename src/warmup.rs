@@ -164,23 +164,42 @@ fn spawn_when_free(
     }
 }
 
-/// Wait for `child` to exit, killing it at `limit`. The standard library has
-/// no timed wait for a child, so this checks with a backoff capped at 50ms.
-/// It runs off the caller's thread, which waits on a channel instead.
+/// Wait for `child` to exit, killing it at `limit`. It runs off the caller's
+/// thread, which waits on a channel instead.
 fn reap(mut child: Child, limit: Instant) -> io::Result<ExitStatus> {
+    if exits_by(&mut child, limit)? {
+        return child.wait();
+    }
+    let _ = child.kill();
+    child.wait()?;
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "warmup child killed at its runaway limit",
+    ))
+}
+
+/// Whether `child` exits by `limit`, told by the OS when it does.
+#[cfg(feature = "local")]
+fn exits_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
+    crate::local::ProcessHandle::for_child(child)?.wait_until(limit)
+}
+
+#[cfg(not(feature = "local"))]
+use polled_exit_by as exits_by;
+
+/// Whether `child` exits by `limit`. Without the `local` feature there is no
+/// exit event, and the standard library has no timed wait for a child, so
+/// this checks with a backoff capped at 50ms.
+#[cfg(not(feature = "local"))]
+fn polled_exit_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
     let mut pause = Duration::from_millis(1);
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+        if child.try_wait()?.is_some() {
+            return Ok(true);
         }
         let left = limit.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            let _ = child.kill();
-            child.wait()?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "warmup child killed at its runaway limit",
-            ));
+            return Ok(false);
         }
         std::thread::sleep(pause.min(left));
         pause = (pause * 2).min(Duration::from_millis(50));
@@ -203,6 +222,16 @@ mod tests {
         let exited = start(Path::new("/bin/sleep"), &["30"], Instant::now(), runaway).unwrap();
         let error = exited.recv().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_child_that_exits_reports_its_status_before_the_limit() {
+        let started = Instant::now();
+        let runaway = Duration::from_secs(60);
+        let exited = start(Path::new("/bin/sh"), &["-c", "exit 4"], started, runaway).unwrap();
+        let status = exited.recv().unwrap().unwrap();
+        assert_eq!(status.code(), Some(4));
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[cfg(target_os = "linux")]

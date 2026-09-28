@@ -5,7 +5,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kunobi_daemon::{
         Candidate, ProcessLock, ServiceIdentity,
         local::{Duplex, unix::UnixDuplex},
-        readiness,
         replacement::{self, Budgets, Driver, Mode, Progress, Step},
         transport::SplitIo,
         wire::{self, capability, operation},
@@ -72,7 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(Progress::Done);
                     }
                     let mut client = Candidate::new(self.command.spawn()?);
-                    let status = readiness::wait_until(deadline, |_| client.try_wait())?
+                    let status = client
+                        .wait_until(deadline)?
                         .ok_or(io::ErrorKind::TimedOut)?;
                     if !status.success() {
                         return Err(io::Error::other(format!(
