@@ -17,7 +17,8 @@ autobenches = false
 default = ["async"]
 async = ["dep:tokio", "tokio/macros"]
 wire = ["dep:buffa"]
-local = ["dep:interprocess", "dep:socket2", "dep:libc", "dep:widestring"]
+# With `async`, `local::ProcessHandle` waits for an exit through Tokio's reactor.
+local = ["dep:interprocess", "dep:socket2", "dep:libc", "dep:widestring", "tokio?/net"]
 local-async = ["local", "async", "interprocess/tokio"]
 wire-async = ["wire", "async", "tokio/io-util"]
 # Stdio clients that may start the daemon. Off by default so a process that

@@ -1,4 +1,6 @@
 //! Optional OS adapters. Unsafe calls are confined to these platform boundaries.
+//!
+//! [`ProcessHandle`] waits for a process to exit without polling its PID.
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -117,13 +119,14 @@ pub use unix::UnixDuplex as PlatformDuplex;
 #[cfg(windows)]
 pub use windows::WindowsDuplex as PlatformDuplex;
 
+pub use process::{ProcessHandle, process_has_exited, process_state};
 // Same name, same signature on both platforms. Everything else in `unix` and
 // `windows` differs (uid and child-reaping helpers on one side, a session-end
 // handler and an inherit guard on the other) and stays behind its module.
 #[cfg(unix)]
-pub use unix::{process_has_exited, process_state, terminate_legacy_peer};
+pub use unix::terminate_legacy_peer;
 #[cfg(windows)]
-pub use windows::{process_has_exited, process_state, terminate_legacy_peer};
+pub use windows::terminate_legacy_peer;
 
 /// What the OS can establish about a PID.
 ///
@@ -137,7 +140,8 @@ pub use windows::{process_has_exited, process_state, terminate_legacy_peer};
 /// `Alive` is about a PID, not a program: a PID is reused once its process is
 /// gone, on Unix and on Windows alike, so a PID that reads as alive may belong
 /// to an unrelated process by now. Before treating it as the daemon you
-/// started, confirm through its endpoint (connect and check the peer).
+/// started, confirm through its endpoint (connect and check the peer). To
+/// follow one process rather than a PID, keep a [`ProcessHandle`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProcessState {
@@ -186,6 +190,7 @@ impl std::fmt::Display for ConnectError {
 }
 impl std::error::Error for ConnectError {}
 
+mod process;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]

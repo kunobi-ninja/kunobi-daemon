@@ -4,15 +4,30 @@
 
 #[test]
 fn msvc_import_libs_use_lowercase_names() {
-    let mixed: Vec<String> = include_str!("../src/local/windows.rs")
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let rest = line.trim().strip_prefix("#[link(name = \"")?;
-            let name = rest.split('"').next()?;
-            name.chars()
-                .any(|c| c.is_ascii_uppercase())
-                .then(|| format!("{}: {name}", index + 1))
+    let sources = [
+        (
+            "src/local/windows.rs",
+            include_str!("../src/local/windows.rs"),
+        ),
+        (
+            "src/local/windows_spawn.rs",
+            include_str!("../src/local/windows_spawn.rs"),
+        ),
+        (
+            "src/local/process/windows.rs",
+            include_str!("../src/local/process/windows.rs"),
+        ),
+    ];
+    let mixed: Vec<String> = sources
+        .iter()
+        .flat_map(|(path, source)| {
+            source.lines().enumerate().filter_map(move |(index, line)| {
+                let rest = line.trim().strip_prefix("#[link(name = \"")?;
+                let name = rest.split('"').next()?;
+                name.chars()
+                    .any(|c| c.is_ascii_uppercase())
+                    .then(|| format!("{path}:{}: {name}", index + 1))
+            })
         })
         .collect();
     assert!(

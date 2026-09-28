@@ -28,6 +28,11 @@ exclude_globs = [
     "src/local/windows.rs",
     "src/local/windows_socket.rs",
     "src/local/windows_spawn.rs",
+    "src/local/process/windows.rs",
+    # macOS and the BSDs; the macOS test job builds and tests it.
+    "src/local/process/kqueue.rs",
+    # Unix systems CI does not run on.
+    "src/local/process/unsupported.rs",
 ]
 
 exclude_re = [

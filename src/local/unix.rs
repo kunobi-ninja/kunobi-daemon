@@ -228,13 +228,14 @@ fn verify_peer_user(fd: RawFd) -> io::Result<()> {
     }
 }
 
-/// True only when the OS establishes that a previously verified PID exited.
-pub fn process_has_exited(pid: u32) -> bool {
-    process_state(pid) == super::ProcessState::Exited
-}
+pub use super::process::{process_has_exited, process_state};
 
-/// What the OS establishes about `pid`: see [`super::ProcessState`].
-pub fn process_state(pid: u32) -> super::ProcessState {
+/// What `kill(pid, 0)` and, on Linux, `/proc` establish about `pid`.
+///
+/// The fallback where no exit event is available: see
+/// [`super::ProcessHandle`]. Outside Linux it reads a child that exited but
+/// has not been waited for as alive.
+pub(crate) fn signal_state(pid: u32) -> super::ProcessState {
     use super::ProcessState;
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -736,6 +737,29 @@ mod tests {
         // Reaped, so the PID is gone (barring reuse within this test).
         assert_eq!(process_state(pid), ProcessState::Exited);
         assert!(process_has_exited(pid));
+    }
+
+    #[test]
+    fn the_signal_fallback_reports_alive_exited_and_unknown() {
+        use super::super::ProcessState;
+        assert_eq!(signal_state(std::process::id()), ProcessState::Alive);
+        assert_eq!(signal_state(0), ProcessState::Unknown);
+        assert_eq!(signal_state(u32::MAX), ProcessState::Unknown);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(signal_state(pid), ProcessState::Exited);
+    }
+
+    /// Linux reads a zombie's state from /proc, so the fallback reports it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_signal_fallback_reports_an_unreaped_child_as_exited_on_linux() {
+        use super::super::{ProcessHandle, ProcessState};
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        ProcessHandle::for_child(&child).unwrap().wait().unwrap();
+        assert_eq!(signal_state(child.id()), ProcessState::Exited);
+        child.wait().unwrap();
     }
 
     #[test]
