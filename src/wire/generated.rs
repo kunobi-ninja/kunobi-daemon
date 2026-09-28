@@ -52,6 +52,83 @@ impl ::buffa::Enumeration for MessageKind {
         &[Self::LIFECYCLE, Self::APPLICATION]
     }
 }
+/// WATCH always starts with a snapshot. Updates carry the complete state too,
+/// so a slow observer can receive coalesced changes without losing current state.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(i32)]
+pub enum LifecycleChange {
+    SNAPSHOT = 0i32,
+    READY = 1i32,
+    DRAINING = 2i32,
+    SELECTION_CHANGED = 3i32,
+    RETIRING = 4i32,
+}
+impl LifecycleChange {
+    ///Idiomatic alias for [`Self::SNAPSHOT`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Snapshot: Self = Self::SNAPSHOT;
+    ///Idiomatic alias for [`Self::READY`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Ready: Self = Self::READY;
+    ///Idiomatic alias for [`Self::DRAINING`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Draining: Self = Self::DRAINING;
+    ///Idiomatic alias for [`Self::SELECTION_CHANGED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const SelectionChanged: Self = Self::SELECTION_CHANGED;
+    ///Idiomatic alias for [`Self::RETIRING`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Retiring: Self = Self::RETIRING;
+}
+impl ::core::default::Default for LifecycleChange {
+    fn default() -> Self {
+        Self::SNAPSHOT
+    }
+}
+impl ::buffa::Enumeration for LifecycleChange {
+    fn from_i32(value: i32) -> ::core::option::Option<Self> {
+        match value {
+            0i32 => ::core::option::Option::Some(Self::SNAPSHOT),
+            1i32 => ::core::option::Option::Some(Self::READY),
+            2i32 => ::core::option::Option::Some(Self::DRAINING),
+            3i32 => ::core::option::Option::Some(Self::SELECTION_CHANGED),
+            4i32 => ::core::option::Option::Some(Self::RETIRING),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn to_i32(&self) -> i32 {
+        *self as i32
+    }
+    fn proto_name(&self) -> &'static str {
+        match self {
+            Self::SNAPSHOT => "SNAPSHOT",
+            Self::READY => "READY",
+            Self::DRAINING => "DRAINING",
+            Self::SELECTION_CHANGED => "SELECTION_CHANGED",
+            Self::RETIRING => "RETIRING",
+        }
+    }
+    fn from_proto_name(name: &str) -> ::core::option::Option<Self> {
+        match name {
+            "SNAPSHOT" => ::core::option::Option::Some(Self::SNAPSHOT),
+            "READY" => ::core::option::Option::Some(Self::READY),
+            "DRAINING" => ::core::option::Option::Some(Self::DRAINING),
+            "SELECTION_CHANGED" => ::core::option::Option::Some(Self::SELECTION_CHANGED),
+            "RETIRING" => ::core::option::Option::Some(Self::RETIRING),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn values() -> &'static [Self] {
+        &[
+            Self::SNAPSHOT,
+            Self::READY,
+            Self::DRAINING,
+            Self::SELECTION_CHANGED,
+            Self::RETIRING,
+        ]
+    }
+}
 /// Version/capability offer. Field numbers are part of the wire contract.
 /// Never reuse a removed field number or change its type.
 #[derive(Clone, PartialEq, Default)]
@@ -311,7 +388,7 @@ impl ::buffa::ExtensionSet for Hello {
 /// receiver and retained when re-encoding. New semantics require capabilities.
 #[derive(Clone, PartialEq, Default)]
 pub struct Control {
-    /// Operation: health=1, drain=2, prepare=3, paused=4, ready=5, commit=6, abort=7.
+    /// Operation: health=1, drain=2, prepare=3, paused=4, ready=5, commit=6, abort=7, watch=8.
     /// For kind=APPLICATION, the application owns IDs starting at 1 instead.
     /// Never reuse retired operation IDs within either kind.
     ///
@@ -739,6 +816,282 @@ impl ::buffa::Message for Health {
 }
 impl ::buffa::ExtensionSet for Health {
     const PROTO_FQN: &'static str = "kunobi.daemon.v2.Health";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+#[derive(Clone, PartialEq, Default)]
+pub struct LifecycleEvent {
+    /// Field 1: `change`
+    pub change: ::buffa::EnumValue<LifecycleChange>,
+    /// Increasing within this subscription, starting at one.
+    ///
+    /// Field 2: `sequence`
+    pub sequence: u64,
+    /// Field 3: `process_id`
+    pub process_id: u32,
+    /// Field 4: `generation`
+    pub generation: u64,
+    /// Field 5: `build`
+    pub build: ::buffa::alloc::string::String,
+    /// Field 6: `ready`
+    pub ready: bool,
+    /// Field 7: `draining`
+    pub draining: bool,
+    /// Most recently committed selection, which may name a successor.
+    ///
+    /// Field 8: `selected_generation`
+    pub selected_generation: ::core::option::Option<u64>,
+    /// Field 9: `selected_build`
+    pub selected_build: ::buffa::alloc::string::String,
+    /// Field 10: `retiring`
+    pub retiring: bool,
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for LifecycleEvent {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("LifecycleEvent")
+            .field("change", &self.change)
+            .field("sequence", &self.sequence)
+            .field("process_id", &self.process_id)
+            .field("generation", &self.generation)
+            .field("build", &self.build)
+            .field("ready", &self.ready)
+            .field("draining", &self.draining)
+            .field("selected_generation", &self.selected_generation)
+            .field("selected_build", &self.selected_build)
+            .field("retiring", &self.retiring)
+            .finish()
+    }
+}
+impl LifecycleEvent {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/kunobi.daemon.v2.LifecycleEvent";
+}
+impl LifecycleEvent {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::selected_generation`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_selected_generation(mut self, value: u64) -> Self {
+        self.selected_generation = Some(value);
+        self
+    }
+}
+::buffa::impl_default_instance!(LifecycleEvent);
+impl ::buffa::MessageName for LifecycleEvent {
+    const PACKAGE: &'static str = "kunobi.daemon.v2";
+    const NAME: &'static str = "LifecycleEvent";
+    const FULL_NAME: &'static str = "kunobi.daemon.v2.LifecycleEvent";
+    const TYPE_URL: &'static str = "type.googleapis.com/kunobi.daemon.v2.LifecycleEvent";
+}
+impl ::buffa::Message for LifecycleEvent {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        {
+            let val = self.change.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        if self.sequence != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.sequence) as u64;
+        }
+        if self.process_id != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.process_id) as u64;
+        }
+        if self.generation != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.generation) as u64;
+        }
+        if !self.build.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.build) as u64;
+        }
+        if self.ready {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.draining {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if let Some(v) = self.selected_generation {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(v) as u64;
+        }
+        if !self.selected_build.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.selected_build) as u64;
+        }
+        if self.retiring {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        {
+            let val = self.change.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(1u32, val, buf);
+            }
+        }
+        if self.sequence != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.sequence, buf);
+        }
+        if self.process_id != 0u32 {
+            ::buffa::types::put_uint32_field(3u32, self.process_id, buf);
+        }
+        if self.generation != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.generation, buf);
+        }
+        if !self.build.is_empty() {
+            ::buffa::types::put_string_field(5u32, &self.build, buf);
+        }
+        if self.ready {
+            ::buffa::types::put_bool_field(6u32, self.ready, buf);
+        }
+        if self.draining {
+            ::buffa::types::put_bool_field(7u32, self.draining, buf);
+        }
+        if let Some(v) = self.selected_generation {
+            ::buffa::types::put_uint64_field(8u32, v, buf);
+        }
+        if !self.selected_build.is_empty() {
+            ::buffa::types::put_string_field(9u32, &self.selected_build, buf);
+        }
+        if self.retiring {
+            ::buffa::types::put_bool_field(10u32, self.retiring, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.change = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(buf)?,
+                );
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.sequence = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.process_id = ::buffa::types::decode_uint32(buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.generation = ::buffa::types::decode_uint64(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.build, buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.ready = ::buffa::types::decode_bool(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.draining = ::buffa::types::decode_bool(buf)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.selected_generation = ::core::option::Option::Some(
+                    ::buffa::types::decode_uint64(buf)?,
+                );
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.selected_build, buf)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.retiring = ::buffa::types::decode_bool(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.change = ::buffa::EnumValue::from(0);
+        self.sequence = 0u64;
+        self.process_id = 0u32;
+        self.generation = 0u64;
+        self.build.clear();
+        self.ready = false;
+        self.draining = false;
+        self.selected_generation = ::core::option::Option::None;
+        self.selected_build.clear();
+        self.retiring = false;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for LifecycleEvent {
+    const PROTO_FQN: &'static str = "kunobi.daemon.v2.LifecycleEvent";
     fn unknown_fields(&self) -> &::buffa::UnknownFields {
         &self.__buffa_unknown_fields
     }

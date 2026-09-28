@@ -76,3 +76,7 @@ required-features = ["wire", "local"]
 [[example]]
 name = "managed_daemon"
 required-features = ["wire", "local"]
+
+[[example]]
+name = "ipc_bench"
+required-features = ["wire-async", "launch"]

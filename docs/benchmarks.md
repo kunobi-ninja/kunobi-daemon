@@ -73,3 +73,30 @@ The threshold applies to each benchmark on its own, so an improvement in one
 cannot hide a regression in another. When the growth is expected, for example a
 correctness fix that must do more work, explain it in the pull request; the
 table shows reviewers which paths grew and by how much.
+
+## Real subprocess and socket measurements
+
+On Linux or macOS, run:
+
+```sh
+cargo run --release --features wire-async,launch --example ipc_bench -- 200 8
+```
+
+The arguments are samples per client and concurrent clients. Output is JSONL:
+
+- Process start through a readiness notification and a verified health response.
+- Connect, negotiate, and health round-trip latency at one client and the chosen concurrency.
+- Daemon CPU time and voluntary context switches during one idle second.
+
+The server is a separate process using Unix sockets and the production session,
+health, and launch primitives. Every health sample establishes a connection;
+these numbers do not describe an already connected application stream. Startup
+uses five samples and includes ordinary OS executable-cache effects; it does not
+force a cold disk cache. Idle counters include the bounding counter requests.
+Voluntary context switches are not a hardware wakeup count. Windows named-pipe
+measurements are not implemented by this harness.
+
+Record OS, architecture, build profile, sample count, and system load alongside
+results. Run the same harness on both revisions and repeat measurements before
+claiming an improvement. Wall-clock results are diagnostic and have no fixed CI
+threshold; the instruction-count gate above remains the regression gate.

@@ -269,12 +269,12 @@ pub async fn run_async<D: AsyncDriver>(
         let committed_before = machine.committed;
         if let Some(outcome) = machine.advance(progress)? {
             if machine.committed && !committed_before {
-                crate::warmup::prefault_all(driver.warmup_paths());
+                prefault_async(driver.warmup_paths()).await;
             }
             return Ok(outcome);
         }
         if machine.committed && !committed_before {
-            crate::warmup::prefault_all(driver.warmup_paths());
+            prefault_async(driver.warmup_paths()).await;
         }
         if machine.step != step {
             if machine.step == Step::Drain || machine.step == Step::Retire {
@@ -292,6 +292,15 @@ pub async fn run_async<D: AsyncDriver>(
             )]
             tokio::time::sleep_until(deadline.map_or(wake, |limit| limit.min(wake))).await;
         }
+    }
+}
+
+// Filesystem reads must not occupy a Tokio worker after a successful commit.
+// The paths are owned and bounded by the caller; failed warming is non-fatal.
+#[cfg(feature = "async")]
+async fn prefault_async(paths: Vec<std::path::PathBuf>) {
+    if !paths.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || crate::warmup::prefault_all(paths)).await;
     }
 }
 
