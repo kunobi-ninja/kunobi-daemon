@@ -64,28 +64,40 @@ impl Event {
 }
 
 /// Poll `fd` for readability until `deadline`, or without one. True once the
-/// process exited. A poll timeout rounded up to whole milliseconds never ends
-/// before the deadline, so a poll that reports nothing means it has passed.
+/// process exited.
 fn wait_readable(fd: RawFd, deadline: Option<Instant>) -> io::Result<bool> {
-    let revents = restarting(|| {
-        let mut entry = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll receives one initialized entry for a descriptor the
-        // caller keeps open for the duration of the call.
-        cvt(unsafe { libc::poll(&mut entry, 1, poll_timeout(deadline)) })?;
-        Ok(entry.revents)
-    })?;
-    exited_from(revents)
+    loop {
+        let revents = restarting(|| {
+            let mut entry = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = poll_timeout(deadline, Instant::now());
+            // SAFETY: poll receives one initialized entry for a descriptor the
+            // caller keeps open for the duration of the call.
+            cvt(unsafe { libc::poll(&mut entry, 1, timeout) })?;
+            Ok(entry.revents)
+        })?;
+        if revents != 0 || !waits_again(deadline, Instant::now()) {
+            return exited_from(revents);
+        }
+    }
 }
 
-/// `poll`'s timeout argument: -1 waits without a deadline.
-fn poll_timeout(deadline: Option<Instant>) -> libc::c_int {
+/// `poll`'s timeout argument at `now`: -1 waits without a deadline. Rounded
+/// up to whole milliseconds, a timeout never ends before the deadline, but a
+/// deadline more than `c_int::MAX` milliseconds away is cut short.
+fn poll_timeout(deadline: Option<Instant>, now: Instant) -> libc::c_int {
     deadline.map_or(-1, |deadline| {
-        libc::c_int::try_from(millis_until(deadline, Instant::now())).unwrap_or(libc::c_int::MAX)
+        libc::c_int::try_from(millis_until(deadline, now)).unwrap_or(libc::c_int::MAX)
     })
+}
+
+/// Whether a poll that reported nothing at `now` must poll again: its
+/// timeout was cut short of `deadline`.
+fn waits_again(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_none_or(|deadline| now < deadline)
 }
 
 /// Whether the returned events report an exit. None at all is a timeout.
@@ -148,12 +160,31 @@ mod tests {
 
     #[test]
     fn the_poll_timeout_covers_the_whole_deadline() {
-        assert_eq!(poll_timeout(None), -1);
-        assert_eq!(poll_timeout(Some(Instant::now())), 0);
-        let timeout = poll_timeout(Some(Instant::now() + Duration::from_secs(5)));
-        assert!((4_900..=5_000).contains(&timeout), "{timeout}");
-        let far = Instant::now() + Duration::from_secs(u64::from(u32::MAX));
-        assert_eq!(poll_timeout(Some(far)), libc::c_int::MAX);
+        let now = Instant::now();
+        assert_eq!(poll_timeout(None, now), -1);
+        assert_eq!(poll_timeout(Some(now), now), 0);
+        assert_eq!(poll_timeout(Some(now), now + Duration::from_secs(1)), 0);
+        assert_eq!(poll_timeout(Some(now + Duration::from_nanos(1)), now), 1);
+        assert_eq!(poll_timeout(Some(now + Duration::from_secs(5)), now), 5_000);
+        let far = now + Duration::from_secs(u64::from(u32::MAX));
+        assert_eq!(poll_timeout(Some(far), now), libc::c_int::MAX);
+    }
+
+    #[test]
+    fn a_poll_cut_short_of_its_deadline_polls_again() {
+        let now = Instant::now();
+        // Only a deadline still ahead sends an empty poll round again.
+        assert!(waits_again(Some(now + Duration::from_millis(1)), now));
+        let far = now + Duration::from_secs(u64::from(u32::MAX));
+        assert!(waits_again(
+            Some(far),
+            now + Duration::from_millis(i32::MAX as u64)
+        ));
+        assert!(!waits_again(Some(now), now));
+        assert!(!waits_again(Some(now), now + Duration::from_millis(1)));
+        // Without a deadline poll does not time out; if it ever reports
+        // nothing, it waits again.
+        assert!(waits_again(None, now));
     }
 
     #[test]
