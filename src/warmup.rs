@@ -164,27 +164,51 @@ fn spawn_when_free(
     }
 }
 
-/// Wait for `child` to exit, killing it at `limit`. The standard library has
-/// no timed wait for a child, so this checks with a backoff capped at 50ms.
-/// It runs off the caller's thread, which waits on a channel instead.
+/// Wait for `child` to exit, killing it at `limit`. It runs off the caller's
+/// thread, which waits on a channel instead. A child whose exit cannot be
+/// observed is killed and reaped too, never dropped still running.
 fn reap(mut child: Child, limit: Instant) -> io::Result<ExitStatus> {
-    let mut pause = Duration::from_millis(1);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        let left = limit.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            let _ = child.kill();
-            child.wait()?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "warmup child killed at its runaway limit",
-            ));
-        }
-        std::thread::sleep(pause.min(left));
-        pause = (pause * 2).min(Duration::from_millis(50));
-    }
+    let stopped = match exits_by(&mut child, limit) {
+        Ok(true) => return child.wait(),
+        Ok(false) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "warmup child killed at its runaway limit",
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = child.kill();
+    child.wait()?;
+    stopped
+}
+
+/// Whether `child` exits by `limit`, told by the OS when it does.
+#[cfg(feature = "local")]
+fn exits_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
+    let opened = crate::local::ProcessHandle::for_child(child);
+    exits_by_watching(child, opened, limit)
+}
+
+/// [`exits_by`] with the result of opening the child's exit handle. A handle
+/// that could not be opened, for example for want of a descriptor, leaves
+/// the child to be asked directly.
+#[cfg(feature = "local")]
+fn exits_by_watching(
+    child: &mut Child,
+    opened: io::Result<crate::local::ProcessHandle>,
+    limit: Instant,
+) -> io::Result<bool> {
+    crate::local::wait_child(|| child.try_wait(), opened.ok().as_mut(), limit)
+}
+
+#[cfg(not(feature = "local"))]
+use polled_exit_by as exits_by;
+
+/// Whether `child` exits by `limit`. Without the `local` feature there is no
+/// exit event, and the standard library has no timed wait for a child, so
+/// this asks the child with a growing pause.
+#[cfg(not(feature = "local"))]
+fn polled_exit_by(child: &mut Child, limit: Instant) -> io::Result<bool> {
+    crate::backoff::poll(|| Ok(child.try_wait()?.is_some()), Some(limit))
 }
 
 pub(crate) fn prefault_all(paths: impl IntoIterator<Item = impl AsRef<Path>>) {
@@ -203,6 +227,37 @@ mod tests {
         let exited = start(Path::new("/bin/sleep"), &["30"], Instant::now(), runaway).unwrap();
         let error = exited.recv().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_child_that_exits_reports_its_status_before_the_limit() {
+        let started = Instant::now();
+        let runaway = Duration::from_secs(60);
+        let exited = start(Path::new("/bin/sh"), &["-c", "exit 4"], started, runaway).unwrap();
+        let status = exited.recv().unwrap().unwrap();
+        assert_eq!(status.code(), Some(4));
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_child_whose_exit_handle_cannot_be_opened_is_still_waited_for() {
+        let failed = || Err(io::Error::other("out of descriptors"));
+        let mut exits = Command::new("/bin/sh")
+            .args(["-c", "exit 4"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
+        assert!(exits_by_watching(&mut exits, failed(), deadline).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(exits.wait().unwrap().code(), Some(4));
+
+        let mut runs = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(!exits_by_watching(&mut runs, failed(), deadline).unwrap());
+        runs.kill().unwrap();
+        runs.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]

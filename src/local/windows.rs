@@ -499,6 +499,89 @@ fn cancel_and_reap(
     }
 }
 
+pub use super::process::{process_has_exited, process_state};
+
+static SESSION_END: AtomicBool = AtomicBool::new(false);
+
+const CTRL_CLOSE_EVENT: u32 = 2;
+const CTRL_LOGOFF_EVENT: u32 = 5;
+const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
+    if matches!(
+        event,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
+        SESSION_END.store(true, Ordering::Release);
+        1
+    } else {
+        0
+    }
+}
+
+/// Arm CLOSE/LOGOFF/SHUTDOWN so a published pipe is not left after logoff.
+pub fn install_session_end_handler() -> io::Result<()> {
+    // SAFETY: `session_end_handler` is process-lifetime and only stores an
+    // atomic, which is safe on the system-created callback thread.
+    if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
+pub fn session_end_requested() -> bool {
+    SESSION_END.load(Ordering::Acquire)
+}
+
+const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+/// Clears inherit on this process's standard handles and restores it on drop.
+///
+/// Explicit child stdio is unaffected: the standard library marks those
+/// handles inheritable. This removes incidental inheritance of the caller's
+/// pipes across `Command::spawn`.
+pub struct StdioInheritGuard {
+    restore: Vec<Handle>,
+}
+
+impl StdioInheritGuard {
+    /// Suppress inherit for the duration of a spawn.
+    pub fn suppress() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        let handles: [Handle; 3] = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut restore = Vec::new();
+        for handle in handles {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            // SAFETY: handle is a live std handle; clearing inherit is
+            // process-local and restored on drop.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                restore.push(handle);
+            }
+        }
+        Self { restore }
+    }
+}
+
+impl Drop for StdioInheritGuard {
+    fn drop(&mut self) {
+        for handle in &self.restore {
+            // SAFETY: handles were successfully cleared by `suppress`.
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -630,174 +713,5 @@ mod tests {
         read.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"x");
         server.join().unwrap();
-    }
-}
-
-/// True only when the OS establishes that a previously verified PID exited.
-pub fn process_has_exited(pid: u32) -> bool {
-    process_state(pid) == super::ProcessState::Exited
-}
-
-/// What the OS establishes about `pid`: see [`super::ProcessState`].
-///
-/// A PID that no longer exists makes `OpenProcess` fail with
-/// `ERROR_INVALID_PARAMETER`, which is proof it exited. Access denial is not:
-/// the process may be running under another user, or be an exited process
-/// object someone still holds a handle to.
-pub fn process_state(pid: u32) -> super::ProcessState {
-    use super::ProcessState;
-    if pid == 0 {
-        return ProcessState::Unknown;
-    }
-    const SYNCHRONIZE: u32 = 0x00100000;
-    // SAFETY: requests only a waitable handle to the given PID.
-    let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-    if process.is_null() {
-        return state_from_open_error(std::io::Error::last_os_error().raw_os_error());
-    }
-    // SAFETY: process is our live handle; zero timeout never blocks.
-    let result = unsafe { WaitForSingleObject(process, 0) };
-    // SAFETY: this closes exactly the handle opened above, which nothing else
-    // owns. Releasing our reference to a process does not stop it.
-    unsafe {
-        CloseHandle(process);
-    }
-    state_from_wait(result)
-}
-
-fn state_from_open_error(error: Option<i32>) -> super::ProcessState {
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-    if error == Some(ERROR_INVALID_PARAMETER) {
-        super::ProcessState::Exited
-    } else {
-        super::ProcessState::Unknown
-    }
-}
-
-fn state_from_wait(result: u32) -> super::ProcessState {
-    match result {
-        WAIT_OBJECT_0 => super::ProcessState::Exited,
-        WAIT_TIMEOUT => super::ProcessState::Alive,
-        _ => super::ProcessState::Unknown,
-    }
-}
-
-static SESSION_END: AtomicBool = AtomicBool::new(false);
-
-const CTRL_CLOSE_EVENT: u32 = 2;
-const CTRL_LOGOFF_EVENT: u32 = 5;
-const CTRL_SHUTDOWN_EVENT: u32 = 6;
-
-unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
-    if matches!(
-        event,
-        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
-    ) {
-        SESSION_END.store(true, Ordering::Release);
-        1
-    } else {
-        0
-    }
-}
-
-/// Arm CLOSE/LOGOFF/SHUTDOWN so a published pipe is not left after logoff.
-pub fn install_session_end_handler() -> io::Result<()> {
-    // SAFETY: `session_end_handler` is process-lifetime and only stores an
-    // atomic, which is safe on the system-created callback thread.
-    if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
-pub fn session_end_requested() -> bool {
-    SESSION_END.load(Ordering::Acquire)
-}
-
-const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
-const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-
-/// Clears inherit on this process's standard handles and restores it on drop.
-///
-/// Explicit child stdio is unaffected: the standard library marks those
-/// handles inheritable. This removes incidental inheritance of the caller's
-/// pipes across `Command::spawn`.
-pub struct StdioInheritGuard {
-    restore: Vec<Handle>,
-}
-
-impl StdioInheritGuard {
-    /// Suppress inherit for the duration of a spawn.
-    pub fn suppress() -> Self {
-        use std::os::windows::io::AsRawHandle;
-        let handles: [Handle; 3] = [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-            std::io::stderr().as_raw_handle(),
-        ];
-        let mut restore = Vec::new();
-        for handle in handles {
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                continue;
-            }
-            // SAFETY: handle is a live std handle; clearing inherit is
-            // process-local and restored on drop.
-            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
-                restore.push(handle);
-            }
-        }
-        Self { restore }
-    }
-}
-
-impl Drop for StdioInheritGuard {
-    fn drop(&mut self) {
-        for handle in &self.restore {
-            // SAFETY: handles were successfully cleared by `suppress`.
-            unsafe {
-                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod lifetime_tests {
-    use super::super::ProcessState;
-
-    #[test]
-    fn the_current_process_and_unknown_pid_are_not_retired() {
-        assert!(!super::process_has_exited(std::process::id()));
-        assert!(!super::process_has_exited(0));
-        assert_eq!(
-            super::process_state(std::process::id()),
-            ProcessState::Alive
-        );
-        assert_eq!(super::process_state(0), ProcessState::Unknown);
-    }
-
-    #[test]
-    fn access_denied_is_unknown_and_only_a_missing_pid_is_exited() {
-        assert_eq!(super::state_from_open_error(Some(87)), ProcessState::Exited);
-        assert_eq!(super::state_from_open_error(Some(5)), ProcessState::Unknown);
-        assert_eq!(super::state_from_open_error(None), ProcessState::Unknown);
-        assert_eq!(super::state_from_wait(0), ProcessState::Exited);
-        assert_eq!(super::state_from_wait(258), ProcessState::Alive);
-        assert_eq!(super::state_from_wait(0xFFFF_FFFF), ProcessState::Unknown);
-    }
-
-    #[test]
-    fn a_child_that_exited_reads_as_exited() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/c", "exit", "0"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        // Keep the handle open while checking: an exited process object that
-        // is still referenced reads as exited through the wait, not the open.
-        child.wait().unwrap();
-        assert_eq!(super::process_state(pid), ProcessState::Exited);
     }
 }

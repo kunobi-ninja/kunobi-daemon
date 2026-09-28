@@ -15,6 +15,7 @@ pub mod launch;
 pub mod local;
 
 pub mod admission;
+mod backoff;
 mod candidate;
 #[cfg(feature = "wire-async")]
 pub mod control;
