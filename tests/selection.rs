@@ -67,6 +67,15 @@ const BUDGET: Budget = Budget {
 };
 
 #[test]
+fn default_evidence_wait_prevents_immediate_repeated_probes() {
+    let start = Instant::now();
+    Script::new().wait(start + Duration::from_secs(60));
+    // A scheduling delay can only lengthen this wait. No upper wall-clock
+    // bound or exact probe count is needed to reject a busy loop.
+    assert!(start.elapsed() >= kunobi_daemon::readiness::POLL_INTERVAL);
+}
+
+#[test]
 fn a_commit_during_a_probe_of_the_incumbent_waits_for_the_candidate_s_own_proof() {
     // The candidate commits while round 0 is still probing the incumbent, and
     // answers from round 1. Pairing round 0's stale probe with the new record
