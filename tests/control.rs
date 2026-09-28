@@ -598,7 +598,9 @@ async fn watch_request_fields_are_validated_before_subscribing() {
         }
         session.send(&request).await.unwrap();
         if case >= 3 {
-            assert_eq!(session.receive().await.unwrap().generation, 4);
+            let reply = session.receive().await.unwrap();
+            assert_eq!(reply.generation, 4);
+            assert_eq!(reply.request_id, request.request_id);
             drop(session);
             task.await.unwrap().unwrap();
         } else {
