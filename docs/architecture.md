@@ -197,6 +197,14 @@ running as the same OS user can publish its own PID in that record, so a match
 does not authenticate the record's writer or the peer's executable. The
 consumer decides what a grant allows.
 
+`client::request` (with `client::health` and `client::drain`) is the blocking
+control client built on that flow. Before trusting a reply it requires the
+peer to run as this user, to be the expected process when the caller passes
+one, and the reply's `Health::process_id` to name that same process, all
+before one deadline. Its `RequestError::is_transient` is true only when nothing
+accepted the connection yet; any other failure after an advertised binary
+endpoint is final for that attempt and never falls back to a legacy protocol.
+
 What the evidence describes differs by platform. Linux reports the PID and
 user captured when the peer connected, listened or created the socket pair.
 macOS reports the user captured then but the PID of the socket's most recent
@@ -278,6 +286,7 @@ fingerprint before a recovery launch, including candidates that can die after co
 | Installer activation of a launched broker | selection | Discovery decoding, runtime reports and what to do with an unproven commit |
 | Kache startup/restart | ProcessLock, replacement in exclusive mode | Build revision policy, installed service ownership and launch arguments |
 | Kache control listener | ControlService, wire, admission | Cache-instance identity, readiness after initialization and endpoint advertisement |
+| Control clients (Kache lifecycle requests, installer and relay probes) | client, peer | Which PID to expect, from the consumer's own record, and what to do on each error |
 | Kache request shutdown | Lifecycle | Persist accepted uploads and decide which background tasks may stop |
 
 The dependency change alone is not migration completion. Consumer integration,

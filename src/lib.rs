@@ -49,5 +49,7 @@ pub use publication::{RecordSlot, publish_record};
 #[cfg(feature = "async")]
 pub use upgrade::{UpgradeError, ensure_current};
 
+#[cfg(all(feature = "wire", feature = "local"))]
+pub mod client;
 #[cfg(feature = "wire")]
 pub mod wire;
