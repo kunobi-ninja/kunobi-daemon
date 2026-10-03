@@ -1,10 +1,8 @@
-//! A blocking client that validates the OS peer and typed lifecycle response.
+//! A blocking control client: health or drain, with the OS peer and reply checked.
 #[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kunobi_daemon::{
-        ServiceIdentity,
-        local::{Duplex, unix::UnixDuplex},
-        transport::SplitIo,
+        ServiceIdentity, client,
         wire::{self, capability, operation},
     };
     use std::{
@@ -16,36 +14,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nth(1)
             .ok_or("usage: blocking_health DIRECTORY [drain]")?,
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let stream = UnixDuplex::connect_once_until(&root.join("control.sock"), deadline)?;
-    stream.verify_peer_user()?;
-    let pid = stream.peer_pid()?;
-    stream.set_read_deadline(Some(deadline.saturating_duration_since(Instant::now())))?;
-    let (read, write) = stream.split()?;
     let identity = ServiceIdentity::new([0x71; 16], "example-daemon", "demo", "default")?;
     let offer = wire::Hello::new(
         &identity,
         capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN,
         capability::HEALTH | capability::HEALTH_DETAILS,
     );
-    let mut session = wire::Session::connect(SplitIo { read, write }, &offer)?;
-    let request = wire::Control {
-        request_id: 1,
-        operation: if std::env::args().nth(2).as_deref() == Some("drain") {
-            operation::DRAIN
-        } else {
-            operation::HEALTH
-        },
-        ..Default::default()
+    let operation = if std::env::args().nth(2).as_deref() == Some("drain") {
+        operation::DRAIN
+    } else {
+        operation::HEALTH
     };
-    session.send(&request)?;
-    let health = wire::Health::from_response(&session.receive()?, &request)?;
-    if health.process_id != pid {
-        return Err("health response differs from OS peer".into());
-    }
+    // Checks the peer is this OS user and that the reply names the process on
+    // the connection. A daemon that advertises its PID would pass it instead
+    // of `None` to require that exact process.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let health = client::request(
+        &root.join("control.sock"),
+        &offer,
+        operation,
+        None,
+        deadline,
+    )?;
     println!(
         "pid={} ready={} draining={} active={}",
-        pid, health.ready, health.draining, health.active
+        health.process_id, health.ready, health.draining, health.active
     );
     Ok(())
 }
