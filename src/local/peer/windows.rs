@@ -23,3 +23,16 @@ pub fn evidence(
     let same_user = super::super::windows::process_runs_as_this_user(pid.get())?;
     Ok(Evidence::new(Some(pid), same_user))
 }
+
+impl super::PeerEvidence for interprocess::local_socket::Stream {
+    fn evidence(&self) -> io::Result<Evidence> {
+        evidence(self)
+    }
+}
+
+#[cfg(feature = "local-async")]
+impl super::PeerEvidence for interprocess::local_socket::tokio::Stream {
+    fn evidence(&self) -> io::Result<Evidence> {
+        evidence(self)
+    }
+}

@@ -197,6 +197,14 @@ running as the same OS user can publish its own PID in that record, so a match
 does not authenticate the record's writer or the peer's executable. The
 consumer decides what a grant allows.
 
+`serve::serve` is the accept loop built on that flow. It authenticates each
+connection before taking an admission permit, so a rejected peer never holds
+capacity; picks the pool from the grant; pauses briefly when the process runs
+out of file descriptors; stops accepting when `Lifecycle` drains; and gives
+running handlers a drain budget before aborting them. It reports admitted,
+rejected, refused and aborted connections. Persistent connections use
+`Lifecycle::unless_draining` to stop reading new requests once draining starts.
+
 What the evidence describes differs by platform. Linux reports the PID and
 user captured when the peer connected, listened or created the socket pair.
 macOS reports the user captured then but the PID of the socket's most recent
@@ -278,6 +286,7 @@ fingerprint before a recovery launch, including candidates that can die after co
 | Installer activation of a launched broker | selection | Discovery decoding, runtime reports and what to do with an unproven commit |
 | Kache startup/restart | ProcessLock, replacement in exclusive mode | Build revision policy, installed service ownership and launch arguments |
 | Kache control listener | ControlService, wire, admission | Cache-instance identity, readiness after initialization and endpoint advertisement |
+| Accept loops (broker sessions, Kache control and data listeners) | serve, peer, admission | The handler, the pool for each grant and the policy's grants |
 | Kache request shutdown | Lifecycle | Persist accepted uploads and decide which background tasks may stop |
 
 The dependency change alone is not migration completion. Consumer integration,
