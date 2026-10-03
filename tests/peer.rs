@@ -1,10 +1,10 @@
-//! The PID of an accepted local connection names the process that connected,
-//! and matching it against an expected PID is numeric agreement only.
+//! Evidence from an accepted local connection names the process that
+//! connected, and policies grant or refuse it.
 
 #![cfg(feature = "local")]
 
-use kunobi_daemon::local::peer::accepted_peer;
-use kunobi_daemon::peer::ProcessId;
+use kunobi_daemon::local::peer::evidence;
+use kunobi_daemon::peer::{Evidence, ProcessId};
 use std::{sync::mpsc, time::Duration};
 
 const BUDGET: Duration = Duration::from_secs(20);
@@ -16,7 +16,7 @@ fn own_pid() -> ProcessId {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use kunobi_daemon::peer::{PidMismatch, match_pid};
+    use kunobi_daemon::peer::{ExpectedProcess, First, Rejected, SameUser, authenticate};
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -61,17 +61,29 @@ mod unix {
         let mut announced = [0u8; 4];
         stream.read_exact(&mut announced).unwrap();
 
-        let peer = accepted_peer(stream.as_fd()).unwrap();
-        assert_eq!(peer.get(), child.id());
-        assert_eq!(peer.get(), u32::from_le_bytes(announced));
-        assert_ne!(peer, own_pid());
-        assert_eq!(match_pid(Some(peer), peer).unwrap().pid(), peer);
+        let peer = evidence(stream.as_fd()).unwrap();
+        let child_pid = ProcessId::new(child.id());
+        assert_eq!(peer, Evidence::new(child_pid, true));
+        assert_eq!(peer.pid, ProcessId::new(u32::from_le_bytes(announced)));
+        assert_ne!(peer.pid, Some(own_pid()));
+
+        // The child is the expected process: full grant. Expecting this test
+        // process instead leaves only the same-user tier.
+        let tiers = |expected: Option<ProcessId>| {
+            First::new()
+                .then(ExpectedProcess::new(move || expected), "full")
+                .then(SameUser, "redacted")
+        };
+        let accepted = authenticate(&stream, peer, &tiers(child_pid)).unwrap();
+        assert_eq!(*accepted.grant(), "full");
+        let accepted = authenticate(&stream, peer, &tiers(Some(own_pid()))).unwrap();
+        assert_eq!(*accepted.grant(), "redacted");
         assert_eq!(
-            match_pid(Some(peer), own_pid()),
-            Err(PidMismatch::Different {
+            authenticate(&stream, peer, &ExpectedProcess::new(|| Some(own_pid()))).unwrap_err(),
+            Rejected::Different {
                 expected: own_pid(),
-                observed: peer
-            })
+                observed: child_pid.unwrap()
+            }
         );
 
         drop(stream);
@@ -115,6 +127,9 @@ fn an_accepted_pipe_reports_its_client() {
         .expect("the client did not connect")
         .unwrap();
 
-    assert_eq!(accepted_peer(&server).unwrap(), own_pid());
+    assert_eq!(
+        evidence(&server).unwrap(),
+        Evidence::new(Some(own_pid()), true)
+    );
     drop(client.join().unwrap());
 }

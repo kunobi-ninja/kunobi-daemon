@@ -185,12 +185,17 @@ request semantics remain in the consumer. Control and application operation IDs
 are separate namespaces. Authenticate peers and validate identity before dispatch;
 never downgrade to a legacy protocol after a failed advertised binary handshake.
 
-`peer::match_pid` compares the PID the kernel reports for an accepted
-connection (`local::peer::accepted_peer`) with a PID the consumer expects,
-such as one its peer published in a record. A match is numeric agreement. A
-process running as the same OS user can publish its own PID in that record, so
-a match does not authenticate the record's writer or the peer's executable.
-The consumer decides what a match grants. Linux reports credentials captured
+Peer authentication is one flow on both ends of a connection.
+`local::peer::evidence` reads what the OS reports for the peer: its PID and
+whether it runs as this user. A `peer::Policy` turns that evidence into a
+consumer-defined grant or a rejection; `SameUser`, `ExpectedProcess` and the
+tiered `First` are built in, and consumers implement the trait for anything
+else. `peer::authenticate` returns an `Authenticated` connection that carries
+its grant into dispatch. A PID match is numeric agreement with a PID the
+consumer expects, such as one its peer published in a record. A process
+running as the same OS user can publish its own PID in that record, so a match
+does not authenticate the record's writer or the peer's executable. The
+consumer decides what a grant allows. Linux reports credentials captured
 at connect; macOS reports the socket's most recent owner; a named pipe reports
 its client. Each platform lets a passed or inherited descriptor carry the
 connection to another process.
