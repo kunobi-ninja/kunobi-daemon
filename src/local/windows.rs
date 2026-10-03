@@ -32,7 +32,20 @@ pub struct WindowsDuplex {
 /// Verify a kernel-reported peer PID against the current process token user.
 /// The caller must obtain the PID from its still-open socket, never a record.
 pub fn verify_process_user(pid: u32) -> io::Result<()> {
-    // SAFETY: query-only handle to the kernel-reported pipe server PID.
+    if process_runs_as_this_user(pid)? {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+/// Whether `pid` runs as this process's token user. `Ok(false)` only after a
+/// successful SID comparison; failing to open or query the process is an error.
+///
+/// The process is looked up by PID, so if the connection's original peer has
+/// exited and another process now has its PID, this describes that process.
+pub(crate) fn process_runs_as_this_user(pid: u32) -> io::Result<bool> {
+    // SAFETY: query-only handle to the kernel-reported pipe peer PID.
     let process = unsafe { OpenProcess(0x1000, 0, pid) };
     if process.is_null() {
         return Err(io::Error::last_os_error());
@@ -46,11 +59,7 @@ pub fn verify_process_user(pid: u32) -> io::Result<()> {
     // buffers, and the SIDs the kernel wrote inside them, are owned locals that
     // outlive this call. EqualSid only reads them.
     let equal = unsafe { EqualSid(peer[0] as *const c_void, own[0] as *const c_void) };
-    if equal != 0 {
-        Ok(())
-    } else {
-        Err(io::ErrorKind::PermissionDenied.into())
-    }
+    Ok(equal != 0)
 }
 
 /// One-time compatibility fallback for a protocol-v1 peer that cannot drain.
@@ -159,6 +168,14 @@ impl WriteHalf for WindowsWriter {
             io::ErrorKind::Unsupported,
             "a named pipe has no half-close",
         ))
+    }
+}
+
+impl WindowsDuplex {
+    /// [`crate::peer::Evidence`] about the server at the other end, for
+    /// [`crate::peer::authenticate`].
+    pub fn evidence(&self) -> io::Result<crate::peer::Evidence> {
+        super::peer::evidence(&self.stream)
     }
 }
 

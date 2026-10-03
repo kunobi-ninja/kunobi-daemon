@@ -27,6 +27,7 @@ pub mod generation;
 mod lifecycle;
 pub mod observation;
 mod ownership;
+pub mod peer;
 mod publication;
 pub mod readiness;
 pub mod replacement;

@@ -174,8 +174,11 @@ impl ControlService {
 /// after advertising WATCH is terminal; it never triggers a protocol downgrade.
 ///
 /// Authenticate the OS peer before connecting and compare `snapshot().process_id`
-/// with that peer. Cancelling `changed` poisons the underlying framed session;
-/// drop it and reconnect rather than continuing from a partial frame.
+/// with the peer PID the kernel reports for this connection. Agreement checks the
+/// protocol's claim against transport evidence; it does not authenticate the
+/// executable or any discovery record. Cancelling `changed` poisons the
+/// underlying framed session; drop it and reconnect rather than continuing from
+/// a partial frame.
 pub struct WatchClient<S> {
     session: wire::AsyncSession<S>,
     request: Control,

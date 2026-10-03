@@ -170,12 +170,18 @@ pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
 
 #[cfg(not(target_os = "macos"))]
 /// Read the OS process identity attached to an established local connection.
+///
+/// Fails when the kernel reports no PID, for example for a peer in another
+/// PID namespace; [`peer_uid`] still succeeds for that peer.
 pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
-    peer_credentials(fd).map(|(pid, _)| pid)
+    peer_credentials(fd)?
+        .0
+        .ok_or_else(|| io::Error::other("peer PID is not visible in this PID namespace"))
 }
 
+/// The peer's PID, when visible in this PID namespace, and its user ID.
 #[cfg(not(target_os = "macos"))]
-fn peer_credentials(fd: RawFd) -> io::Result<(u32, u32)> {
+fn peer_credentials(fd: RawFd) -> io::Result<(Option<u32>, u32)> {
     use std::os::raw::{c_int, c_void};
     #[repr(C)]
     struct UCred {
@@ -211,11 +217,17 @@ fn peer_credentials(fd: RawFd) -> io::Result<(u32, u32)> {
             &raw mut len,
         )
     };
-    if rc == 0 && cred.pid > 0 {
-        Ok((cred.pid as u32, cred.uid))
-    } else {
-        Err(io::Error::last_os_error())
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok((visible_pid(cred.pid), cred.uid))
+}
+
+/// The PID from `SO_PEERCRED`, or `None` for a peer outside this PID namespace:
+/// Linux then reports PID 0 with a valid user ID.
+#[cfg(not(target_os = "macos"))]
+fn visible_pid(raw: std::os::raw::c_int) -> Option<u32> {
+    u32::try_from(raw).ok().filter(|pid| *pid > 0)
 }
 
 /// Current effective OS user ID.
@@ -560,6 +572,15 @@ pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
     }
 }
 
+impl UnixDuplex {
+    /// [`crate::peer::Evidence`] about the service at the other end, for
+    /// [`crate::peer::authenticate`].
+    pub fn evidence(&self) -> io::Result<crate::peer::Evidence> {
+        use std::os::fd::AsFd;
+        super::peer::evidence(self.stream.as_fd())
+    }
+}
+
 impl Duplex for UnixDuplex {
     type Reader = UnixReader;
     type Writer = UnixWriter;
@@ -602,10 +623,11 @@ impl Duplex for UnixDuplex {
         verify_peer_user(self.stream.as_raw_fd())
     }
 
-    /// PID of the process at the other end of this live socket.
+    /// Kernel-reported PID of the process at the other end of this socket.
     ///
-    /// This is stronger than trusting the discovery file's PID: the open
-    /// connection pins the peer while the kernel reports its credentials.
+    /// Stronger than trusting the discovery file's PID because the kernel
+    /// reports it for this connection; see [`Duplex::peer_pid`] for what it
+    /// does not prove.
     fn peer_pid(&self) -> io::Result<u32> {
         peer_pid(self.stream.as_raw_fd())
     }
@@ -1317,5 +1339,17 @@ mod tests {
         drop(duplex);
         let _ = accept.join();
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod visible_pid_tests {
+    use super::visible_pid;
+
+    #[test]
+    fn pid_zero_and_negative_values_are_not_visible_pids() {
+        assert_eq!(visible_pid(0), None);
+        assert_eq!(visible_pid(-1), None);
+        assert_eq!(visible_pid(42), Some(42));
     }
 }

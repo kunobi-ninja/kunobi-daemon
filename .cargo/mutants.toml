@@ -28,6 +28,7 @@ exclude_globs = [
     "src/local/windows.rs",
     "src/local/windows_socket.rs",
     "src/local/windows_spawn.rs",
+    "src/local/peer/windows.rs",
     "src/local/process/windows.rs",
     # macOS and the BSDs; the macOS test job builds and tests it.
     "src/local/process/kqueue.rs",

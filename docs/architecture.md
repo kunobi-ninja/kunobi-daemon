@@ -185,6 +185,28 @@ request semantics remain in the consumer. Control and application operation IDs
 are separate namespaces. Authenticate peers and validate identity before dispatch;
 never downgrade to a legacy protocol after a failed advertised binary handshake.
 
+Peer authentication is one flow on both ends of a connection.
+`local::peer::evidence` reads what the OS reports for the peer: its PID and
+whether it runs as this user. A `peer::Policy` turns that evidence into a
+consumer-defined grant or a rejection; `SameUser`, `ExpectedProcess` and the
+tiered `First` are built in, and consumers implement the trait for anything
+else. `peer::authenticate` returns an `Authenticated` connection that carries
+its grant into dispatch. A PID match is numeric agreement with a PID the
+consumer expects, such as one its peer published in a record. A process
+running as the same OS user can publish its own PID in that record, so a match
+does not authenticate the record's writer or the peer's executable. The
+consumer decides what a grant allows.
+
+What the evidence describes differs by platform. Linux reports the PID and
+user captured when the peer connected, listened or created the socket pair.
+macOS reports the user captured then but the PID of the socket's most recent
+owner. A named pipe reports the other end's PID, the client to a server and
+the server to a client, and the user is then checked by opening that PID. If
+the original peer has exited while another process holds its descriptor or
+handle, a reused PID can make that check describe an unrelated process. On
+every platform a passed or inherited descriptor carries the connection to
+another process.
+
 Byte counters and receipt boundaries do not establish exactly-once application
 execution. A relay may reconnect a transport; the application decides how to rebuild
 its session and whether a particular operation can be retried.
@@ -202,10 +224,14 @@ denied elsewhere.
 
 Process exit is an event, not a PID check. `ProcessHandle` holds a pidfd on
 Linux, a kqueue registered for `NOTE_EXIT` on macOS and the BSDs, and a process
-handle on Windows. Each refers to the process, so a reused PID does not reach
-it. A child is watched from its spawn, before anything can reap it; another
-process is watched from a PID taken from a live connection's peer credentials,
-such as an incumbent about to retire. Where no event exists (Linux before 5.3,
+handle on Windows. Once opened, each refers to that process, so a later reuse
+of its PID does not reach it. A child is watched from its spawn, before anything
+can reap it; another process is watched from a PID taken from a live
+connection's peer credentials, such as an incumbent about to retire. Open that
+handle while the connection is still open: the connection does not reserve the
+PID, so a handle opened after the peer has exited may name a different process.
+Opening it while connected narrows that window; it does not prove the PID still
+names the original peer. Where no event exists (Linux before 5.3,
 a seccomp policy that refuses `pidfd_open`, FreeBSD for another user's process),
 the handle falls back to checking the PID and reports that it did.
 `process_state` answers once for a PID on the same mechanism. Unix listener acquisition secures the parent directory before

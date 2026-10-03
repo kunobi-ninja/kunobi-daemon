@@ -169,6 +169,11 @@ impl Generation {
         }
     }
     /// Subscribe before reading state so a concurrent release is not missed.
+    ///
+    /// Notifies when the selected generation advances and when a session lease
+    /// is released: the transitions that can make retirement possible.
+    /// Admission and [`SessionLease::mark_legacy`] do not notify, so
+    /// [`Self::run_until_retired`] does not refresh once per new session.
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.changes.subscribe()
     }
