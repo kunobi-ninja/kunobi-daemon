@@ -185,6 +185,16 @@ request semantics remain in the consumer. Control and application operation IDs
 are separate namespaces. Authenticate peers and validate identity before dispatch;
 never downgrade to a legacy protocol after a failed advertised binary handshake.
 
+`peer::match_pid` compares the PID the kernel reports for an accepted
+connection (`local::peer::accepted_peer`) with a PID the consumer expects,
+such as one its peer published in a record. A match is numeric agreement. A
+process running as the same OS user can publish its own PID in that record, so
+a match does not authenticate the record's writer or the peer's executable.
+The consumer decides what a match grants. Linux reports credentials captured
+at connect; macOS reports the socket's most recent owner; a named pipe reports
+its client. Each platform lets a passed or inherited descriptor carry the
+connection to another process.
+
 Byte counters and receipt boundaries do not establish exactly-once application
 execution. A relay may reconnect a transport; the application decides how to rebuild
 its session and whether a particular operation can be retried.
@@ -202,10 +212,12 @@ denied elsewhere.
 
 Process exit is an event, not a PID check. `ProcessHandle` holds a pidfd on
 Linux, a kqueue registered for `NOTE_EXIT` on macOS and the BSDs, and a process
-handle on Windows. Each refers to the process, so a reused PID does not reach
-it. A child is watched from its spawn, before anything can reap it; another
-process is watched from a PID taken from a live connection's peer credentials,
-such as an incumbent about to retire. Where no event exists (Linux before 5.3,
+handle on Windows. Once opened, each refers to that process, so a later reuse
+of its PID does not reach it. A child is watched from its spawn, before anything
+can reap it; another process is watched from a PID taken from a live
+connection's peer credentials, such as an incumbent about to retire. Open that
+handle while the connection is still open: the connection does not reserve the
+PID, so a handle opened after the peer has exited may name a different process. Where no event exists (Linux before 5.3,
 a seccomp policy that refuses `pidfd_open`, FreeBSD for another user's process),
 the handle falls back to checking the PID and reports that it did.
 `process_state` answers once for a PID on the same mechanism. Unix listener acquisition secures the parent directory before

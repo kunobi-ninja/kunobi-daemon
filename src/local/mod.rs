@@ -86,10 +86,14 @@ pub trait Duplex: Sized {
     /// Reject another OS user before sending a preamble or handoff token.
     fn verify_peer_user(&self) -> io::Result<()>;
 
-    /// PID of the process at the other end of this live connection.
+    /// Kernel-reported PID of the process at the other end of this connection.
     ///
-    /// Stronger than trusting a discovery file: the open connection pins the
-    /// peer while the kernel reports its credentials.
+    /// Stronger than trusting a discovery file, because the kernel reports it
+    /// for this connection. It is connection evidence, not executable identity:
+    /// keeping the connection open does not keep that process alive or reserve
+    /// its PID, and a passed or inherited descriptor can carry the connection to
+    /// another process. Open a [`ProcessHandle`] for exit tracking while the
+    /// connection is still open. See [`crate::peer`].
     fn peer_pid(&self) -> io::Result<u32>;
 
     /// Arm or clear one absolute deadline for session establishment.
@@ -195,6 +199,7 @@ impl std::fmt::Display for ConnectError {
 }
 impl std::error::Error for ConnectError {}
 
+pub mod peer;
 mod process;
 #[cfg(unix)]
 pub mod unix;
