@@ -67,7 +67,7 @@ required-features = ["wire"]
 
 [[example]]
 name = "lifecycle_server"
-required-features = ["wire-async", "local"]
+required-features = ["wire-async", "local-async"]
 
 [[example]]
 name = "blocking_health"

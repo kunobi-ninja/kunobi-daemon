@@ -106,6 +106,20 @@ impl Lifecycle {
         }
     }
 
+    /// Run `operation` unless admission closes first. `None` means draining
+    /// started, for example while a persistent connection waited for its next
+    /// request; the caller then stops reading from it.
+    pub async fn unless_draining<T>(
+        &self,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.draining() => None,
+            value = operation => Some(value),
+        }
+    }
+
     /// Close admission and wait for every guard without a timeout.
     pub async fn drain(&self) {
         self.start_drain();
