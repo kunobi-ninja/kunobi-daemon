@@ -3,19 +3,32 @@
 //! The same call serves a listener checking an accepted connection and a client
 //! checking the service it reached. Pass the result to
 //! [`crate::peer::authenticate`] with a [`crate::peer::Policy`], while the
-//! connection is still open and before dispatching anything. See
-//! [`crate::peer`] for what the evidence does and does not prove.
+//! connection is still open and before dispatching anything. The crate's own
+//! adapters offer it as `UnixDuplex::evidence` and `WindowsDuplex::evidence`.
+//! See [`crate::peer`] for what the evidence does and does not prove.
 
+#[cfg(unix)]
 use crate::peer::{Evidence, ProcessId};
+#[cfg(unix)]
 use std::io;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::evidence;
 
 /// Evidence for a connected Unix socket, from either end.
 ///
-/// Failing to read the peer's user is an error, never a same-user result. A
-/// peer PID the platform cannot report is recorded as `None`, which
-/// [`crate::peer::ExpectedProcess`] rejects. Linux reports the credentials
-/// captured when the connection was made; macOS reports the socket's most
-/// recent owner, which can differ after the descriptor is passed or inherited.
+/// `same_user` compares this process's effective user with the credentials
+/// the kernel recorded for the connection. Failing to read them is an error,
+/// never a same-user result.
+///
+/// `pid` is `None` when the kernel reports none, for example for a peer in
+/// another PID namespace; [`crate::peer::ExpectedProcess`] rejects that. Linux
+/// reports the PID and user captured when the peer connected, listened or
+/// created the socket pair. macOS reports the user captured then, but the PID
+/// of the socket's most recent owner, so after a descriptor is passed or
+/// inherited the two can describe different processes.
 #[cfg(unix)]
 pub fn evidence(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Evidence> {
     use std::os::fd::AsRawFd;
@@ -23,29 +36,6 @@ pub fn evidence(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Evidence> {
     let same_user = super::unix::peer_uid(raw)? == super::unix::own_uid();
     let pid = super::unix::peer_pid(raw).ok().and_then(ProcessId::new);
     Ok(Evidence::new(pid, same_user))
-}
-
-/// Evidence for a connected named pipe, from either end: a server sees its
-/// client and a client sees the server.
-///
-/// The user is checked against this process's token through the peer PID, so
-/// a pipe that reports no PID is an error rather than unknown evidence. A
-/// client can still pass or duplicate its handle to another process.
-#[cfg(windows)]
-pub fn evidence(
-    stream: &impl interprocess::local_socket::traits::StreamCommon,
-) -> io::Result<Evidence> {
-    let pid = stream
-        .peer_creds()?
-        .pid()
-        .and_then(ProcessId::new)
-        .ok_or_else(|| io::Error::other("named-pipe peer has no PID"))?;
-    let same_user = match super::windows::verify_process_user(pid.get()) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
-        Err(error) => return Err(error),
-    };
-    Ok(Evidence::new(Some(pid), same_user))
 }
 
 #[cfg(all(test, unix))]

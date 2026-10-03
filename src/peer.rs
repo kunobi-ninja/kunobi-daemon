@@ -86,6 +86,8 @@ pub enum Rejected {
         /// The PID the operating system reported for the connection.
         observed: ProcessId,
     },
+    /// A consumer's own policy refused the peer, for the reason given.
+    Refused(&'static str),
 }
 
 impl fmt::Display for Rejected {
@@ -97,6 +99,7 @@ impl fmt::Display for Rejected {
             Self::Different { expected, observed } => {
                 write!(f, "peer PID {observed} is not the expected PID {expected}")
             }
+            Self::Refused(reason) => f.write_str(reason),
         }
     }
 }
@@ -130,7 +133,8 @@ pub fn match_pid(observed: Option<ProcessId>, expected: ProcessId) -> Result<Pid
 pub trait Policy {
     /// What an accepted connection is allowed, in the consumer's own terms.
     type Grant;
-    /// Grant access or say why not. Must not block or perform I/O.
+    /// Grant access or say why not. Runs on the accepting task, so it must not
+    /// block or perform I/O: read state the consumer keeps current elsewhere.
     fn grant(&self, evidence: &Evidence) -> Result<Self::Grant, Rejected>;
 }
 
@@ -151,9 +155,10 @@ impl Policy for SameUser {
 
 /// Accept one process of this OS user, whose PID `expected` returns when asked.
 ///
-/// `expected` runs once per connection, so it can read a record the peer
-/// keeps up to date. It must not block for long; return `None` when there is
-/// no process to accept.
+/// `expected` is called at most once per [`Policy::grant`], and only after the
+/// same-user check passes. Like the policy, it must not block or perform I/O:
+/// return a PID the consumer already read, for example from a record it
+/// watches, or `None` when there is no process to accept.
 #[derive(Clone, Copy, Debug)]
 pub struct ExpectedProcess<F> {
     expected: F,
@@ -247,6 +252,10 @@ impl<G> Policy for First<G> {
 }
 
 /// A connection whose peer a [`Policy`] accepted, with the grant it received.
+///
+/// Reads and writes pass through to the connection. There is no mutable access
+/// to the connection itself, so it cannot be swapped for another one while the
+/// grant is kept; take it out with [`Self::into_parts`] and authenticate again.
 #[derive(Debug)]
 pub struct Authenticated<C, G> {
     connection: C,
@@ -270,20 +279,65 @@ impl<C, G> Authenticated<C, G> {
         &self.connection
     }
 
-    /// The connection, mutably.
-    pub fn connection_mut(&mut self) -> &mut C {
-        &mut self.connection
-    }
-
     /// Give up the wrapper.
     pub fn into_parts(self) -> (C, G, Evidence) {
         (self.connection, self.grant, self.evidence)
     }
 }
 
+impl<C: std::io::Read, G> std::io::Read for Authenticated<C, G> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.connection.read(buf)
+    }
+}
+
+impl<C: std::io::Write, G> std::io::Write for Authenticated<C, G> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.connection.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.connection.flush()
+    }
+}
+
+#[cfg(feature = "async")]
+impl<C: tokio::io::AsyncRead + Unpin, G: Unpin> tokio::io::AsyncRead for Authenticated<C, G> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "async")]
+impl<C: tokio::io::AsyncWrite + Unpin, G: Unpin> tokio::io::AsyncWrite for Authenticated<C, G> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().connection).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().connection).poll_shutdown(cx)
+    }
+}
+
 /// Run `policy` on `evidence` for `connection`. Collect the evidence from the
-/// same connection, while it is open, before calling this.
-pub fn authenticate<C, P: Policy>(
+/// same connection, while it is open, before calling this: `authenticate`
+/// cannot check where the evidence came from.
+pub fn authenticate<C, P: Policy + ?Sized>(
     connection: C,
     evidence: Evidence,
     policy: &P,
@@ -412,16 +466,104 @@ mod tests {
     #[test]
     fn authenticate_carries_the_grant_and_evidence_with_the_connection() {
         let evidence = Evidence::new(Some(pid(42)), true);
-        let mut accepted = authenticate("conn", evidence, &tiered()).unwrap();
+        let accepted = authenticate("conn", evidence, &tiered()).unwrap();
         assert_eq!(accepted.grant(), &View::Full);
         assert_eq!(accepted.evidence(), &evidence);
         assert_eq!(*accepted.connection(), "conn");
-        *accepted.connection_mut() = "moved";
-        assert_eq!(accepted.into_parts(), ("moved", View::Full, evidence));
+        assert_eq!(accepted.into_parts(), ("conn", View::Full, evidence));
+        let dynamic: &dyn Policy<Grant = ()> = &SameUser;
+        assert!(authenticate((), evidence, dynamic).is_ok());
         assert_eq!(
             authenticate("conn", Evidence::new(Some(pid(1)), false), &tiered()).unwrap_err(),
             Rejected::OtherUser
         );
+    }
+
+    #[test]
+    fn reads_and_writes_pass_through_to_the_connection() {
+        use std::io::{Read, Write};
+        let evidence = Evidence::new(Some(pid(1)), true);
+        let mut reader = authenticate(&b"ping"[..], evidence, &SameUser).unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "ping");
+        let mut writer = authenticate(Vec::new(), evidence, &SameUser).unwrap();
+        writer.write_all(b"pong").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.into_parts().0, b"pong");
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_reads_and_writes_pass_through_to_the_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let evidence = Evidence::new(Some(pid(1)), true);
+        let (near, far) = tokio::io::duplex(16);
+        let mut near = authenticate(near, evidence, &SameUser).unwrap();
+        let mut far = authenticate(far, evidence, &SameUser).unwrap();
+        near.write_all(b"ping").await.unwrap();
+        near.flush().await.unwrap();
+        near.shutdown().await.unwrap();
+        let mut text = String::new();
+        far.read_to_string(&mut text).await.unwrap();
+        assert_eq!(text, "ping");
+    }
+
+    #[test]
+    fn first_reports_the_last_tiers_reason_when_none_accepts() {
+        struct Refuse;
+        impl Policy for Refuse {
+            type Grant = ();
+            fn grant(&self, _: &Evidence) -> Result<(), Rejected> {
+                Err(Rejected::Refused("closed for maintenance"))
+            }
+        }
+        let evidence = Evidence::new(Some(pid(42)), true);
+        let refuse_last = First::new()
+            .then(ExpectedProcess::new(|| None), View::Full)
+            .then(Refuse, View::Redacted);
+        assert_eq!(
+            refuse_last.grant(&evidence),
+            Err(Rejected::Refused("closed for maintenance"))
+        );
+        let missing_last = First::new()
+            .then(Refuse, View::Redacted)
+            .then(ExpectedProcess::new(|| None), View::Full);
+        assert_eq!(
+            missing_last.grant(&evidence),
+            Err(Rejected::NoExpectedProcess)
+        );
+    }
+
+    #[test]
+    fn the_expected_pid_is_read_once_and_only_when_needed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ProcessId::new(42)
+            }
+        };
+        let app = ExpectedProcess::new(counted.clone());
+        assert!(app.grant(&Evidence::new(Some(pid(42)), true)).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Another user is refused before the record is consulted.
+        assert!(app.grant(&Evidence::new(Some(pid(42)), false)).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A tier that already accepted stops the list.
+        let stop_early = First::new()
+            .then(SameUser, View::Redacted)
+            .then(ExpectedProcess::new(counted), View::Full);
+        assert_eq!(
+            stop_early.grant(&Evidence::new(Some(pid(42)), true)),
+            Ok(View::Redacted)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -446,5 +588,6 @@ mod tests {
             .to_string(),
             "peer PID 7 is not the expected PID 42"
         );
+        assert_eq!(Rejected::Refused("closed").to_string(), "closed");
     }
 }
