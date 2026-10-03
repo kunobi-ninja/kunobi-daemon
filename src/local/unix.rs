@@ -220,10 +220,14 @@ fn peer_credentials(fd: RawFd) -> io::Result<(Option<u32>, u32)> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    // Linux reports PID 0, with a valid user ID, for a peer outside this PID
-    // namespace.
-    let pid = u32::try_from(cred.pid).ok().filter(|pid| *pid > 0);
-    Ok((pid, cred.uid))
+    Ok((visible_pid(cred.pid), cred.uid))
+}
+
+/// The PID from `SO_PEERCRED`, or `None` for a peer outside this PID namespace:
+/// Linux then reports PID 0 with a valid user ID.
+#[cfg(not(target_os = "macos"))]
+fn visible_pid(raw: std::os::raw::c_int) -> Option<u32> {
+    u32::try_from(raw).ok().filter(|pid| *pid > 0)
 }
 
 /// Current effective OS user ID.
@@ -1335,5 +1339,17 @@ mod tests {
         drop(duplex);
         let _ = accept.join();
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod visible_pid_tests {
+    use super::visible_pid;
+
+    #[test]
+    fn pid_zero_and_negative_values_are_not_visible_pids() {
+        assert_eq!(visible_pid(0), None);
+        assert_eq!(visible_pid(-1), None);
+        assert_eq!(visible_pid(42), Some(42));
     }
 }

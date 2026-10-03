@@ -1,4 +1,4 @@
-//! Collect [`Evidence`] about the other end of a local connection.
+//! Collect [`Evidence`](crate::peer::Evidence) about the other end of a local connection.
 //!
 //! The same call serves a listener checking an accepted connection and a client
 //! checking the service it reached. Pass the result to

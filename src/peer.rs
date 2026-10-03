@@ -487,10 +487,14 @@ mod tests {
         let mut text = String::new();
         reader.read_to_string(&mut text).unwrap();
         assert_eq!(text, "ping");
-        let mut writer = authenticate(Vec::new(), evidence, &SameUser).unwrap();
+        // A buffered writer only reaches its inner vector on flush, so this
+        // fails if the passthrough does not flush the connection.
+        let mut writer =
+            authenticate(std::io::BufWriter::new(Vec::new()), evidence, &SameUser).unwrap();
         writer.write_all(b"pong").unwrap();
+        assert!(writer.connection().get_ref().is_empty());
         writer.flush().unwrap();
-        assert_eq!(writer.into_parts().0, b"pong");
+        assert_eq!(writer.connection().get_ref(), b"pong");
     }
 
     #[cfg(feature = "async")]
