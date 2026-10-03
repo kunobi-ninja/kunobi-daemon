@@ -17,6 +17,14 @@
 //! reports what happened. Handlers still take a [`crate::RequestGuard`] per
 //! operation; [`Lifecycle::unless_draining`] stops a persistent connection
 //! from reading new requests once draining starts.
+//!
+//! Shut down by starting the drain and awaiting [`serve`]. Dropping the
+//! [`serve`] future instead aborts the handlers without waiting for them.
+//!
+//! On Unix the listener is Tokio's `UnixListener`, which
+//! `local::unix_socket::acquire` produces through `from_std`; on Windows it is
+//! `interprocess`'s Tokio listener, which `local::windows_socket::acquire_tokio`
+//! produces.
 
 use crate::{
     Lifecycle,
@@ -35,7 +43,9 @@ pub const DESCRIPTOR_BACKOFF: Duration = Duration::from_millis(50);
 pub trait Listener {
     /// The accepted connection.
     type Connection: PeerEvidence + Send + 'static;
-    /// Wait for the next connection.
+    /// Wait for the next connection. Must be cancellation-safe: [`serve`]
+    /// drops a pending accept whenever a handler finishes, and a dropped
+    /// accept must not lose a connection.
     fn accept(&self) -> impl Future<Output = io::Result<Self::Connection>> + Send;
 }
 
@@ -49,12 +59,8 @@ impl Listener for tokio::net::UnixListener {
     }
 }
 
-impl Listener for interprocess::local_socket::tokio::Listener {
-    type Connection = interprocess::local_socket::tokio::Stream;
-    async fn accept(&self) -> io::Result<interprocess::local_socket::tokio::Stream> {
-        interprocess::local_socket::traits::tokio::Listener::accept(self).await
-    }
-}
+#[cfg(windows)]
+mod windows;
 
 /// What [`serve`] did with the connections it accepted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,7 +73,8 @@ pub struct Served {
     pub rejected: u64,
     /// Authenticated connections dropped because their pool was full.
     pub refused: u64,
-    /// Handlers still running when the drain budget expired, then aborted.
+    /// Handlers cancelled because they were still running when the drain
+    /// budget expired.
     pub aborted: u64,
 }
 
@@ -106,10 +113,10 @@ where
 {
     let mut served = Served::default();
     let mut handlers = JoinSet::new();
-    let stopped = loop {
+    let stopped = 'accept: loop {
         tokio::select! {
             biased;
-            () = lifecycle.draining() => break Ok(()),
+            () = lifecycle.draining() => break 'accept Ok(()),
             Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok(connection) => {
@@ -125,32 +132,55 @@ where
                         served.refused += 1;
                         continue;
                     };
+                    // Draining can start while this peer is checked.
+                    if !lifecycle.accepting_calls() {
+                        break 'accept Ok(());
+                    }
                     served.admitted += 1;
                     handlers.spawn(handler(authenticated, permit));
                 }
                 Err(error) if is_descriptor_exhaustion(&error) => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "No event says a descriptor was freed; pause briefly, then accept again."
-                    )]
-                    tokio::time::sleep(DESCRIPTOR_BACKOFF).await;
+                    tokio::select! {
+                        () = lifecycle.draining() => break 'accept Ok(()),
+                        () = descriptor_backoff() => {}
+                    }
                 }
-                Err(error) => break Err(error),
+                Err(error) => break 'accept Err(error),
             },
         }
     };
-    let deadline = tokio::time::Instant::now() + drain_budget;
+    served.aborted = finish(&mut handlers, drain_budget).await;
+    stopped.map(|()| served)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "No event says a descriptor was freed; pause briefly, then accept again."
+)]
+async fn descriptor_backoff() {
+    tokio::time::sleep(DESCRIPTOR_BACKOFF).await;
+}
+
+/// Give running handlers until `budget` expires, abort the rest, and count the
+/// handlers that were cancelled.
+async fn finish(handlers: &mut JoinSet<()>, budget: Duration) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
     while !handlers.is_empty() {
-        match tokio::time::timeout_at(deadline, handlers.join_next()).await {
-            Ok(_) => {}
-            Err(_) => {
-                served.aborted = handlers.len() as u64;
-                handlers.abort_all();
-                while handlers.join_next().await.is_some() {}
-            }
+        if tokio::time::timeout_at(deadline, handlers.join_next())
+            .await
+            .is_err()
+        {
+            break;
         }
     }
-    stopped.map(|()| served)
+    handlers.abort_all();
+    let mut aborted = 0;
+    while let Some(joined) = handlers.join_next().await {
+        if joined.is_err_and(|error| error.is_cancelled()) {
+            aborted += 1;
+        }
+    }
+    aborted
 }
 
 #[cfg(all(test, unix))]
@@ -158,7 +188,7 @@ mod tests {
     use super::*;
     use crate::{
         admission::Limits,
-        peer::{ExpectedProcess, First, ProcessId, SameUser},
+        peer::{Evidence, ExpectedProcess, First, ProcessId, SameUser},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -376,6 +406,140 @@ mod tests {
         let served = server.await.unwrap().unwrap();
         assert_eq!(served.admitted, 1);
         assert_eq!(served.aborted, 0);
+    }
+
+    /// A connection whose evidence the test decides.
+    struct Fake(Option<Evidence>);
+
+    impl PeerEvidence for Fake {
+        fn evidence(&self) -> io::Result<Evidence> {
+            self.0
+                .ok_or_else(|| io::Error::other("no peer credentials"))
+        }
+    }
+
+    /// Returns the scripted results in order, then waits forever.
+    struct Scripted(std::sync::Mutex<std::collections::VecDeque<io::Result<Fake>>>);
+
+    impl Scripted {
+        fn new(results: impl IntoIterator<Item = io::Result<Fake>>) -> Self {
+            Self(std::sync::Mutex::new(results.into_iter().collect()))
+        }
+    }
+
+    impl Listener for Scripted {
+        type Connection = Fake;
+        async fn accept(&self) -> io::Result<Fake> {
+            let next = self.0.lock().unwrap().pop_front();
+            match next {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn same_user() -> Fake {
+        Fake(Some(Evidence::new(
+            ProcessId::new(std::process::id()),
+            true,
+        )))
+    }
+
+    /// Serve `listener` with a handler that reports each admission, then drain
+    /// once `admissions` connections were admitted (or right away for zero).
+    async fn serve_scripted(
+        listener: Scripted,
+        policy: impl Policy<Grant = ()> + Send + 'static,
+        lifecycle: Arc<Lifecycle>,
+        admissions: usize,
+    ) -> io::Result<Served> {
+        let (admitted, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(serve(
+            listener,
+            Arc::clone(&lifecycle),
+            Arc::new(Admission::new(Limits::default())),
+            policy,
+            |()| Pool::Application,
+            move |_connection, _permit| {
+                let admitted = admitted.clone();
+                async move {
+                    let _ = admitted.send(());
+                }
+            },
+            Duration::from_secs(5),
+        ));
+        for _ in 0..admissions {
+            seen.recv().await.unwrap();
+        }
+        tokio::task::yield_now().await;
+        lifecycle.start_drain();
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn unreadable_evidence_rejects_the_connection() {
+        let served = serve_scripted(
+            Scripted::new([Ok(Fake(None)), Ok(same_user())]),
+            SameUser,
+            Arc::new(Lifecycle::default()),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (served.rejected, served.admitted, served.refused),
+            (1, 1, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_out_of_descriptors_pauses_accepting_then_continues() {
+        let started = tokio::time::Instant::now();
+        let served = serve_scripted(
+            Scripted::new([Err(io::Error::from_raw_os_error(24)), Ok(same_user())]),
+            SameUser,
+            Arc::new(Lifecycle::default()),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(served.admitted, 1);
+        assert!(started.elapsed() >= DESCRIPTOR_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn any_other_accept_error_stops_the_loop_and_is_returned() {
+        let error = serve_scripted(
+            Scripted::new([Err(io::Error::from(io::ErrorKind::PermissionDenied))]),
+            SameUser,
+            Arc::new(Lifecycle::default()),
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn a_connection_checked_while_draining_starts_is_not_handed_out() {
+        struct DrainsWhileChecking(Arc<Lifecycle>);
+        impl Policy for DrainsWhileChecking {
+            type Grant = ();
+            fn grant(&self, _: &Evidence) -> Result<(), crate::peer::Rejected> {
+                self.0.start_drain();
+                Ok(())
+            }
+        }
+        let lifecycle = Arc::new(Lifecycle::default());
+        let served = serve_scripted(
+            Scripted::new([Ok(same_user())]),
+            DrainsWhileChecking(Arc::clone(&lifecycle)),
+            lifecycle,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(served.admitted, 0);
     }
 
     #[tokio::test]
