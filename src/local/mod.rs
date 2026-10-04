@@ -198,6 +198,13 @@ impl std::fmt::Display for ConnectError {
     }
 }
 impl std::error::Error for ConnectError {}
+impl ConnectError {
+    /// Whether a later attempt can succeed: nothing accepted the connection in
+    /// time, which includes an endpoint that does not exist yet.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::ConnectTimeout)
+    }
+}
 
 pub mod peer;
 mod process;

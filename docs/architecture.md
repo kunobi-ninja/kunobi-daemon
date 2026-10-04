@@ -205,6 +205,14 @@ running handlers a drain budget before aborting them. It reports admitted,
 rejected, refused and aborted connections. Persistent connections use
 `Lifecycle::unless_draining` to stop reading new requests once draining starts.
 
+`client::request` (with `client::health` and `client::drain`) is the blocking
+control client built on that flow. Before trusting a reply it requires the
+peer to run as this user, to be the expected process when the caller passes
+one, and the reply's `Health::process_id` to name that same process, all
+before one deadline. Its `RequestError::is_transient` is true only when nothing
+accepted the connection yet; any other failure after an advertised binary
+endpoint is final for that attempt and never falls back to a legacy protocol.
+
 What the evidence describes differs by platform. Linux reports the PID and
 user captured when the peer connected, listened or created the socket pair.
 macOS reports the user captured then but the PID of the socket's most recent
@@ -287,6 +295,7 @@ fingerprint before a recovery launch, including candidates that can die after co
 | Kache startup/restart | ProcessLock, replacement in exclusive mode | Build revision policy, installed service ownership and launch arguments |
 | Kache control listener | ControlService, wire, admission | Cache-instance identity, readiness after initialization and endpoint advertisement |
 | Accept loops (broker sessions, Kache control and data listeners) | serve, peer, admission | The handler, the pool for each grant and the policy's grants |
+| Control clients (Kache lifecycle requests, installer and relay probes) | client, peer | Which PID to expect, from the consumer's own record, and what to do on each error |
 | Kache request shutdown | Lifecycle | Persist accepted uploads and decide which background tasks may stop |
 
 The dependency change alone is not migration completion. Consumer integration,
