@@ -989,6 +989,20 @@ mod tests {
     // ── State machine ───────────────────────────────────────────────
 
     #[test]
+    fn signaled_errors_preserve_the_failed_probe_or_channel() {
+        let probe = SignaledError::Evidence(io::Error::other("unreadable record"));
+        assert_eq!(
+            std::error::Error::source(&probe).unwrap().to_string(),
+            "unreadable record"
+        );
+        let channel: SignaledError<io::Error> = SignaledError::NotReady(NotReady::Died);
+        assert_eq!(
+            std::error::Error::source(&channel).unwrap().to_string(),
+            NotReady::Died.to_string()
+        );
+    }
+
+    #[test]
     fn progress_restarts_the_silence_bound_so_a_slow_start_is_not_cut_off() {
         // A total deadline of one second would fail this daemon at 1 s; it
         // reports progress every 0.9 s and is ready at 3.6 s.

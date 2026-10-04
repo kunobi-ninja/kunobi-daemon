@@ -392,3 +392,29 @@ mod proofs {
         }
     }
 }
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn an_adapter_failure_preserves_its_source() {
+        let failure = Failure {
+            step: Step::Start,
+            committed: false,
+            reason: Reason::Adapter(std::io::Error::other("failed to spawn")),
+        };
+        assert_eq!(
+            std::error::Error::source(&failure).unwrap().to_string(),
+            "failed to spawn"
+        );
+        for reason in [Reason::Deadline, Reason::InvalidProgress] {
+            let failure: Failure<std::io::Error> = Failure {
+                step: Step::Start,
+                committed: false,
+                reason,
+            };
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
+}

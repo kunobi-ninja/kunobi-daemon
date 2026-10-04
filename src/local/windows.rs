@@ -16,7 +16,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{Stream as _, StreamCommon as _};
+use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream, ToNsName};
 
 use super::{ConnectError, Endpoint};

@@ -36,8 +36,8 @@ mod unix {
             } else {
                 client::health
             };
-            let health = request(&path.to_path_buf(), &offer(), None, Instant::now() + BUDGET)
-                .map_err(io::Error::other)?;
+            let health =
+                request(path, &offer(), None, Instant::now() + BUDGET).map_err(io::Error::other)?;
             if operation == operation::HEALTH && !health.ready {
                 return Err(io::Error::other("peer is not ready"));
             }
@@ -47,7 +47,7 @@ mod unix {
                 ..Default::default()
             });
         }
-        let stream = UnixDuplex::connect_once_until(&path.to_path_buf(), Instant::now() + BUDGET)
+        let stream = UnixDuplex::connect_once_until(path, Instant::now() + BUDGET)
             .map_err(io::Error::other)?;
         SameUser
             .grant(&stream.credentials()?)

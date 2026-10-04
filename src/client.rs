@@ -167,6 +167,26 @@ mod tests {
     }
 
     #[test]
+    fn nested_control_errors_keep_their_sources() {
+        for error in [
+            RequestError::Unavailable(ConnectError::Failed(io::ErrorKind::InvalidInput)),
+            RequestError::Peer(Rejected::OtherUser),
+            RequestError::Credentials(io::Error::other("credential query denied")),
+            RequestError::Protocol(io::Error::other("bad frame")),
+        ] {
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(!error.is_transient());
+        }
+        assert!(
+            std::error::Error::source(&RequestError::ProcessMismatch {
+                peer: ProcessId::new(7).unwrap(),
+                reported: 9,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
     fn every_failure_says_what_happened() {
         let peer = ProcessId::new(7).unwrap();
         let cases: [(RequestError, &str); 6] = [
