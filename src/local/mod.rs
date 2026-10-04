@@ -204,15 +204,10 @@ pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
         ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted, NotConnected, NotFound,
         PermissionDenied, TimedOut, WouldBlock,
     };
-    // Windows reports ERROR_PIPE_BUSY while every pipe instance is in use.
-    const ERROR_PIPE_BUSY: i32 = 231;
     match error.kind() {
         PermissionDenied => ConnectError::PermissionDenied,
         NotFound | ConnectionRefused | TimedOut | WouldBlock | Interrupted | ConnectionReset
         | ConnectionAborted | NotConnected => ConnectError::ConnectTimeout,
-        _ if cfg!(windows) && error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-            ConnectError::ConnectTimeout
-        }
         kind => ConnectError::Failed(kind),
     }
 }
@@ -280,12 +275,60 @@ mod connect_error_tests {
 
     #[test]
     fn a_busy_pipe_is_retried_only_on_windows() {
+        #[cfg(windows)]
+        let busy = super::windows::connect_error(&io::Error::from_raw_os_error(231));
+        #[cfg(not(windows))]
         let busy = connect_error(&io::Error::from_raw_os_error(231));
         if cfg!(windows) {
             assert_eq!(busy, ConnectError::ConnectTimeout);
         } else {
             assert_ne!(busy, ConnectError::ConnectTimeout);
         }
+    }
+
+    #[test]
+    fn a_temporary_connection_failure_is_retried_until_the_endpoint_accepts() {
+        use super::{Duplex, Endpoint, PlatformDuplex, peer::PeerCredentials};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        struct StartsAfterOneAttempt;
+        impl PeerCredentials for StartsAfterOneAttempt {
+            fn credentials(&self) -> io::Result<crate::peer::Credentials> {
+                unreachable!()
+            }
+        }
+        impl Duplex for StartsAfterOneAttempt {
+            type Reader = <PlatformDuplex as Duplex>::Reader;
+            type Writer = <PlatformDuplex as Duplex>::Writer;
+            fn connect_once_until(
+                _: &Endpoint,
+                _: std::time::Instant,
+            ) -> Result<Self, ConnectError> {
+                if ATTEMPTS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(ConnectError::ConnectTimeout)
+                } else {
+                    Ok(Self)
+                }
+            }
+            fn set_read_deadline(&self, _: Option<std::time::Duration>) -> io::Result<()> {
+                unreachable!()
+            }
+            fn split(self) -> io::Result<(Self::Reader, Self::Writer)> {
+                unreachable!()
+            }
+        }
+        #[cfg(unix)]
+        let endpoint = std::path::Path::new("unused");
+        #[cfg(windows)]
+        let endpoint = "unused";
+        assert!(
+            StartsAfterOneAttempt::connect_until(
+                endpoint,
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
     }
 
     #[test]

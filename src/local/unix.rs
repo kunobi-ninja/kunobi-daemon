@@ -182,11 +182,14 @@ pub(crate) fn fd_credentials(fd: RawFd) -> io::Result<crate::peer::Credentials> 
 /// [`Credentials`](crate::peer::Credentials) for a connected Unix socket. See
 /// [`super::peer`] for what they describe on each platform.
 #[cfg(target_os = "macos")]
-pub(crate) fn fd_credentials(fd: RawFd) -> io::Result<crate::peer::Credentials> {
+pub(crate) fn macos_credentials(fd: RawFd) -> io::Result<crate::peer::Credentials> {
     let same_user = macos_peer_uid(fd)? == own_uid();
     let pid = crate::ProcessId::new(macos_peer_pid(fd)?);
     Ok(crate::peer::Credentials::new(pid, same_user))
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos_credentials as fd_credentials;
 
 /// The peer's PID, when visible in this PID namespace, and its user ID.
 #[cfg(not(target_os = "macos"))]
@@ -876,6 +879,41 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[ignore = "child fixture for legacy peer termination"]
+    fn legacy_peer_waits_for_input() {
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+    }
+
+    #[test]
+    fn legacy_termination_signals_only_its_child_and_reports_os_failures() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local::unix::tests::legacy_peer_waits_for_input",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = crate::Candidate::new(child);
+        terminate_legacy_peer(child.id()).unwrap();
+        let status = child
+            .wait_until(Instant::now() + Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(15));
+        let missing = crate::ProcessId::new(i32::MAX as u32).unwrap();
+        assert_eq!(
+            terminate_legacy_peer(missing).unwrap_err().raw_os_error(),
+            Some(3)
+        );
     }
 
     #[test]

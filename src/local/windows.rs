@@ -173,6 +173,16 @@ impl super::peer::PeerCredentials for WindowsDuplex {
     }
 }
 
+/// Windows can report a busy named pipe outside the portable I/O categories.
+pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    if error.raw_os_error() == Some(ERROR_PIPE_BUSY) {
+        ConnectError::ConnectTimeout
+    } else {
+        super::connect_error(error)
+    }
+}
+
 impl Duplex for WindowsDuplex {
     type Reader = WindowsReader;
     type Writer = WindowsWriter;
@@ -194,7 +204,7 @@ impl Duplex for WindowsDuplex {
                 stream,
                 read_deadline: Cell::new(None),
             })
-            .map_err(|error| super::connect_error(&error))
+            .map_err(|error| connect_error(&error))
     }
 
     /// Arm an absolute deadline for reads performed during session setup.
