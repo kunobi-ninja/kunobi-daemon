@@ -1,15 +1,15 @@
-//! Credentials from a local connection names the process at the other end, in
+//! Credentials from a local connection name the process at the other end, in
 //! both directions, and policies grant or refuse it. The listener and its peer
 //! are separate operating-system processes.
 
 #![cfg(feature = "local")]
 
-use kunobi_daemon::ProcessId;
 use kunobi_daemon::local::peer::PeerCredentials;
 use kunobi_daemon::peer::{Credentials, ExpectedProcess, First, Rejected, SameUser, authenticate};
+use kunobi_daemon::{Candidate, ProcessId};
 use std::{
     io::{Read, Write},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -22,17 +22,8 @@ fn own_pid() -> ProcessId {
     ProcessId::new(std::process::id()).unwrap()
 }
 
-/// Kills and reaps the child if the test fails before it exits.
-struct Reaped(Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
-}
+/// A fixture candidate is killed and reaped if the test fails before it exits.
+struct Reaped(Candidate);
 
 impl Reaped {
     fn spawn(endpoint: &str) -> Self {
@@ -45,28 +36,21 @@ impl Reaped {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Self(child)
+        Self(Candidate::new(child))
     }
 
     fn pid(&self) -> ProcessId {
-        ProcessId::new(self.0.id()).unwrap()
+        self.0.id()
     }
 
     /// Wait for the child to finish its own checks, within the budget.
     fn assert_succeeds(&mut self) {
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                assert!(status.success(), "the child's own checks failed: {status}");
-                return;
-            }
-            assert!(Instant::now() < deadline, "the child did not exit");
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "Bounded wait for a test child; std::process has no exit timeout."
-            )]
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let status = self
+            .0
+            .wait_until(Instant::now() + BUDGET)
+            .unwrap()
+            .expect("the child did not exit");
+        assert!(status.success(), "the child's own checks failed: {status}");
     }
 }
 
