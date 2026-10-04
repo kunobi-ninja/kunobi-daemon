@@ -581,6 +581,12 @@ impl UnixDuplex {
     }
 }
 
+impl super::peer::PeerEvidence for UnixDuplex {
+    fn evidence(&self) -> io::Result<crate::peer::Evidence> {
+        UnixDuplex::evidence(self)
+    }
+}
+
 impl Duplex for UnixDuplex {
     type Reader = UnixReader;
     type Writer = UnixWriter;

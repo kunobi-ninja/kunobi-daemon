@@ -6,13 +6,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Lifecycle, ProcessLock, ServiceIdentity,
         admission::{Admission, Limits, Pool},
         control::ControlService,
-        local::{
-            unix,
-            unix_socket::{self, Bound, SocketGuard},
-        },
+        local::unix_socket::{self, Bound, SocketGuard},
+        peer::SameUser,
+        serve::serve,
         wire::{Hello, capability},
     };
-    use std::{os::fd::AsRawFd, path::PathBuf, sync::Arc, time::Duration};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
     let root = PathBuf::from(
         std::env::args_os()
             .nth(1)
@@ -42,28 +41,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1,
     ));
     let admission = Arc::new(Admission::new(Limits::default()));
-    let mut connections = tokio::task::JoinSet::new();
     // An application marks this only after its handlers can serve requests.
     service.mark_ready();
-    loop {
-        tokio::select! {
-            _ = lifecycle.draining() => break,
-            Some(_) = connections.join_next(), if !connections.is_empty() => {},
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                if unix::peer_uid(stream.as_raw_fd())? != unix::own_uid() { continue; }
-                let Some(permit) = admission.try_acquire(Pool::Control) else { continue };
-                let service = Arc::clone(&service);
-                let offer = offer.clone();
-                connections.spawn(async move {
-                    let _permit = permit;
-                    service.serve(stream, &offer, tokio::time::Instant::now() + Duration::from_secs(2)).await
-                });
+    // Accept, authenticate the peer as this OS user, admit it to the control
+    // pool and serve it; stop when a DRAIN request closes admission. Running
+    // exchanges, including that DRAIN's acknowledgement, get five seconds.
+    let served = serve(
+        listener,
+        Arc::clone(&lifecycle),
+        admission,
+        SameUser,
+        |()| Pool::Control,
+        move |connection, permit| {
+            let service = Arc::clone(&service);
+            let offer = offer.clone();
+            async move {
+                let _permit = permit;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let _ = service.serve(connection, &offer, deadline).await;
             }
-        }
-    }
-    // Preserve the drain acknowledgement before dropping the runtime and owner.
-    while connections.join_next().await.is_some() {}
+        },
+        Duration::from_secs(5),
+    )
+    .await?;
+    eprintln!("{served:?}");
     lifecycle.drain().await;
     Ok(())
 }

@@ -17,6 +17,30 @@ mod windows;
 #[cfg(windows)]
 pub use windows::evidence;
 
+/// A connection that can report [`crate::peer::Evidence`] about its peer: the
+/// crate's adapters, std and Tokio Unix streams, and `interprocess` local
+/// sockets on Windows. The accept loop in `serve` requires it.
+pub trait PeerEvidence {
+    /// What the OS reports about the other end. See [`evidence`].
+    fn evidence(&self) -> std::io::Result<crate::peer::Evidence>;
+}
+
+#[cfg(unix)]
+impl PeerEvidence for std::os::unix::net::UnixStream {
+    fn evidence(&self) -> io::Result<Evidence> {
+        use std::os::fd::AsFd;
+        evidence(self.as_fd())
+    }
+}
+
+#[cfg(all(unix, feature = "async"))]
+impl PeerEvidence for tokio::net::UnixStream {
+    fn evidence(&self) -> io::Result<Evidence> {
+        use std::os::fd::AsFd;
+        evidence(self.as_fd())
+    }
+}
+
 /// Evidence for a connected Unix socket, from either end.
 ///
 /// `same_user` compares this process's effective user with the credentials
@@ -49,6 +73,7 @@ mod tests {
         let own = ProcessId::new(std::process::id());
         for end in [&left, &right] {
             assert_eq!(evidence(end.as_fd()).unwrap(), Evidence::new(own, true));
+            assert_eq!(end.evidence().unwrap(), Evidence::new(own, true));
         }
     }
 }

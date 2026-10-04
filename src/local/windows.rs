@@ -179,6 +179,12 @@ impl WindowsDuplex {
     }
 }
 
+impl super::peer::PeerEvidence for WindowsDuplex {
+    fn evidence(&self) -> io::Result<crate::peer::Evidence> {
+        WindowsDuplex::evidence(self)
+    }
+}
+
 impl Duplex for WindowsDuplex {
     type Reader = WindowsReader;
     type Writer = WindowsWriter;

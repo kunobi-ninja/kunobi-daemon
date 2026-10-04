@@ -33,6 +33,8 @@ pub mod readiness;
 pub mod replacement;
 pub mod retry;
 pub mod selection;
+#[cfg(feature = "local-async")]
+pub mod serve;
 pub mod socket_path;
 mod spawn_lock;
 pub mod transport;
