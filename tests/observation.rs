@@ -216,10 +216,7 @@ async fn async_pending_io_and_cancellation_remain_observable_until_transport_dro
 /// operation sequences.
 mod properties {
     use super::*;
-    use kunobi_daemon::{
-        admission::{Permit, PoolSnapshot},
-        observation::Direction,
-    };
+    use kunobi_daemon::{admission::Permit, observation::Direction};
     use proptest::prelude::*;
     use std::collections::VecDeque;
 
@@ -354,14 +351,10 @@ mod properties {
                     }
                 }
                 for (index, pool) in POOLS.into_iter().enumerate() {
-                    prop_assert_eq!(
-                        admission.snapshot(pool),
-                        PoolSnapshot {
-                            limit: limits[index],
-                            active: held[index].len(),
-                            rejected: rejected[index],
-                        }
-                    );
+                    let snapshot = admission.snapshot(pool);
+                    prop_assert_eq!(snapshot.limit, limits[index]);
+                    prop_assert_eq!(snapshot.active, held[index].len());
+                    prop_assert_eq!(snapshot.rejected, rejected[index]);
                 }
             }
         }

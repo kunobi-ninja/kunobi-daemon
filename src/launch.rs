@@ -69,6 +69,7 @@ pub const POLL: Duration = readiness::POLL_INTERVAL;
 /// `live` is independent of `spawn_error`: another client may have won the
 /// bind after this spawn failed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SpawnWait {
     /// The caller's probe succeeded before the budget elapsed.
     pub live: bool,
@@ -89,7 +90,8 @@ pub fn spawn(command: &mut Command) -> io::Result<Child> {
     }
     #[cfg(windows)]
     {
-        let _guard = crate::local::windows::StdioInheritGuard::suppress();
+        let _spawn = crate::spawn_lock::spawning();
+        let _guard = crate::local::windows::StdioInheritGuard::suppress()?;
         command.spawn()
     }
 }
@@ -350,7 +352,9 @@ impl DaemonCommand {
                 stderr: target(&self.stderr),
             })?;
             let handles = (|| {
-                let exit = ProcessHandle::open(inner.id())?;
+                let exit = ProcessHandle::open(
+                    crate::ProcessId::new(inner.id()).expect("spawned daemon has a nonzero PID"),
+                )?;
                 // Before the daemon connects, its exit is the only event
                 // that can end the channel. Clone its owned process handle.
                 let readiness = match readiness {
@@ -421,8 +425,8 @@ pub enum Startup {
 
 impl DaemonChild {
     /// The daemon's process ID.
-    pub fn id(&self) -> u32 {
-        self.inner.id()
+    pub fn id(&self) -> crate::ProcessId {
+        crate::ProcessId::new(self.inner.id()).expect("spawned daemon has a nonzero PID")
     }
 
     /// The launcher's end of the readiness channel, the first time it is
@@ -722,7 +726,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         // Opened while the daemon certainly runs, so it follows that process.
-        let mut daemon_exit = ProcessHandle::open(daemon).unwrap();
+        let mut daemon_exit = ProcessHandle::open(crate::ProcessId::new(daemon).unwrap()).unwrap();
         crate::local::unix::interrupt_process_group(helper.id()).unwrap();
         let status = helper.wait().unwrap();
         // A daemon that shared the group dies of the same SIGINT; give it

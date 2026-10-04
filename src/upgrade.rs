@@ -4,6 +4,7 @@ use tokio::time::Instant;
 
 /// Failure to obtain a live daemon satisfying the caller's version policy.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UpgradeError<E> {
     /// A health probe failed, rather than reporting an absent daemon.
     Probe(E),

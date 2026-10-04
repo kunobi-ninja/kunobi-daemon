@@ -650,6 +650,7 @@ fn relay(root: PathBuf, minimum: u64) -> io::Result<()> {
                 return Ok(());
             }
             PumpExit::PeerClosed => {}
+            _ => panic!("unexpected pump outcome"),
         }
         out.frame.clear();
         let ids = std::mem::take(&mut *out.pending.lock().unwrap());

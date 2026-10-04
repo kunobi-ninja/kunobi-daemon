@@ -29,24 +29,15 @@ pub struct WindowsDuplex {
     read_deadline: Cell<Option<Instant>>,
 }
 
-/// Verify a kernel-reported peer PID against the current process token user.
-/// The caller must obtain the PID from its still-open socket, never a record.
-pub fn verify_process_user(pid: u32) -> io::Result<()> {
-    if process_runs_as_this_user(pid)? {
-        Ok(())
-    } else {
-        Err(io::ErrorKind::PermissionDenied.into())
-    }
-}
-
 /// Whether `pid` runs as this process's token user. `Ok(false)` only after a
 /// successful SID comparison; failing to open or query the process is an error.
 ///
 /// The process is looked up by PID, so if the connection's original peer has
 /// exited and another process now has its PID, this describes that process.
-pub(crate) fn process_runs_as_this_user(pid: u32) -> io::Result<bool> {
-    // SAFETY: query-only handle to the kernel-reported pipe peer PID.
-    let process = unsafe { OpenProcess(0x1000, 0, pid) };
+pub(crate) fn process_runs_as_this_user(pid: crate::ProcessId) -> io::Result<bool> {
+    // SAFETY: OpenProcess takes integers and returns a handle or null; query
+    // access only.
+    let process = unsafe { OpenProcess(0x1000, 0, pid.get()) };
     if process.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -62,9 +53,14 @@ pub(crate) fn process_runs_as_this_user(pid: u32) -> io::Result<bool> {
     Ok(equal != 0)
 }
 
-/// One-time compatibility fallback for a protocol-v1 peer that cannot drain.
-/// Terminate a peer whose identity and ownership the caller already verified.
-pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
+/// One-time compatibility fallback for a protocol-v1 peer that cannot drain:
+/// terminate it.
+///
+/// This reaches whichever process has `pid` now. Take the PID from the
+/// credentials of a live connection to that peer, and prefer draining: a PID
+/// can be reused once its process has exited.
+pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
+    let pid = pid.get();
     use std::ffi::c_void;
     type Handle = *mut c_void;
     #[link(name = "kernel32")]
@@ -74,7 +70,7 @@ pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
         fn CloseHandle(object: Handle) -> i32;
     }
     const PROCESS_TERMINATE: u32 = 0x0001;
-    // SAFETY: `pid` was obtained from the credentials of the still-live pipe.
+    // SAFETY: OpenProcess takes integers and returns a handle or null.
     let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     if process.is_null() {
         return Err(io::Error::last_os_error());
@@ -171,17 +167,9 @@ impl WriteHalf for WindowsWriter {
     }
 }
 
-impl WindowsDuplex {
-    /// [`crate::peer::Evidence`] about the server at the other end, for
-    /// [`crate::peer::authenticate`].
-    pub fn evidence(&self) -> io::Result<crate::peer::Evidence> {
-        super::peer::evidence(&self.stream)
-    }
-}
-
-impl super::peer::PeerEvidence for WindowsDuplex {
-    fn evidence(&self) -> io::Result<crate::peer::Evidence> {
-        WindowsDuplex::evidence(self)
+impl super::peer::PeerCredentials for WindowsDuplex {
+    fn credentials(&self) -> io::Result<crate::peer::Credentials> {
+        super::peer::pipe_credentials(&self.stream)
     }
 }
 
@@ -190,9 +178,10 @@ impl Duplex for WindowsDuplex {
     type Writer = WindowsWriter;
 
     fn connect_once_until(endpoint: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
+        // A malformed name can never connect, so it is not worth retrying.
         let name = endpoint
             .to_ns_name::<GenericNamespaced>()
-            .map_err(|_| ConnectError::ConnectTimeout)?;
+            .map_err(|error| ConnectError::Failed(error.kind()))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(ConnectError::ConnectTimeout);
@@ -205,26 +194,7 @@ impl Duplex for WindowsDuplex {
                 stream,
                 read_deadline: Cell::new(None),
             })
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    ConnectError::PermissionDenied
-                } else {
-                    ConnectError::ConnectTimeout
-                }
-            })
-    }
-
-    /// Check the server process token before sending any client identity.
-    fn verify_peer_user(&self) -> io::Result<()> {
-        verify_process_user(self.peer_pid()?)
-    }
-
-    /// Read the server PID from the named-pipe kernel object.
-    fn peer_pid(&self) -> io::Result<u32> {
-        self.stream
-            .peer_creds()?
-            .pid()
-            .ok_or_else(|| io::Error::other("named-pipe peer has no PID"))
+            .map_err(|error| super::connect_error(&error))
     }
 
     /// Arm an absolute deadline for reads performed during session setup.
@@ -323,6 +293,7 @@ unsafe extern "system" {
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
         add: i32,
     ) -> i32;
+    fn GetHandleInformation(object: Handle, flags: *mut u32) -> i32;
     fn SetHandleInformation(object: Handle, mask: u32, flags: u32) -> i32;
 }
 
@@ -522,8 +493,6 @@ fn cancel_and_reap(
     }
 }
 
-pub use super::process::{process_has_exited, process_state};
-
 static SESSION_END: AtomicBool = AtomicBool::new(false);
 
 const CTRL_CLOSE_EVENT: u32 = 2;
@@ -571,37 +540,102 @@ pub struct StdioInheritGuard {
 }
 
 impl StdioInheritGuard {
-    /// Suppress inherit for the duration of a spawn.
-    pub fn suppress() -> Self {
+    /// Suppress inherit for the duration of a spawn. Reading or changing a
+    /// live standard handle's flags can fail; partial changes are restored.
+    pub fn suppress() -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
-        let handles: [Handle; 3] = [
+        Self::for_handles([
             std::io::stdin().as_raw_handle(),
             std::io::stdout().as_raw_handle(),
             std::io::stderr().as_raw_handle(),
-        ];
-        let mut restore = Vec::new();
+        ])
+    }
+
+    fn for_handles(handles: [Handle; 3]) -> io::Result<Self> {
+        let mut guard = Self {
+            restore: Vec::new(),
+        };
         for handle in handles {
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 continue;
             }
-            // SAFETY: handle is a live std handle; clearing inherit is
-            // process-local and restored on drop.
-            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
-                restore.push(handle);
+            let mut flags = 0;
+            // SAFETY: handle is live for this guard; flags is writable.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(io::Error::last_os_error());
             }
+            if flags & HANDLE_FLAG_INHERIT == 0 {
+                continue;
+            }
+            // SAFETY: the handle is live; change only its inherit flag.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            guard.restore.push(handle);
         }
-        Self { restore }
+        Ok(guard)
+    }
+
+    /// Restore the original flags and report a failure. Drop also attempts
+    /// restoration, but cannot return an error.
+    pub fn restore(&mut self) -> io::Result<()> {
+        let mut failed = None;
+        self.restore.retain(|handle| {
+            // SAFETY: these live handles were originally inheritable; restore
+            // only that flag. Keep failures for another attempt on drop.
+            if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                != 0
+            {
+                false
+            } else {
+                failed.get_or_insert_with(io::Error::last_os_error);
+                true
+            }
+        });
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for StdioInheritGuard {
     fn drop(&mut self) {
-        for handle in &self.restore {
-            // SAFETY: handles were successfully cleared by `suppress`.
-            unsafe {
-                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-            }
+        let _ = self.restore();
+    }
+}
+
+#[cfg(test)]
+mod stdio_inheritance_tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    #[test]
+    fn restores_only_the_handles_that_were_inheritable() {
+        let (read, write) = std::io::pipe().unwrap();
+        let inherited = read.as_raw_handle();
+        let private = write.as_raw_handle();
+        // SAFETY: both pipe handles are live; change only their inherit flags.
+        unsafe {
+            assert_ne!(
+                SetHandleInformation(inherited, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT),
+                0
+            );
+            assert_ne!(SetHandleInformation(private, HANDLE_FLAG_INHERIT, 0), 0);
         }
+        fn flags(handle: Handle) -> u32 {
+            let mut flags = 0;
+            // SAFETY: the caller keeps this pipe handle open; flags is writable.
+            assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+            flags & HANDLE_FLAG_INHERIT
+        }
+        {
+            let _guard = StdioInheritGuard::for_handles([inherited, private, inherited]).unwrap();
+            assert_eq!(flags(inherited), 0);
+            assert_eq!(flags(private), 0);
+        }
+        assert_eq!(flags(inherited), HANDLE_FLAG_INHERIT);
+        assert_eq!(flags(private), 0);
     }
 }
 
@@ -1188,7 +1222,11 @@ mod tests {
             let _ = wait.recv_timeout(Duration::from_secs(2));
         });
         let transport = WindowsDuplex::connect(&endpoint).unwrap();
-        transport.verify_peer_user().unwrap();
+        assert!(
+            crate::local::peer::PeerCredentials::credentials(&transport)
+                .unwrap()
+                .same_user
+        );
         transport
             .set_read_deadline(Some(Duration::from_millis(100)))
             .unwrap();

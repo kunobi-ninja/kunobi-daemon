@@ -60,6 +60,7 @@ pub struct Generation {
 
 /// Local session state. Counts describe leases, not application operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Snapshot {
     /// This process's epoch.
     pub own: u64,

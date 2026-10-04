@@ -13,6 +13,7 @@ use std::{
 pub use super::Bound;
 /// Failed acquisition, preserving filesystem errors separately from contention.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BindError {
     /// Failed to prepare the private parent directory.
     Directory(io::Error),

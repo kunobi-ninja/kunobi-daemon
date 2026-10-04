@@ -2,10 +2,11 @@
 #[cfg(unix)]
 mod unix {
     use kunobi_daemon::{
-        Lifecycle, ServiceIdentity,
+        Lifecycle, ServiceIdentity, client,
         control::ControlService,
         launch::{DaemonChild, DaemonCommand},
-        local::{Duplex, unix::UnixDuplex},
+        local::{Duplex, peer::PeerCredentials, unix::UnixDuplex},
+        peer::{Policy, SameUser},
         transport::SplitIo,
         wire::{self, Control, Hello, capability, operation},
     };
@@ -29,10 +30,28 @@ mod unix {
         )
     }
     fn request(path: &Path, operation: u32, application: bool) -> io::Result<Control> {
-        let stream = UnixDuplex::connect_once_until(path, Instant::now() + BUDGET)
+        if !application {
+            let request = if operation == operation::DRAIN {
+                client::drain
+            } else {
+                client::health
+            };
+            let health = request(&path.to_path_buf(), &offer(), None, Instant::now() + BUDGET)
+                .map_err(io::Error::other)?;
+            if operation == operation::HEALTH && !health.ready {
+                return Err(io::Error::other("peer is not ready"));
+            }
+            return health.response(&Control {
+                operation,
+                request_id: 1,
+                ..Default::default()
+            });
+        }
+        let stream = UnixDuplex::connect_once_until(&path.to_path_buf(), Instant::now() + BUDGET)
             .map_err(io::Error::other)?;
-        stream.verify_peer_user()?;
-        let pid = stream.peer_pid()?;
+        SameUser
+            .grant(&stream.credentials()?)
+            .map_err(io::Error::other)?;
         stream.set_read_deadline(Some(BUDGET))?;
         let (read, write) = stream.split()?;
         let mut session = wire::Session::connect(SplitIo { read, write }, &offer())?;
@@ -49,14 +68,6 @@ mod unix {
         };
         session.send(&request)?;
         let reply = session.receive()?;
-        if !application {
-            let health = wire::Health::from_response(&reply, &request)?;
-            if health.process_id != pid || (operation == operation::HEALTH && !health.ready) {
-                return Err(io::Error::other(
-                    "health proof did not identify a ready peer",
-                ));
-            }
-        }
         Ok(reply)
     }
 

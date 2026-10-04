@@ -185,6 +185,7 @@ pub const BUFFER_SIZE: usize = 65_536;
 
 /// Why forwarding from the peer to the client stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PumpExit {
     /// The peer closed or failed its stream; the coordinator may reconnect.
     PeerClosed,

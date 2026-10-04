@@ -46,24 +46,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Accept, authenticate the peer as this OS user, admit it to the control
     // pool and serve it; stop when a DRAIN request closes admission. Running
     // exchanges, including that DRAIN's acknowledgement, get five seconds.
-    let served = serve(
-        listener,
-        Arc::clone(&lifecycle),
-        admission,
-        SameUser,
-        |()| Pool::Control,
-        move |connection, permit| {
-            let service = Arc::clone(&service);
-            let offer = offer.clone();
-            async move {
-                let _permit = permit;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-                let _ = service.serve(connection, &offer, deadline).await;
-            }
-        },
-        Duration::from_secs(5),
-    )
-    .await?;
+    let served = serve(listener, Arc::clone(&lifecycle), admission, SameUser)
+        .drain_budget(Duration::from_secs(5))
+        .run(
+            |()| Pool::Control,
+            move |connection, permit| {
+                let service = Arc::clone(&service);
+                let offer = offer.clone();
+                async move {
+                    let _permit = permit;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    let _ = service.serve(connection, &offer, deadline).await;
+                }
+            },
+        )
+        .await
+        .map_err(io::Error::other)?;
     eprintln!("{served:?}");
     lifecycle.drain().await;
     Ok(())

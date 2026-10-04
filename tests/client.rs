@@ -3,12 +3,13 @@
 
 #![cfg(all(unix, feature = "wire-async", feature = "local"))]
 
+use kunobi_daemon::ProcessId;
 use kunobi_daemon::{
     Lifecycle, ServiceIdentity,
     client::{self, RequestError},
     control::ControlService,
     local::unix_socket::{self, Bound},
-    peer::{ProcessId, Rejected},
+    peer::Rejected,
     wire::{self, Health, Hello, capability},
 };
 use std::{
@@ -95,7 +96,7 @@ async fn a_peer_that_is_not_the_expected_process_is_refused() {
     assert!(
         matches!(
             error,
-            RequestError::Peer(Rejected::Different { expected, observed })
+            RequestError::Peer(Rejected::OtherProcess { expected, observed })
                 if expected == other && observed == own_pid()
         ),
         "{error:?}"

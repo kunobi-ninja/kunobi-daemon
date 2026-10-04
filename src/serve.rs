@@ -5,7 +5,7 @@
 //!
 //! 1. Accept a connection. Running out of file descriptors pauses accepting
 //!    briefly instead of ending the loop.
-//! 2. Read its [`Evidence`](crate::peer::Evidence) and run the consumer's
+//! 2. Read its [`Credentials`](crate::peer::Credentials) and run the consumer's
 //!    [`Policy`]. A rejected peer is dropped before it can hold any capacity.
 //! 3. Take an [`Admission`] permit from the pool the consumer picks for that
 //!    grant. No capacity drops the connection.
@@ -29,7 +29,7 @@
 use crate::{
     Lifecycle,
     admission::{Admission, Permit, Pool},
-    local::peer::PeerEvidence,
+    local::peer::PeerCredentials,
     peer::{Authenticated, Policy, authenticate},
 };
 use std::{future::Future, io, sync::Arc, time::Duration};
@@ -37,12 +37,12 @@ use tokio::task::JoinSet;
 
 /// How long to stop accepting after the process runs out of file descriptors.
 /// Accepting again immediately would spin on the same error.
-pub const DESCRIPTOR_BACKOFF: Duration = Duration::from_millis(50);
+const DESCRIPTOR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// A listener whose connections can report their peer.
 pub trait Listener {
     /// The accepted connection.
-    type Connection: PeerEvidence + Send + 'static;
+    type Connection: PeerCredentials + Send + 'static;
     /// Wait for the next connection. Must be cancellation-safe: [`serve`]
     /// drops a pending accept whenever a handler finishes, and a dropped
     /// accept must not lose a connection.
@@ -70,9 +70,9 @@ pub struct Served {
     pub admitted: u64,
     /// Connections whose evidence could not be read or whose peer the policy
     /// rejected.
-    pub rejected: u64,
+    pub unauthenticated: u64,
     /// Authenticated connections dropped because their pool was full.
-    pub refused: u64,
+    pub over_capacity: u64,
     /// Handlers cancelled because they were still running when the drain
     /// budget expired.
     pub aborted: u64,
@@ -80,77 +80,136 @@ pub struct Served {
 
 /// Whether an accept error means this process has no file descriptors left,
 /// which is temporary: wait and accept again.
-pub fn is_descriptor_exhaustion(error: &io::Error) -> bool {
+fn is_descriptor_exhaustion(error: &io::Error) -> bool {
     // EMFILE and ENFILE, the same numbers on Linux, macOS and the BSDs.
     cfg!(unix) && matches!(error.raw_os_error(), Some(23 | 24))
 }
 
-/// Accept, authenticate, admit and serve connections until `lifecycle` drains.
-///
-/// `pool` picks the admission pool for each grant. `handler` runs on its own
-/// task with the authenticated connection and the permit, which it holds for
-/// as long as the connection uses capacity. After draining starts, running
-/// handlers get `drain_budget` to finish; the rest are aborted.
-///
-/// Returns the counts in [`Served`]. An accept error other than descriptor
-/// exhaustion stops accepting, drains the running handlers the same way, and
-/// is returned.
-pub async fn serve<L, P, H, F>(
+/// Configure an accept loop with its listener, lifecycle, admission and peer policy.
+/// Call [`Serve::run`] with the grant-to-pool mapping and connection handler.
+pub fn serve<L, P>(
     listener: L,
     lifecycle: Arc<Lifecycle>,
     admission: Arc<Admission>,
     policy: P,
-    pool: impl Fn(&P::Grant) -> Pool,
-    handler: H,
+) -> Serve<L, P> {
+    Serve {
+        listener,
+        lifecycle,
+        admission,
+        policy,
+        drain_budget: Duration::from_secs(5),
+    }
+}
+
+/// An accept loop configured with one peer policy and a bounded handler drain.
+pub struct Serve<L, P> {
+    listener: L,
+    lifecycle: Arc<Lifecycle>,
+    admission: Arc<Admission>,
+    policy: P,
     drain_budget: Duration,
-) -> io::Result<Served>
-where
-    L: Listener,
-    P: Policy,
-    P::Grant: Send + 'static,
-    H: Fn(Authenticated<L::Connection, P::Grant>, Permit) -> F,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let mut served = Served::default();
-    let mut handlers = JoinSet::new();
-    let stopped = 'accept: loop {
-        tokio::select! {
-            biased;
-            () = lifecycle.draining() => break 'accept Ok(()),
-            Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
-            accepted = listener.accept() => match accepted {
-                Ok(connection) => {
-                    let Ok(evidence) = connection.evidence() else {
-                        served.rejected += 1;
-                        continue;
-                    };
-                    let Ok(authenticated) = authenticate(connection, evidence, &policy) else {
-                        served.rejected += 1;
-                        continue;
-                    };
-                    let Some(permit) = admission.try_acquire(pool(authenticated.grant())) else {
-                        served.refused += 1;
-                        continue;
-                    };
-                    // Draining can start while this peer is checked.
-                    if !lifecycle.accepting_calls() {
-                        break 'accept Ok(());
+}
+
+/// An accept failure, retaining the counts after running handlers have drained.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ServeError {
+    /// The listener's error.
+    pub error: io::Error,
+    /// Accepted, rejected and aborted connections before the loop ended.
+    pub served: Served,
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "accept loop failed: {}", self.error)
+    }
+}
+
+impl std::error::Error for ServeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl<L, P> Serve<L, P> {
+    /// Give running handlers this long to finish after draining starts.
+    /// The default is five seconds. Remaining handlers are then aborted.
+    pub fn drain_budget(mut self, budget: Duration) -> Self {
+        self.drain_budget = budget;
+        self
+    }
+
+    /// Accept, authenticate, admit and serve until the lifecycle drains.
+    ///
+    /// `pool` chooses capacity for a grant; `handler` owns the authenticated
+    /// connection and its permit. An accept failure drains handlers before
+    /// returning [`ServeError`]. Dropping the future aborts handlers immediately.
+    pub async fn run<H, F>(
+        self,
+        pool: impl Fn(&P::Grant) -> Pool,
+        handler: H,
+    ) -> Result<Served, ServeError>
+    where
+        L: Listener,
+        P: Policy,
+        P::Grant: Send + 'static,
+        H: Fn(Authenticated<L::Connection, P::Grant>, Permit) -> F,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let Self {
+            listener,
+            lifecycle,
+            admission,
+            policy,
+            drain_budget,
+        } = self;
+        let mut served = Served::default();
+        let mut handlers = JoinSet::new();
+        let stopped = 'accept: loop {
+            tokio::select! {
+                biased;
+                () = lifecycle.draining() => break 'accept Ok(()),
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+                accepted = listener.accept() => match accepted {
+                    Ok(connection) => {
+                        let Ok(evidence) = connection.credentials() else {
+                            served.unauthenticated += 1;
+                            lifecycle.record(crate::observation::Event::Rejected);
+                            continue;
+                        };
+                        let Ok(authenticated) = authenticate(connection, evidence, &policy) else {
+                            served.unauthenticated += 1;
+                            lifecycle.record(crate::observation::Event::Rejected);
+                            continue;
+                        };
+                        let Some(permit) = admission.try_acquire(pool(authenticated.grant())) else {
+                            served.over_capacity += 1;
+                            continue;
+                        };
+                        // Draining can start while this peer is checked.
+                        if !lifecycle.accepting_calls() {
+                            break 'accept Ok(());
+                        }
+                        served.admitted += 1;
+                        handlers.spawn(handler(authenticated, permit));
                     }
-                    served.admitted += 1;
-                    handlers.spawn(handler(authenticated, permit));
-                }
-                Err(error) if is_descriptor_exhaustion(&error) => {
-                    tokio::select! {
-                        () = lifecycle.draining() => break 'accept Ok(()),
-                        () = descriptor_backoff() => {}
+                    Err(error) if is_descriptor_exhaustion(&error) => {
+                        tokio::select! {
+                            () = lifecycle.draining() => break 'accept Ok(()),
+                            () = descriptor_backoff() => {}
+                        }
                     }
-                }
-                Err(error) => break 'accept Err(error),
-            },
-        }
-    };
-    served.aborted = finish(&mut handlers, drain_budget).await;
-    stopped.map(|()| served)
+                    Err(error) => break 'accept Err(error),
+                },
+            }
+        };
+        served.aborted = finish(&mut handlers, drain_budget).await;
+        stopped
+            .map(|()| served)
+            .map_err(|error| ServeError { error, served })
+    }
 }
 
 #[expect(
@@ -187,8 +246,9 @@ async fn finish(handlers: &mut JoinSet<()>, budget: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::{
+        ProcessId,
         admission::Limits,
-        peer::{Evidence, ExpectedProcess, First, ProcessId, SameUser},
+        peer::{Credentials, ExpectedProcess, First, SameUser},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -242,25 +302,29 @@ mod tests {
         let policy = First::new()
             .then(ExpectedProcess::new(move || own), "full")
             .then(SameUser, "redacted");
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            Arc::clone(&admission),
-            policy,
-            |grant: &&str| {
-                if *grant == "full" {
-                    Pool::Control
-                } else {
-                    Pool::Application
-                }
-            },
-            |mut connection, permit| async move {
-                let _permit = permit;
-                let grant = *connection.grant();
-                connection.write_all(grant.as_bytes()).await.unwrap();
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(
+                listener,
+                Arc::clone(&lifecycle),
+                Arc::clone(&admission),
+                policy,
+            )
+            .drain_budget(Duration::from_secs(5))
+            .run(
+                |grant: &&str| {
+                    if *grant == "full" {
+                        Pool::Control
+                    } else {
+                        Pool::Application
+                    }
+                },
+                |mut connection, permit| async move {
+                    let _permit = permit;
+                    let grant = *connection.grant();
+                    connection.write_all(grant.as_bytes()).await.unwrap();
+                },
+            ),
+        );
         assert_eq!(exchange(&path).await, b"full");
         assert_eq!(admission.snapshot(Pool::Application).rejected, 0);
         lifecycle.start_drain();
@@ -281,25 +345,36 @@ mod tests {
             path,
             listener,
         } = fixture();
-        let lifecycle = Arc::new(Lifecycle::default());
+        let observations = Arc::new(crate::observation::Observations::new(4));
+        let lifecycle = Arc::new(Lifecycle::observed(Arc::clone(&observations)));
         let admission = Arc::new(Admission::new(Limits::default()));
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            Arc::clone(&admission),
-            ExpectedProcess::new(|| ProcessId::new(1)),
-            |_| Pool::Control,
-            |_connection, _permit| async move {
-                panic!("a rejected peer reached the handler");
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(
+                listener,
+                Arc::clone(&lifecycle),
+                Arc::clone(&admission),
+                ExpectedProcess::new(|| ProcessId::new(1)),
+            )
+            .drain_budget(Duration::from_secs(5))
+            .run(
+                |_| Pool::Control,
+                |_connection, _permit| async move {
+                    panic!("a rejected peer reached the handler");
+                },
+            ),
+        );
         assert_eq!(exchange(&path).await, b"");
         let control = admission.snapshot(Pool::Control);
         assert_eq!((control.active, control.rejected), (0, 0));
+        assert!(
+            observations
+                .take_events()
+                .iter()
+                .any(|event| event.event == crate::observation::Event::Rejected)
+        );
         lifecycle.start_drain();
         let served = server.await.unwrap().unwrap();
-        assert_eq!(served.rejected, 1);
+        assert_eq!(served.unauthenticated, 1);
         assert_eq!(served.admitted, 0);
     }
 
@@ -315,23 +390,27 @@ mod tests {
             control: 0,
             ..Limits::default()
         }));
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            Arc::clone(&admission),
-            SameUser,
-            |()| Pool::Control,
-            |_connection, _permit| async move {
-                panic!("a refused peer reached the handler");
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(
+                listener,
+                Arc::clone(&lifecycle),
+                Arc::clone(&admission),
+                SameUser,
+            )
+            .drain_budget(Duration::from_secs(5))
+            .run(
+                |()| Pool::Control,
+                |_connection, _permit| async move {
+                    panic!("a refused peer reached the handler");
+                },
+            ),
+        );
         assert_eq!(exchange(&path).await, b"");
         assert_eq!(admission.snapshot(Pool::Control).rejected, 1);
         lifecycle.start_drain();
         let served = server.await.unwrap().unwrap();
-        assert_eq!(served.refused, 1);
-        assert_eq!(served.rejected, 0);
+        assert_eq!(served.over_capacity, 1);
+        assert_eq!(served.unauthenticated, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -344,22 +423,21 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::default());
         let admission = Arc::new(Admission::new(Limits::default()));
         let (started, mut running) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            admission,
-            SameUser,
-            |()| Pool::Application,
-            move |_connection, permit| {
-                let started = started.clone();
-                async move {
-                    let _permit = permit;
-                    started.send(()).unwrap();
-                    std::future::pending::<()>().await;
-                }
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(listener, Arc::clone(&lifecycle), admission, SameUser)
+                .drain_budget(Duration::from_secs(5))
+                .run(
+                    |()| Pool::Application,
+                    move |_connection, permit| {
+                        let started = started.clone();
+                        async move {
+                            let _permit = permit;
+                            started.send(()).unwrap();
+                            std::future::pending::<()>().await;
+                        }
+                    },
+                ),
+        );
         let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
         running.recv().await.unwrap();
         lifecycle.start_drain();
@@ -380,23 +458,22 @@ mod tests {
         let (started, mut running) = tokio::sync::mpsc::unbounded_channel();
         let finish = Arc::new(tokio::sync::Notify::new());
         let release = Arc::clone(&finish);
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            admission,
-            SameUser,
-            |()| Pool::Application,
-            move |_connection, permit| {
-                let started = started.clone();
-                let finish = Arc::clone(&finish);
-                async move {
-                    let _permit = permit;
-                    started.send(()).unwrap();
-                    finish.notified().await;
-                }
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(listener, Arc::clone(&lifecycle), admission, SameUser)
+                .drain_budget(Duration::from_secs(5))
+                .run(
+                    |()| Pool::Application,
+                    move |_connection, permit| {
+                        let started = started.clone();
+                        let finish = Arc::clone(&finish);
+                        async move {
+                            let _permit = permit;
+                            started.send(()).unwrap();
+                            finish.notified().await;
+                        }
+                    },
+                ),
+        );
         let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
         running.recv().await.unwrap();
         lifecycle.start_drain();
@@ -408,12 +485,80 @@ mod tests {
         assert_eq!(served.aborted, 0);
     }
 
-    /// A connection whose evidence the test decides.
-    struct Fake(Option<Evidence>);
+    #[tokio::test]
+    async fn an_accept_failure_keeps_counts_and_its_error_source() {
+        let error = serve(
+            Scripted::new([
+                Ok(Fake(None)),
+                Ok(same_user()),
+                Err(io::ErrorKind::PermissionDenied.into()),
+            ]),
+            Arc::new(Lifecycle::default()),
+            Arc::new(Admission::new(Limits::default())),
+            SameUser,
+        )
+        .run(|()| Pool::Application, |_connection, _permit| async {})
+        .await
+        .unwrap_err();
+        assert_eq!(error.served.unauthenticated, 1);
+        assert_eq!(error.served.admitted, 1);
+        assert_eq!(error.served.over_capacity, 0);
+        assert_eq!(error.served.aborted, 0);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            format!("accept loop failed: {}", error.error)
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .is_some()
+        );
+    }
 
-    impl PeerEvidence for Fake {
-        fn evidence(&self) -> io::Result<Evidence> {
+    #[tokio::test(start_paused = true)]
+    async fn the_handler_drain_budget_is_configurable_and_defaults_to_five_seconds() {
+        for budget in [None, Some(Duration::from_secs(13))] {
+            let lifecycle = Arc::new(Lifecycle::default());
+            let (started, mut ready) = tokio::sync::mpsc::unbounded_channel();
+            let configured = serve(
+                Scripted::new([Ok(same_user())]),
+                Arc::clone(&lifecycle),
+                Arc::new(Admission::new(Limits::default())),
+                SameUser,
+            );
+            let configured = match budget {
+                Some(budget) => configured.drain_budget(budget),
+                None => configured,
+            };
+            let server = tokio::spawn(configured.run(
+                |()| Pool::Application,
+                move |_connection, permit| {
+                    let started = started.clone();
+                    async move {
+                        let _permit = permit;
+                        started.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                },
+            ));
+            ready.recv().await.unwrap();
+            let began = tokio::time::Instant::now();
+            lifecycle.start_drain();
+            let served = server.await.unwrap().unwrap();
+            assert_eq!(served.aborted, 1);
+            assert_eq!(began.elapsed(), budget.unwrap_or(Duration::from_secs(5)));
+        }
+    }
+
+    /// A connection whose evidence the test decides.
+    struct Fake(Option<Credentials>);
+
+    impl PeerCredentials for Fake {
+        fn credentials(&self) -> io::Result<Credentials> {
             self.0
+                .clone()
                 .ok_or_else(|| io::Error::other("no peer credentials"))
         }
     }
@@ -439,7 +584,7 @@ mod tests {
     }
 
     fn same_user() -> Fake {
-        Fake(Some(Evidence::new(
+        Fake(Some(Credentials::new(
             ProcessId::new(std::process::id()),
             true,
         )))
@@ -452,22 +597,26 @@ mod tests {
         policy: impl Policy<Grant = ()> + Send + 'static,
         lifecycle: Arc<Lifecycle>,
         admissions: usize,
-    ) -> io::Result<Served> {
+    ) -> Result<Served, ServeError> {
         let (admitted, mut seen) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(serve(
-            listener,
-            Arc::clone(&lifecycle),
-            Arc::new(Admission::new(Limits::default())),
-            policy,
-            |()| Pool::Application,
-            move |_connection, _permit| {
-                let admitted = admitted.clone();
-                async move {
-                    let _ = admitted.send(());
-                }
-            },
-            Duration::from_secs(5),
-        ));
+        let server = tokio::spawn(
+            serve(
+                listener,
+                Arc::clone(&lifecycle),
+                Arc::new(Admission::new(Limits::default())),
+                policy,
+            )
+            .drain_budget(Duration::from_secs(5))
+            .run(
+                |()| Pool::Application,
+                move |_connection, _permit| {
+                    let admitted = admitted.clone();
+                    async move {
+                        let _ = admitted.send(());
+                    }
+                },
+            ),
+        );
         for _ in 0..admissions {
             seen.recv().await.unwrap();
         }
@@ -487,7 +636,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            (served.rejected, served.admitted, served.refused),
+            (
+                served.unauthenticated,
+                served.admitted,
+                served.over_capacity
+            ),
             (1, 1, 0)
         );
     }
@@ -517,7 +670,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]
@@ -525,7 +678,7 @@ mod tests {
         struct DrainsWhileChecking(Arc<Lifecycle>);
         impl Policy for DrainsWhileChecking {
             type Grant = ();
-            fn grant(&self, _: &Evidence) -> Result<(), crate::peer::Rejected> {
+            fn grant(&self, _: &Credentials) -> Result<(), crate::peer::Rejected> {
                 self.0.start_drain();
                 Ok(())
             }

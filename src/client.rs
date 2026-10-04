@@ -1,10 +1,10 @@
 //! Ask a running service for its health, or tell it to drain, over its binary
 //! control endpoint.
 //!
-//! [`request`] proves three PIDs agree before it trusts a reply: the PID the
-//! kernel reports for the connection, the PID the caller expects (usually the
-//! one the service advertised in its record), and `Health::process_id` in the
-//! reply. It also checks the peer runs as this OS user, and that the reply
+//! [`health`] and [`drain`] check the kernel-reported peer PID against the
+//! reply and, when supplied, the expected PID. A PID match does not identify
+//! an executable or the author of a discovery record; see [`crate::peer`].
+//! The client also checks that the peer runs as this OS user and the reply
 //! arrives before the deadline.
 //!
 //! A failure after the service advertised its binary endpoint is final for
@@ -12,8 +12,9 @@
 //! says so, or rediscover it, but never fall back to an older protocol.
 
 use crate::{
-    local::{ConnectError, Duplex, Endpoint, PlatformDuplex},
-    peer::{ExpectedProcess, Policy, ProcessId, Rejected, SameUser},
+    ProcessId,
+    local::{ConnectError, Duplex, Endpoint, PlatformDuplex, peer::PeerCredentials},
+    peer::{ExpectedProcess, Policy, Rejected, SameUser},
     transport::SplitIo,
     wire::{self, Control, Health, Hello, operation},
 };
@@ -27,6 +28,8 @@ pub enum RequestError {
     Unavailable(ConnectError),
     /// The peer runs as another user or is not the expected process.
     Peer(Rejected),
+    /// The OS could not read the peer credentials.
+    Credentials(io::Error),
     /// The reply names a different process than the one on the connection.
     ProcessMismatch {
         /// The PID the kernel reports for the connection.
@@ -58,6 +61,7 @@ impl fmt::Display for RequestError {
                 "control reply names process {reported}, but the connection belongs to {peer}"
             ),
             Self::Late => f.write_str("control reply arrived after the deadline"),
+            Self::Credentials(error) => write!(f, "control peer credentials failed: {error}"),
             Self::Protocol(error) => write!(f, "control exchange failed: {error}"),
         }
     }
@@ -68,13 +72,13 @@ impl std::error::Error for RequestError {
         match self {
             Self::Unavailable(error) => Some(error),
             Self::Peer(rejected) => Some(rejected),
-            Self::Protocol(error) => Some(error),
+            Self::Protocol(error) | Self::Credentials(error) => Some(error),
             Self::ProcessMismatch { .. } | Self::Late => None,
         }
     }
 }
 
-/// Ask for health. See [`request`].
+/// Ask for health. See the module documentation.
 pub fn health(
     endpoint: &Endpoint,
     offer: &Hello,
@@ -85,7 +89,7 @@ pub fn health(
 }
 
 /// Close the service's admission. The reply reports the requests still active;
-/// it does not wait for them. See [`request`].
+/// it does not wait for them. See the module documentation.
 pub fn drain(
     endpoint: &Endpoint,
     offer: &Hello,
@@ -98,7 +102,7 @@ pub fn drain(
 /// Send one lifecycle `operation` to the binary control endpoint and return the
 /// reply, once the peer is this OS user, is `expected` when given, and the
 /// reply names that same process. Everything happens before `deadline`.
-pub fn request(
+fn request(
     endpoint: &Endpoint,
     offer: &Hello,
     operation: u32,
@@ -107,7 +111,7 @@ pub fn request(
 ) -> Result<Health, RequestError> {
     let stream = PlatformDuplex::connect_once_until(endpoint, deadline)
         .map_err(RequestError::Unavailable)?;
-    let evidence = stream.evidence().map_err(RequestError::Protocol)?;
+    let evidence = stream.credentials().map_err(RequestError::Credentials)?;
     match expected {
         Some(pid) => ExpectedProcess::new(move || Some(pid))
             .grant(&evidence)
@@ -165,7 +169,11 @@ mod tests {
     #[test]
     fn every_failure_says_what_happened() {
         let peer = ProcessId::new(7).unwrap();
-        let cases: [(RequestError, &str); 5] = [
+        let cases: [(RequestError, &str); 6] = [
+            (
+                RequestError::Credentials(io::Error::other("denied")),
+                "control peer credentials failed: denied",
+            ),
             (
                 RequestError::Unavailable(ConnectError::ConnectTimeout),
                 "control endpoint unavailable: daemon connection timed out",

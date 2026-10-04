@@ -18,6 +18,26 @@ A lock is coordination, not authentication. An application chooses an OS-protect
 instance directory and authenticates the socket peer separately from service UUID
 validation. A UUID prevents accidental cross-service dispatch; it is not a secret.
 
+## Authenticate and serve
+
+`ProcessId` names one nonzero OS process. Read `peer::Credentials` through
+`local::peer::PeerCredentials` on the connection before dispatch. `peer::Policy`
+grants access or returns a typed rejection. `SameUser`, `ExpectedProcess` and
+`First` compose with consumer policies; `First` can map a process match to full
+access and other same-user peers to a redacted view. A PID match establishes
+numeric agreement, not executable identity or authorship of a discovery record.
+
+`serve::serve(listener, lifecycle, admission, policy)` configures the accept loop.
+Set its `drain_budget`, then call `run(pool, handler)`. Authentication precedes
+capacity assignment. Its counts distinguish unauthenticated peers from full pools,
+and a fatal accept error retains those counts after handlers drain. Rejections
+are recorded when the lifecycle has observations attached.
+
+`client::health` and `client::drain` check the same-user peer, an optional expected
+PID, and the PID in the reply before accepting it. Credential-query failures,
+policy rejections and protocol failures are distinct errors. Only unavailable
+endpoints are transient; a malformed endpoint or denied connection fails at once.
+
 ## Client attach
 
 Features compose as the destination for shared process code:
@@ -25,9 +45,13 @@ Features compose as the destination for shared process code:
 | Feature | Role |
 | --- | --- |
 | `local` | Blocking OS transport, bind, peer checks, session-end, spawn inherit guard, process exit events |
-| `local-async` | Tokio listener (`windows_socket`) for a process that accepts |
+| `local-async` | Authenticated `serve` accept loop and Tokio Windows listener |
 | `launch` | Client-side spawn primitives on top of `local` |
-| `replacement` / `readiness` | Exclusive or overlapping upgrade; bounded live probes |
+| `async` (default) | Tokio lifecycle, generation and async coordinator |
+| `wire` | Blocking binary lifecycle messages; with `local`, the `client` API |
+| `wire-async` | Tokio binary messages and `ControlService` |
+
+`replacement` and `readiness` are modules available without extra features.
 
 A byte-pump shim enables `launch` and can call `spawn_and_wait` with a connect
 probe. A cache daemon already uses `local-async`, `replacement` and

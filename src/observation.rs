@@ -55,6 +55,7 @@ pub enum Event {
 }
 /// An event with monotonic time relative to this observation instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TimedEvent {
     /// Time since construction.
     pub elapsed: Duration,
@@ -72,6 +73,7 @@ struct Progress {
 }
 /// Progress in one direction. Samples are approximate during concurrent I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProgressSnapshot {
     /// Bytes accepted by successful transport calls, not application acknowledgements.
     pub bytes: u64,
@@ -86,6 +88,7 @@ pub struct ProgressSnapshot {
 }
 /// Transport observations aggregated over wrappers sharing this instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Snapshot {
     /// Currently owned observed transports.
     pub connections: usize,
