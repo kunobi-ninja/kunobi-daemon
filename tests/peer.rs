@@ -78,7 +78,7 @@ fn peer_fixture_process() {
     let endpoint = std::env::var(ENDPOINT_ENV).unwrap();
     let server: u32 = std::env::var(SERVER_PID_ENV).unwrap().parse().unwrap();
     let mut stream = connect(&endpoint);
-    let server_evidence = client_stream.credentials();
+    let server_evidence = client_evidence(&stream);
     assert_eq!(
         server_evidence,
         Credentials::new(ProcessId::new(server), true)

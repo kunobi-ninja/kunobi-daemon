@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serve::serve,
         wire::{Hello, capability},
     };
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{io, path::PathBuf, sync::Arc, time::Duration};
     let root = PathBuf::from(
         std::env::args_os()
             .nth(1)
