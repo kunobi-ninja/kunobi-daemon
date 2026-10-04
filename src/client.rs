@@ -128,8 +128,8 @@ pub fn request(
     let (read, write) = stream.split().map_err(RequestError::Protocol)?;
     let mut session =
         wire::Session::connect(SplitIo { read, write }, offer).map_err(RequestError::Protocol)?;
+    // One request per connection, so the reply needs no correlation ID.
     let message = Control {
-        request_id: 1,
         operation,
         ..Default::default()
     };
