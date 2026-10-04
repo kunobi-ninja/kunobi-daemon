@@ -1,79 +1,72 @@
-//! Collect [`crate::peer::Evidence`] about the other end of a local connection.
+//! Read [`Credentials`] for the other end of a local connection.
 //!
-//! The same call serves a listener checking an accepted connection and a client
-//! checking the service it reached. Pass the result to
+//! [`PeerCredentials`] serves a listener checking an accepted connection and a
+//! client checking the service it reached. Pass the result to
 //! [`crate::peer::authenticate`] with a [`crate::peer::Policy`], while the
-//! connection is still open and before dispatching anything. The crate's own
-//! adapters offer it as `UnixDuplex::evidence` and `WindowsDuplex::evidence`.
-//! See [`crate::peer`] for what the evidence does and does not prove.
+//! connection is still open and before dispatching anything. See
+//! [`crate::peer`] for what the credentials do and do not prove.
+//!
+//! On Unix, `same_user` compares this process's effective user with the user
+//! the kernel recorded for the connection; failing to read it is an error,
+//! never a same-user result. `pid` is `None` when the kernel reports none, for
+//! example for a Linux peer in another PID namespace, which
+//! [`crate::peer::ExpectedProcess`] rejects. Linux reports the PID and user
+//! captured when the peer connected, listened or created the socket pair.
+//! macOS reports the user captured then but the PID of the socket's most recent
+//! owner, so after a descriptor is passed or inherited the two can describe
+//! different processes.
+//!
+//! On Windows, a server sees its client's PID and a client sees the server's.
+//! `same_user` compares that process's token user with this process's: a
+//! lookup by PID, so if the original peer has exited while another process
+//! holds its handle, a process that reused the PID is checked instead. A pipe
+//! that reports no PID, or a process that cannot be queried, is an error.
 
-#[cfg(unix)]
-use crate::peer::{Evidence, ProcessId};
-#[cfg(unix)]
+use crate::peer::Credentials;
 use std::io;
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::evidence;
+pub(crate) use windows::pipe_credentials;
 
-/// A connection that can report [`crate::peer::Evidence`] about its peer: the
-/// crate's adapters, std and Tokio Unix streams, and `interprocess` local
-/// sockets on Windows. The accept loop in `serve` requires it.
-pub trait PeerEvidence {
-    /// What the OS reports about the other end. See [`evidence`].
-    fn evidence(&self) -> std::io::Result<crate::peer::Evidence>;
+/// A connection that can report [`Credentials`] for its peer: the crate's
+/// adapters, std and Tokio Unix streams, and `interprocess` local sockets on
+/// Windows. [`super::Duplex`] and the accept loop in `serve` require it.
+pub trait PeerCredentials {
+    /// What the OS reports about the other end. See the module docs.
+    fn credentials(&self) -> io::Result<Credentials>;
 }
 
 #[cfg(unix)]
-impl PeerEvidence for std::os::unix::net::UnixStream {
-    fn evidence(&self) -> io::Result<Evidence> {
-        use std::os::fd::AsFd;
-        evidence(self.as_fd())
+impl PeerCredentials for std::os::unix::net::UnixStream {
+    fn credentials(&self) -> io::Result<Credentials> {
+        use std::os::fd::AsRawFd;
+        super::unix::fd_credentials(self.as_raw_fd())
     }
 }
 
 #[cfg(all(unix, feature = "async"))]
-impl PeerEvidence for tokio::net::UnixStream {
-    fn evidence(&self) -> io::Result<Evidence> {
-        use std::os::fd::AsFd;
-        evidence(self.as_fd())
+impl PeerCredentials for tokio::net::UnixStream {
+    fn credentials(&self) -> io::Result<Credentials> {
+        use std::os::fd::AsRawFd;
+        super::unix::fd_credentials(self.as_raw_fd())
     }
-}
-
-/// Evidence for a connected Unix socket, from either end.
-///
-/// `same_user` compares this process's effective user with the credentials
-/// the kernel recorded for the connection. Failing to read them is an error,
-/// never a same-user result.
-///
-/// `pid` is `None` when the kernel reports none, for example for a peer in
-/// another PID namespace; [`crate::peer::ExpectedProcess`] rejects that. Linux
-/// reports the PID and user captured when the peer connected, listened or
-/// created the socket pair. macOS reports the user captured then, but the PID
-/// of the socket's most recent owner, so after a descriptor is passed or
-/// inherited the two can describe different processes.
-#[cfg(unix)]
-pub fn evidence(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Evidence> {
-    use std::os::fd::AsRawFd;
-    let raw = fd.as_raw_fd();
-    let same_user = super::unix::peer_uid(raw)? == super::unix::own_uid();
-    let pid = super::unix::peer_pid(raw).ok().and_then(ProcessId::new);
-    Ok(Evidence::new(pid, same_user))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
+    use crate::ProcessId;
 
     #[test]
     fn a_socket_pair_reports_this_process_as_the_same_user_peer() {
         let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
-        let own = ProcessId::new(std::process::id());
         for end in [&left, &right] {
-            assert_eq!(evidence(end.as_fd()).unwrap(), Evidence::new(own, true));
-            assert_eq!(end.evidence().unwrap(), Evidence::new(own, true));
+            assert_eq!(
+                end.credentials().unwrap(),
+                Credentials::new(Some(ProcessId::current()), true)
+            );
         }
     }
 }

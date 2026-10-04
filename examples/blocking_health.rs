@@ -3,7 +3,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kunobi_daemon::{
         ServiceIdentity, client,
-        wire::{self, capability, operation},
+        wire::{self, capability},
     };
     use std::{
         path::PathBuf,
@@ -20,22 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN,
         capability::HEALTH | capability::HEALTH_DETAILS,
     );
-    let operation = if std::env::args().nth(2).as_deref() == Some("drain") {
-        operation::DRAIN
+    let request = if std::env::args().nth(2).as_deref() == Some("drain") {
+        client::drain
     } else {
-        operation::HEALTH
+        client::health
     };
     // Checks the peer is this OS user and that the reply names the process on
     // the connection. A daemon that advertises its PID would pass it instead
     // of `None` to require that exact process.
     let deadline = Instant::now() + Duration::from_secs(2);
-    let health = client::request(
-        &root.join("control.sock"),
-        &offer,
-        operation,
-        None,
-        deadline,
-    )?;
+    let health = request(&root.join("control.sock"), &offer, None, deadline)?;
     println!(
         "pid={} ready={} draining={} active={}",
         health.process_id, health.ready, health.draining, health.active

@@ -50,6 +50,23 @@ jobs:
       - run: cargo run --locked --no-default-features --features wire --example application_messages
       - run: cargo package --locked
 
+  cross-version:
+    name: Cross-version health and drain
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: current
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: v0.8.0
+          path: previous
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: python3 current/scripts/check-cross-version.py previous current
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+
   protobuf:
     name: Protobuf schema
     runs-on: ubuntu-latest

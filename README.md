@@ -15,6 +15,10 @@ work. The crate has no MCP, cache database or telemetry exporter dependency.
   atomic publication and cleanup that preserves a successor's endpoint.
 - `Lifecycle` and `generation`: request guards, generation selection, session
   leases and retirement. `retry` bounds persisted candidate campaigns.
+- `ProcessId` and `peer`: nonzero process IDs, same-user credentials and
+  application policies that grant access before dispatch.
+- `serve`: a shared authenticated accept loop with capacity limits and handler drain.
+- `client`: health and drain requests that check peer credentials and the reply PID.
 - `wire` and `control`: Buffa Protobuf negotiation, typed health and drain replies.
 - `local` and `transport`: optional OS peer checks, setup deadlines, half-close,
   byte pumps and replaceable writers. `Outstanding` ends a session once every
@@ -31,7 +35,8 @@ ordering, failure boundaries and consumer responsibilities.
 The default `async` feature adds Tokio-based lifecycle and generation support.
 Blocking clients use `default-features = false`; `wire` and `local` do not create
 a runtime. `wire-async` adds the async protocol and control handler.
-`local-async` adds the Tokio Windows listener with an explicit local-owner ACL.
+`local-async` adds the shared accept loop and the Tokio Windows listener
+with an explicit local-owner ACL.
 With `local` and `async` together, `local::ProcessHandle` can also wait for an
 exit on a Tokio runtime; on Unix that runtime needs I/O enabled.
 `launch` is the client-side start recipe on top of `local`. A daemon that only

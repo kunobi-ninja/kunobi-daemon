@@ -34,7 +34,7 @@ pub const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// connection setup lived in inherent methods the two adapters drifted: Windows
 /// never grew `connect_once_until`, and it carried its own copies of the budget
 /// and retry interval above. The compiler now compares them.
-pub trait Duplex: Sized {
+pub trait Duplex: Sized + peer::PeerCredentials {
     /// Receive half owned by the downstream pump.
     type Reader: io::Read + Send + 'static;
     /// Send half with an explicit half-close operation.
@@ -48,16 +48,14 @@ pub trait Duplex: Sized {
 
     /// Retry availability until the deadline passes.
     ///
-    /// A denial or an endpoint too long to address short-circuits: neither
-    /// resolves by waiting, and spending the budget first only makes the
-    /// diagnosis slower.
+    /// Only [`ConnectError::is_transient`] failures are retried: a denial, an
+    /// endpoint too long to address or any other OS failure does not resolve by
+    /// waiting, and spending the budget first only makes the diagnosis slower.
     fn connect_until(endpoint: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
         loop {
             match Self::connect_once_until(endpoint, deadline) {
                 Ok(connected) => return Ok(connected),
-                Err(error @ (ConnectError::PermissionDenied | ConnectError::EndpointTooLong)) => {
-                    return Err(error);
-                }
+                Err(error) if !error.is_transient() => return Err(error),
                 Err(error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -82,19 +80,6 @@ pub trait Duplex: Sized {
     fn connect(endpoint: &Endpoint) -> Result<Self, ConnectError> {
         Self::connect_until(endpoint, Instant::now() + CONNECT_BUDGET)
     }
-
-    /// Reject another OS user before sending a preamble or handoff token.
-    fn verify_peer_user(&self) -> io::Result<()>;
-
-    /// Kernel-reported PID of the process at the other end of this connection.
-    ///
-    /// Stronger than trusting a discovery file, because the kernel reports it
-    /// for this connection. It is connection evidence, not executable identity:
-    /// keeping the connection open does not keep that process alive or reserve
-    /// its PID, and a passed or inherited descriptor can carry the connection to
-    /// another process. Open a [`ProcessHandle`] for exit tracking while the
-    /// connection is still open. See [`crate::peer`].
-    fn peer_pid(&self) -> io::Result<u32>;
 
     /// Arm or clear one absolute deadline for session establishment.
     fn set_read_deadline(&self, timeout: Option<Duration>) -> io::Result<()>;
@@ -179,22 +164,29 @@ pub use windows_socket as socket;
 
 /// Connection establishment failure, before application traffic is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectError {
-    /// No connection was established within the configured setup budget.
+    /// Nothing accepted the connection in time: the endpoint does not exist
+    /// yet, refused the connection, is busy, or the deadline passed.
     ConnectTimeout,
     /// The OS denied access to the endpoint.
     PermissionDenied,
     /// The endpoint path does not fit in a Unix socket address, so no attempt
     /// can succeed. See [`crate::socket_path`].
     EndpointTooLong,
+    /// The OS failed the attempt for another reason, which waiting does not fix.
+    Failed(io::ErrorKind),
 }
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::ConnectTimeout => "daemon connection timed out",
-            Self::PermissionDenied => "daemon endpoint permission denied",
-            Self::EndpointTooLong => "daemon endpoint path is too long for a Unix socket",
-        })
+        match self {
+            Self::ConnectTimeout => f.write_str("daemon connection timed out"),
+            Self::PermissionDenied => f.write_str("daemon endpoint permission denied"),
+            Self::EndpointTooLong => {
+                f.write_str("daemon endpoint path is too long for a Unix socket")
+            }
+            Self::Failed(kind) => write!(f, "daemon connection failed: {kind}"),
+        }
     }
 }
 impl std::error::Error for ConnectError {}
@@ -203,6 +195,20 @@ impl ConnectError {
     /// time, which includes an endpoint that does not exist yet.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::ConnectTimeout)
+    }
+}
+
+/// Classify a failed connection attempt, the same way on every platform.
+pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
+    use io::ErrorKind::{
+        ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted, NotConnected, NotFound,
+        PermissionDenied, TimedOut, WouldBlock,
+    };
+    match error.kind() {
+        PermissionDenied => ConnectError::PermissionDenied,
+        NotFound | ConnectionRefused | TimedOut | WouldBlock | Interrupted | ConnectionReset
+        | ConnectionAborted | NotConnected => ConnectError::ConnectTimeout,
+        kind => ConnectError::Failed(kind),
     }
 }
 
@@ -234,3 +240,118 @@ pub mod windows_socket;
 pub(crate) mod command_line;
 #[cfg(all(windows, feature = "launch"))]
 pub(crate) mod windows_spawn;
+
+#[cfg(test)]
+mod connect_error_tests {
+    use super::{ConnectError, connect_error};
+    use std::io::{self, ErrorKind};
+
+    #[test]
+    fn only_an_endpoint_nothing_serves_yet_is_worth_retrying() {
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+        ] {
+            let error = connect_error(&kind.into());
+            assert_eq!(error, ConnectError::ConnectTimeout, "{kind:?}");
+            assert!(error.is_transient());
+        }
+        assert_eq!(
+            connect_error(&ErrorKind::PermissionDenied.into()),
+            ConnectError::PermissionDenied
+        );
+        let other = connect_error(&ErrorKind::InvalidInput.into());
+        assert_eq!(other, ConnectError::Failed(ErrorKind::InvalidInput));
+        assert!(!other.is_transient());
+        assert!(!ConnectError::PermissionDenied.is_transient());
+        assert!(!ConnectError::EndpointTooLong.is_transient());
+    }
+
+    #[test]
+    fn a_busy_pipe_is_retried_only_on_windows() {
+        #[cfg(windows)]
+        let busy = super::windows::connect_error(&io::Error::from_raw_os_error(231));
+        #[cfg(not(windows))]
+        let busy = connect_error(&io::Error::from_raw_os_error(231));
+        if cfg!(windows) {
+            assert_eq!(busy, ConnectError::ConnectTimeout);
+        } else {
+            assert_ne!(busy, ConnectError::ConnectTimeout);
+        }
+    }
+
+    #[test]
+    fn a_temporary_connection_failure_is_retried_until_the_endpoint_accepts() {
+        use super::{Duplex, Endpoint, PlatformDuplex, peer::PeerCredentials};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        struct StartsAfterOneAttempt;
+        impl PeerCredentials for StartsAfterOneAttempt {
+            fn credentials(&self) -> io::Result<crate::peer::Credentials> {
+                unreachable!()
+            }
+        }
+        impl Duplex for StartsAfterOneAttempt {
+            type Reader = <PlatformDuplex as Duplex>::Reader;
+            type Writer = <PlatformDuplex as Duplex>::Writer;
+            fn connect_once_until(
+                _: &Endpoint,
+                _: std::time::Instant,
+            ) -> Result<Self, ConnectError> {
+                if ATTEMPTS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(ConnectError::ConnectTimeout)
+                } else {
+                    Ok(Self)
+                }
+            }
+            fn set_read_deadline(&self, _: Option<std::time::Duration>) -> io::Result<()> {
+                unreachable!()
+            }
+            fn split(self) -> io::Result<(Self::Reader, Self::Writer)> {
+                unreachable!()
+            }
+        }
+        #[cfg(unix)]
+        let endpoint = std::path::Path::new("unused");
+        #[cfg(windows)]
+        let endpoint = "unused";
+        assert!(
+            StartsAfterOneAttempt::connect_until(
+                endpoint,
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+        assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn every_failure_says_what_happened() {
+        let cases = [
+            (ConnectError::ConnectTimeout, "daemon connection timed out"),
+            (
+                ConnectError::PermissionDenied,
+                "daemon endpoint permission denied",
+            ),
+            (
+                ConnectError::EndpointTooLong,
+                "daemon endpoint path is too long for a Unix socket",
+            ),
+            (
+                ConnectError::Failed(ErrorKind::InvalidInput),
+                "daemon connection failed: invalid input parameter",
+            ),
+        ];
+        for (error, text) in cases {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+}
+
+mod readiness;

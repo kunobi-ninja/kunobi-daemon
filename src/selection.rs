@@ -31,6 +31,7 @@ use crate::readiness::POLL_INTERVAL;
 
 /// What an observer may report about a candidate it does not drive.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Selection<P> {
     /// A fresh probe proved the candidate is serving.
     Current(P),
@@ -42,7 +43,7 @@ pub enum Selection<P> {
     NotCommitted,
 }
 
-/// Two independent bounds, both measured from the start of the wait.
+/// A startup bound and a separate proof bound beginning at the observed commit.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
     /// Longest wait for the selection to name the candidate at all. This covers

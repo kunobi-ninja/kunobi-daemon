@@ -28,6 +28,7 @@ mod lifecycle;
 pub mod observation;
 mod ownership;
 pub mod peer;
+mod pid;
 mod publication;
 pub mod readiness;
 pub mod replacement;
@@ -47,6 +48,7 @@ pub use identity::{CONTROL_SOCKET, ServiceIdentity, ServicePaths};
 #[cfg(feature = "async")]
 pub use lifecycle::{DrainOutcome, Lifecycle, LifecycleSnapshot, RequestGuard};
 pub use ownership::ProcessLock;
+pub use pid::ProcessId;
 pub use publication::{RecordSlot, publish_record};
 #[cfg(feature = "async")]
 pub use upgrade::{UpgradeError, ensure_current};

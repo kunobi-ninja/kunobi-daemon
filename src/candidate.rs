@@ -29,8 +29,8 @@ impl Candidate {
         }
     }
     /// OS process identity used by the live verifier.
-    pub fn id(&self) -> u32 {
-        self.process.as_ref().expect("candidate owns child").id()
+    pub fn id(&self) -> crate::ProcessId {
+        crate::ProcessId::of(self.process.as_ref().expect("candidate owns child"))
     }
     /// Observe whether the candidate exited before readiness.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -96,7 +96,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let pid = child.id();
+        let pid = crate::ProcessId::of(&child);
         let mut candidate = super::Candidate::new(child);
         assert!(candidate.exit.is_some());
         assert_eq!(candidate.exit_handle().unwrap().pid(), pid);

@@ -3,10 +3,8 @@
 #[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kunobi_daemon::{
-        Candidate, ProcessLock, ServiceIdentity,
-        local::{Duplex, unix::UnixDuplex},
+        Candidate, ProcessLock, ServiceIdentity, client,
         replacement::{self, Budgets, Driver, Mode, Progress, Step},
-        transport::SplitIo,
         wire::{self, capability, operation},
     };
     use std::{
@@ -23,12 +21,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     impl Managed {
         fn probe(&self, operation: u32, deadline: Instant) -> io::Result<wire::Health> {
-            let stream = UnixDuplex::connect_once_until(&self.root.join("control.sock"), deadline)
-                .map_err(io::Error::other)?;
-            stream.verify_peer_user()?;
-            let pid = stream.peer_pid()?;
-            stream.set_read_deadline(Some(deadline.saturating_duration_since(Instant::now())))?;
-            let (read, write) = stream.split()?;
             let identity = ServiceIdentity::new([0x71; 16], "example-daemon", "demo", "default")
                 .map_err(io::Error::other)?;
             let offer = wire::Hello::new(
@@ -36,18 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN,
                 capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN,
             );
-            let mut session = wire::Session::connect(SplitIo { read, write }, &offer)?;
-            let request = wire::Control {
-                request_id: 1,
-                operation,
-                ..Default::default()
+            let request = if operation == operation::DRAIN {
+                client::drain
+            } else {
+                client::health
             };
-            session.send(&request)?;
-            let proof = wire::Health::from_response(&session.receive()?, &request)?;
-            if proof.process_id != pid {
-                return Err(io::Error::other("health differs from the kernel peer"));
-            }
-            Ok(proof)
+            request(&self.root.join("control.sock"), &offer, None, deadline)
+                .map_err(io::Error::other)
         }
     }
     impl Driver for Managed {
@@ -86,8 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(error)
                             if step == Step::Verify
                                 && error.get_ref().is_some_and(|source| {
-                                    source.downcast_ref::<kunobi_daemon::local::ConnectError>()
-                                        == Some(&kunobi_daemon::local::ConnectError::ConnectTimeout)
+                                    source
+                                        .downcast_ref::<client::RequestError>()
+                                        .is_some_and(client::RequestError::is_transient)
                                 }) =>
                         {
                             return Ok(Progress::Pending);

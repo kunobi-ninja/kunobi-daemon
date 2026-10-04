@@ -103,7 +103,8 @@ Each frame is a four-byte little-endian body length followed by one Protobuf
 message. Pre-negotiation frames are limited to 1024 bytes. Negotiated limits are
 between 256 and 65536 bytes, including encoded field overhead. Receivers reject
 oversized lengths before allocating the body, and never read past one frame.
-Buffers are reused. The implementation uses no unsafe Rust in this crate.
+Buffers are reused. The wire codec uses safe Rust; OS adapters keep their
+unsafe calls under `local`.
 
 Field tags in `Hello` and `Control` are permanent. Add optional fields with new
 tags; do not reuse removed tags or change their wire types. Unknown fields are retained when re-encoding, within a limit of 128 per message.

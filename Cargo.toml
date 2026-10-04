@@ -13,6 +13,9 @@ categories = ["os", "asynchronous"]
 # their tooling never reaches this crate's dependency graph or MSRV.
 autobenches = false
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["async"]
 async = ["dep:tokio", "tokio/macros"]

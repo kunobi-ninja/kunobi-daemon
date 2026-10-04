@@ -38,6 +38,7 @@ impl Default for Limits {
 
 /// One pool's observation; counters are independent atomic samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PoolSnapshot {
     /// Configured capacity.
     pub limit: usize,

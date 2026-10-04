@@ -14,6 +14,7 @@ pub use super::Bound;
 
 /// An OS error that is not normal listener contention.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BindError {
     /// Bind, naming or security descriptor failure.
     Io(io::Error),
@@ -92,7 +93,8 @@ fn next_step(
 fn live_same_user_peer(endpoint: &str) -> bool {
     matches!(
         super::windows::WindowsDuplex::connect_once(endpoint),
-        Ok(peer) if peer.verify_peer_user().is_ok()
+        Ok(peer) if crate::local::peer::PeerCredentials::credentials(&peer)
+            .is_ok_and(|credentials| credentials.same_user)
     )
 }
 

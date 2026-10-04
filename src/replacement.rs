@@ -50,6 +50,7 @@ pub enum Progress {
 
 /// A replacement result never implies replay of application work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     /// No replacement was performed.
     Unchanged,
@@ -61,6 +62,7 @@ pub enum Outcome {
 
 /// Failure retains the phase and whether selection has already committed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Failure<E> {
     /// Failed operation.
     pub step: Step,
@@ -72,6 +74,7 @@ pub struct Failure<E> {
 
 /// Cause of a replacement failure.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Reason<E> {
     /// Setup or the consumer's explicit drain budget expired.
     Deadline,
@@ -91,7 +94,14 @@ impl<E: std::fmt::Display> std::fmt::Display for Failure<E> {
         }
     }
 }
-impl<E: std::error::Error + 'static> std::error::Error for Failure<E> {}
+impl<E: std::error::Error + 'static> std::error::Error for Failure<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            Reason::Adapter(error) => Some(error),
+            Reason::Deadline | Reason::InvalidProgress => None,
+        }
+    }
+}
 
 /// Short setup budget and independent application-owned drain policy.
 #[derive(Clone, Copy, Debug)]
@@ -379,6 +389,32 @@ mod proofs {
                     return;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn an_adapter_failure_preserves_its_source() {
+        let failure = Failure {
+            step: Step::Start,
+            committed: false,
+            reason: Reason::Adapter(std::io::Error::other("failed to spawn")),
+        };
+        assert_eq!(
+            std::error::Error::source(&failure).unwrap().to_string(),
+            "failed to spawn"
+        );
+        for reason in [Reason::Deadline, Reason::InvalidProgress] {
+            let failure: Failure<std::io::Error> = Failure {
+                step: Step::Start,
+                committed: false,
+                reason,
+            };
+            assert!(std::error::Error::source(&failure).is_none());
         }
     }
 }

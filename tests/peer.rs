@@ -1,16 +1,15 @@
-//! Evidence from a local connection names the process at the other end, in
+//! Credentials from a local connection name the process at the other end, in
 //! both directions, and policies grant or refuse it. The listener and its peer
 //! are separate operating-system processes.
 
 #![cfg(feature = "local")]
 
-use kunobi_daemon::local::peer::evidence;
-use kunobi_daemon::peer::{
-    Evidence, ExpectedProcess, First, ProcessId, Rejected, SameUser, authenticate,
-};
+use kunobi_daemon::local::peer::PeerCredentials;
+use kunobi_daemon::peer::{Credentials, ExpectedProcess, First, Rejected, SameUser, authenticate};
+use kunobi_daemon::{Candidate, ProcessId};
 use std::{
     io::{Read, Write},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -23,17 +22,8 @@ fn own_pid() -> ProcessId {
     ProcessId::new(std::process::id()).unwrap()
 }
 
-/// Kills and reaps the child if the test fails before it exits.
-struct Reaped(Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
-}
+/// A fixture candidate is killed and reaped if the test fails before it exits.
+struct Reaped(Candidate);
 
 impl Reaped {
     fn spawn(endpoint: &str) -> Self {
@@ -46,28 +36,21 @@ impl Reaped {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Self(child)
+        Self(Candidate::new(child))
     }
 
     fn pid(&self) -> ProcessId {
-        ProcessId::new(self.0.id()).unwrap()
+        self.0.id()
     }
 
     /// Wait for the child to finish its own checks, within the budget.
     fn assert_succeeds(&mut self) {
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                assert!(status.success(), "the child's own checks failed: {status}");
-                return;
-            }
-            assert!(Instant::now() < deadline, "the child did not exit");
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "Bounded wait for a test child; std::process has no exit timeout."
-            )]
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let status = self
+            .0
+            .wait_until(Instant::now() + BUDGET)
+            .unwrap()
+            .expect("the child did not exit");
+        assert!(status.success(), "the child's own checks failed: {status}");
     }
 }
 
@@ -80,7 +63,10 @@ fn peer_fixture_process() {
     let server: u32 = std::env::var(SERVER_PID_ENV).unwrap().parse().unwrap();
     let mut stream = connect(&endpoint);
     let server_evidence = client_evidence(&stream);
-    assert_eq!(server_evidence, Evidence::new(ProcessId::new(server), true));
+    assert_eq!(
+        server_evidence,
+        Credentials::new(ProcessId::new(server), true)
+    );
     let accepted = authenticate(
         &stream,
         server_evidence,
@@ -92,8 +78,8 @@ fn peer_fixture_process() {
 }
 
 /// The parent's checks on the connection it accepted from `child`.
-fn check_accepted(peer: Evidence, child: ProcessId, announced: [u8; 4]) {
-    assert_eq!(peer, Evidence::new(Some(child), true));
+fn check_accepted(peer: Credentials, child: ProcessId, announced: [u8; 4]) {
+    assert_eq!(peer, Credentials::new(Some(child), true));
     assert_eq!(peer.pid, ProcessId::new(u32::from_le_bytes(announced)));
     assert_ne!(peer.pid, Some(own_pid()));
 
@@ -105,16 +91,16 @@ fn check_accepted(peer: Evidence, child: ProcessId, announced: [u8; 4]) {
             .then(SameUser, "redacted")
     };
     assert_eq!(
-        authenticate((), peer, &tiers(Some(child))).map(|a| *a.grant()),
+        authenticate((), peer.clone(), &tiers(Some(child))).map(|a| *a.grant()),
         Ok("full")
     );
     assert_eq!(
-        authenticate((), peer, &tiers(Some(own_pid()))).map(|a| *a.grant()),
+        authenticate((), peer.clone(), &tiers(Some(own_pid()))).map(|a| *a.grant()),
         Ok("redacted")
     );
     assert_eq!(
         authenticate((), peer, &ExpectedProcess::new(|| Some(own_pid()))).unwrap_err(),
-        Rejected::Different {
+        Rejected::OtherProcess {
             expected: own_pid(),
             observed: child
         }
@@ -139,7 +125,6 @@ fn accept_within_budget<S: Send + 'static>(
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use std::os::fd::AsFd;
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub(super) fn connect(endpoint: &str) -> UnixStream {
@@ -148,8 +133,8 @@ mod platform {
         stream
     }
 
-    pub(super) fn client_evidence(stream: &UnixStream) -> Evidence {
-        evidence(stream.as_fd()).unwrap()
+    pub(super) fn client_evidence(stream: &UnixStream) -> Credentials {
+        stream.credentials().unwrap()
     }
 
     #[test]
@@ -163,7 +148,7 @@ mod platform {
         stream.set_read_timeout(Some(BUDGET)).unwrap();
         let mut announced = [0u8; 4];
         stream.read_exact(&mut announced).unwrap();
-        check_accepted(evidence(stream.as_fd()).unwrap(), child.pid(), announced);
+        check_accepted(stream.credentials().unwrap(), child.pid(), announced);
 
         drop(stream);
         child.assert_succeeds();
@@ -182,8 +167,8 @@ mod platform {
         Stream::connect(endpoint.to_ns_name::<GenericNamespaced>().unwrap()).unwrap()
     }
 
-    pub(super) fn client_evidence(stream: &Stream) -> Evidence {
-        evidence(stream).unwrap()
+    pub(super) fn client_evidence(stream: &Stream) -> Credentials {
+        stream.credentials().unwrap()
     }
 
     #[test]
@@ -202,7 +187,7 @@ mod platform {
         let mut stream = accept_within_budget(move || listener.accept());
         let mut announced = [0u8; 4];
         stream.read_exact(&mut announced).unwrap();
-        check_accepted(evidence(&stream).unwrap(), child.pid(), announced);
+        check_accepted(stream.credentials().unwrap(), child.pid(), announced);
 
         drop(stream);
         child.assert_succeeds();

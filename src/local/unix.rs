@@ -133,9 +133,9 @@ fn reap_exited_children() {
 
 use std::os::fd::{AsRawFd, RawFd};
 
+/// The PID `LOCAL_PEERPID` reports: the socket's most recent owner.
 #[cfg(target_os = "macos")]
-/// Read the OS process identity attached to an established local connection.
-pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
+fn macos_peer_pid(fd: RawFd) -> io::Result<u32> {
     use std::os::raw::{c_int, c_void};
     unsafe extern "C" {
         fn getsockopt(
@@ -168,16 +168,28 @@ pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
     }
 }
 
+/// [`Credentials`](crate::peer::Credentials) for a connected Unix socket. See
+/// [`super::peer`] for what they describe on each platform.
 #[cfg(not(target_os = "macos"))]
-/// Read the OS process identity attached to an established local connection.
-///
-/// Fails when the kernel reports no PID, for example for a peer in another
-/// PID namespace; [`peer_uid`] still succeeds for that peer.
-pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
-    peer_credentials(fd)?
-        .0
-        .ok_or_else(|| io::Error::other("peer PID is not visible in this PID namespace"))
+pub(crate) fn fd_credentials(fd: RawFd) -> io::Result<crate::peer::Credentials> {
+    let (pid, uid) = peer_credentials(fd)?;
+    Ok(crate::peer::Credentials::new(
+        pid.and_then(crate::ProcessId::new),
+        uid == own_uid(),
+    ))
 }
+
+/// [`Credentials`](crate::peer::Credentials) for a connected Unix socket. See
+/// [`super::peer`] for what they describe on each platform.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_credentials(fd: RawFd) -> io::Result<crate::peer::Credentials> {
+    let same_user = macos_peer_uid(fd)? == own_uid();
+    let pid = crate::ProcessId::new(macos_peer_pid(fd)?);
+    Ok(crate::peer::Credentials::new(pid, same_user))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos_credentials as fd_credentials;
 
 /// The peer's PID, when visible in this PID namespace, and its user ID.
 #[cfg(not(target_os = "macos"))]
@@ -231,7 +243,7 @@ fn visible_pid(raw: std::os::raw::c_int) -> Option<u32> {
 }
 
 /// Current effective OS user ID.
-pub fn own_uid() -> u32 {
+pub(crate) fn own_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
@@ -241,34 +253,19 @@ pub fn own_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-/// Effective user ID reported by the kernel for a still-open Unix socket.
-pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
-    #[cfg(target_os = "macos")]
-    let peer = {
-        unsafe extern "C" {
-            fn getpeereid(fd: RawFd, uid: *mut u32, gid: *mut u32) -> i32;
-        }
-        let (mut uid, mut gid) = (0, 0);
-        // SAFETY: fd is a live socket; both output pointers are valid u32 values.
-        if unsafe { getpeereid(fd, &mut uid, &mut gid) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        uid
-    };
-    #[cfg(not(target_os = "macos"))]
-    let peer = peer_credentials(fd)?.1;
-    Ok(peer)
-}
-
-fn verify_peer_user(fd: RawFd) -> io::Result<()> {
-    if peer_uid(fd)? == own_uid() {
-        Ok(())
-    } else {
-        Err(io::ErrorKind::PermissionDenied.into())
+/// The user `getpeereid` reports for a connected socket, captured at connect.
+#[cfg(target_os = "macos")]
+fn macos_peer_uid(fd: RawFd) -> io::Result<u32> {
+    unsafe extern "C" {
+        fn getpeereid(fd: RawFd, uid: *mut u32, gid: *mut u32) -> i32;
     }
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: fd is a live socket; both output pointers are valid u32 values.
+    if unsafe { getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uid)
 }
-
-pub use super::process::{process_has_exited, process_state};
 
 /// What `kill(pid, 0)` and, on Linux, `/proc` establish about `pid`.
 ///
@@ -556,34 +553,33 @@ fn mark_inherited_descriptors_cloexec(limit: libc::c_int) {
     }
 }
 
-/// One-time compatibility fallback for a protocol-v1 peer that cannot drain.
-pub fn terminate_legacy_peer(pid: u32) -> io::Result<()> {
+/// One-time compatibility fallback for a protocol-v1 peer that cannot drain:
+/// send it SIGTERM.
+///
+/// The signal reaches whichever process has `pid` now. Take the PID from the
+/// credentials of a live connection to that peer, and prefer draining: a PID
+/// can be reused once its process has exited.
+pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
     use std::os::raw::c_int;
     unsafe extern "C" {
         fn kill(pid: c_int, signal: c_int) -> c_int;
     }
     const SIGTERM: c_int = 15;
-    // SAFETY: the PID came from kernel credentials on the still-live socket;
-    // this never trusts a stale discovery record.
-    if unsafe { kill(pid as c_int, SIGTERM) } == 0 {
+    // A PID above i32::MAX would turn negative and address a process group.
+    let pid = c_int::try_from(pid.get())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID out of range"))?;
+    // SAFETY: kill takes two integers and dereferences nothing; `pid` is
+    // positive, so it names one process rather than a group.
+    if unsafe { kill(pid, SIGTERM) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
-impl UnixDuplex {
-    /// [`crate::peer::Evidence`] about the service at the other end, for
-    /// [`crate::peer::authenticate`].
-    pub fn evidence(&self) -> io::Result<crate::peer::Evidence> {
-        use std::os::fd::AsFd;
-        super::peer::evidence(self.stream.as_fd())
-    }
-}
-
-impl super::peer::PeerEvidence for UnixDuplex {
-    fn evidence(&self) -> io::Result<crate::peer::Evidence> {
-        UnixDuplex::evidence(self)
+impl super::peer::PeerCredentials for UnixDuplex {
+    fn credentials(&self) -> io::Result<crate::peer::Credentials> {
+        fd_credentials(self.stream.as_raw_fd())
     }
 }
 
@@ -615,27 +611,7 @@ impl Duplex for UnixDuplex {
                 stream,
                 read_deadline: Cell::new(None),
             })
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    ConnectError::PermissionDenied
-                } else {
-                    ConnectError::ConnectTimeout
-                }
-            })
-    }
-
-    /// Reject another OS user before sending a preamble or handoff token.
-    fn verify_peer_user(&self) -> io::Result<()> {
-        verify_peer_user(self.stream.as_raw_fd())
-    }
-
-    /// Kernel-reported PID of the process at the other end of this socket.
-    ///
-    /// Stronger than trusting the discovery file's PID because the kernel
-    /// reports it for this connection; see [`Duplex::peer_pid`] for what it
-    /// does not prove.
-    fn peer_pid(&self) -> io::Result<u32> {
-        peer_pid(self.stream.as_raw_fd())
+            .map_err(|error| super::connect_error(&error))
     }
 
     /// Arm one absolute deadline for the whole session-establishment phase.
@@ -865,6 +841,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::local::peer::PeerCredentials as _;
     use std::os::unix::net::UnixListener;
 
     #[test]
@@ -905,13 +882,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "child fixture for legacy peer termination"]
+    fn legacy_peer_waits_for_input() {
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+    }
+
+    #[test]
+    fn legacy_termination_signals_only_its_child_and_reports_os_failures() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local::unix::tests::legacy_peer_waits_for_input",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = crate::Candidate::new(child);
+        terminate_legacy_peer(child.id()).unwrap();
+        let status = child
+            .wait_until(Instant::now() + Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(15));
+        let missing = crate::ProcessId::new(i32::MAX as u32).unwrap();
+        assert_eq!(
+            terminate_legacy_peer(missing).unwrap_err().raw_os_error(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn terminating_a_pid_outside_the_process_range_is_refused() {
+        let error = terminate_legacy_peer(crate::ProcessId::new(u32::MAX).unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn process_state_reports_alive_exited_and_unknown() {
-        use super::super::ProcessState;
-        assert_eq!(process_state(std::process::id()), ProcessState::Alive);
-        assert_eq!(process_state(0), ProcessState::Unknown);
-        assert_eq!(process_state(u32::MAX), ProcessState::Unknown);
+        use super::super::{ProcessState, process_has_exited, process_state};
+        use crate::ProcessId;
+        assert_eq!(process_state(ProcessId::current()), ProcessState::Alive);
+        assert_eq!(
+            process_state(ProcessId::new(u32::MAX).unwrap()),
+            ProcessState::Unknown
+        );
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
+        let pid = ProcessId::of(&child);
         child.wait().unwrap();
         // Reaped, so the PID is gone (barring reuse within this test).
         assert_eq!(process_state(pid), ProcessState::Exited);
@@ -1017,7 +1038,7 @@ mod tests {
     fn a_new_session_child_is_watched_from_its_spawn() {
         let mut command = std::process::Command::new("true");
         let (mut child, mut exit) = spawn_in_new_session_watched(&mut command, None).unwrap();
-        assert_eq!(exit.pid(), child.id());
+        assert_eq!(exit.pid(), crate::ProcessId::of(&child));
         exit.wait().unwrap();
         assert!(child.wait().unwrap().success());
     }
@@ -1028,14 +1049,14 @@ mod tests {
         command.arg("30");
         let mut pid = None;
         let error = spawn_then(&mut command, |child| {
-            pid = Some(child.id());
+            pid = Some(crate::ProcessId::of(child));
             Err::<(), _>(io::Error::other("watch failed"))
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "watch failed");
         // Stopped and reaped: no process has the PID any more.
         assert_eq!(
-            process_state(pid.unwrap()),
+            super::super::process_state(pid.unwrap()),
             super::super::ProcessState::Exited
         );
     }
@@ -1090,7 +1111,7 @@ mod tests {
             let _ = wait.recv_timeout(Duration::from_secs(2));
         });
         let transport = UnixDuplex::connect(&path).unwrap();
-        transport.verify_peer_user().unwrap();
+        assert!(transport.credentials().unwrap().same_user);
         transport
             .set_read_deadline(Some(Duration::from_millis(100)))
             .unwrap();
@@ -1109,8 +1130,8 @@ mod tests {
             stream,
             read_deadline: Cell::new(None),
         };
-        transport.verify_peer_user().unwrap();
-        assert!(verify_peer_user(-1).is_err());
+        assert!(transport.credentials().unwrap().same_user);
+        assert!(fd_credentials(-1).is_err());
         transport
             .set_read_deadline(Some(Duration::from_millis(1)))
             .unwrap();

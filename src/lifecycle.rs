@@ -49,7 +49,7 @@ impl Lifecycle {
         }
     }
 
-    fn record(&self, event: crate::observation::Event) {
+    pub(crate) fn record(&self, event: crate::observation::Event) {
         if let Some(observations) = &self.observations {
             observations.record(event);
         }
@@ -157,6 +157,7 @@ impl Lifecycle {
 
 /// Current request admission and drain state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LifecycleSnapshot {
     /// Admitted requests whose guards have not been dropped.
     pub active: usize,
@@ -168,6 +169,7 @@ pub struct LifecycleSnapshot {
 
 /// Result of closing admission and waiting for admitted operations.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DrainOutcome {
     /// Every admitted operation released its guard.
     Complete,

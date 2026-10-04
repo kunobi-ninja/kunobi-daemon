@@ -5,6 +5,7 @@ use std::process::{Child, ExitStatus};
 use std::time::Instant;
 
 use super::ProcessState;
+use crate::ProcessId;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod pidfd;
@@ -121,7 +122,7 @@ enum Source {
 /// when the handle could not be opened at all.
 #[derive(Debug)]
 pub struct ProcessHandle {
-    pid: u32,
+    pid: ProcessId,
     source: Source,
 }
 
@@ -129,8 +130,7 @@ impl ProcessHandle {
     /// Watch the process that has `pid` now.
     ///
     /// A process that already exited, or a PID no process has, gives a
-    /// handle that reports the exit at once. PID 0 is refused with
-    /// `InvalidInput`.
+    /// handle that reports the exit at once.
     ///
     /// The process need not be a child. Linux takes the PID in this
     /// process's PID namespace, and macOS lets any process be watched.
@@ -141,16 +141,10 @@ impl ProcessHandle {
     ///
     /// A PID read from a discovery record may already name another process.
     /// Take it from the peer credentials of a live connection instead
-    /// ([`super::Duplex::peer_pid`]), and open the handle while that
+    /// ([`super::peer::PeerCredentials`]), and open the handle while that
     /// connection is still open.
-    pub fn open(pid: u32) -> io::Result<Self> {
-        if pid == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "PID 0 names no single process",
-            ));
-        }
-        let source = match sys::open(pid)? {
+    pub fn open(pid: ProcessId) -> io::Result<Self> {
+        let source = match sys::open(pid.get())? {
             Opened::Watching(event) => Source::Event(event),
             Opened::Gone => Source::Exited,
             #[cfg(unix)]
@@ -167,11 +161,11 @@ impl ProcessHandle {
     /// its children reaped by the kernel as they exit, and there a child can
     /// be gone, and its PID reused, before this runs.
     pub fn for_child(child: &Child) -> io::Result<Self> {
-        Self::open(child.id())
+        Self::open(ProcessId::of(child))
     }
 
     /// The PID this handle was opened with.
-    pub fn pid(&self) -> u32 {
+    pub fn pid(&self) -> ProcessId {
         self.pid
     }
 
@@ -208,7 +202,7 @@ impl ProcessHandle {
             Source::Event(event) => event.wait(deadline)?,
             Source::Exited => true,
             #[cfg(unix)]
-            Source::Pid => pid_wait(self.pid, deadline)?,
+            Source::Pid => pid_wait(self.pid.get(), deadline)?,
         };
         if exited {
             // A kqueue reports the exit once; remember it, and release the
@@ -232,7 +226,7 @@ impl ProcessHandle {
             #[cfg(unix)]
             Source::Pid => {
                 let mut pause = crate::backoff::FIRST;
-                while !pid_exited(self.pid)? {
+                while !pid_exited(self.pid.get())? {
                     let nap = crate::backoff::next_pause(&mut pause, None).expect("no deadline");
                     #[expect(
                         clippy::disallowed_methods,
@@ -264,16 +258,16 @@ impl ProcessHandle {
 /// handle cannot be opened, for example because access was denied, Unix
 /// falls back to `kill(pid, 0)`, which reports a process this user may not
 /// signal as alive, and Windows reports `Unknown`.
-pub fn process_state(pid: u32) -> ProcessState {
+pub fn process_state(pid: ProcessId) -> ProcessState {
     match ProcessHandle::open(pid).and_then(|mut handle| handle.has_exited()) {
         Ok(true) => ProcessState::Exited,
         Ok(false) => ProcessState::Alive,
-        Err(_) => fallback_state(pid),
+        Err(_) => fallback_state(pid.get()),
     }
 }
 
 /// True only when the OS establishes that a previously verified PID exited.
-pub fn process_has_exited(pid: u32) -> bool {
+pub fn process_has_exited(pid: ProcessId) -> bool {
     process_state(pid) == ProcessState::Exited
 }
 
@@ -373,7 +367,7 @@ mod tests {
     fn the_exit_event_fires_only_once_the_process_exits() {
         let mut child = blocked_child();
         let mut exit = ProcessHandle::for_child(&child).unwrap();
-        assert_eq!(exit.pid(), child.id());
+        assert_eq!(exit.pid(), ProcessId::of(&child));
         assert!(!exit.is_pid_only(), "no exit event on this system");
         assert!(!exit.has_exited().unwrap());
 
@@ -431,10 +425,10 @@ mod tests {
         first.wait().unwrap();
 
         // Exited, not yet waited for: its PID still names it.
-        let mut late = ProcessHandle::open(child.id()).unwrap();
+        let mut late = ProcessHandle::open(ProcessId::of(&child)).unwrap();
         assert!(late.has_exited().unwrap());
-        assert_eq!(process_state(child.id()), ProcessState::Exited);
-        assert!(process_has_exited(child.id()));
+        assert_eq!(process_state(ProcessId::of(&child)), ProcessState::Exited);
+        assert!(process_has_exited(ProcessId::of(&child)));
         assert_eq!(child.wait().unwrap().code(), Some(3));
     }
 
@@ -444,23 +438,18 @@ mod tests {
         release(&mut child);
         child.wait().unwrap();
         // Reaped, so no process has the PID (barring reuse within this test).
-        let mut exit = ProcessHandle::open(child.id()).unwrap();
+        let mut exit = ProcessHandle::open(ProcessId::of(&child)).unwrap();
         assert!(exit.has_exited().unwrap());
         exit.wait().unwrap();
-        assert_eq!(process_state(child.id()), ProcessState::Exited);
+        assert_eq!(process_state(ProcessId::of(&child)), ProcessState::Exited);
     }
 
     #[test]
-    fn the_current_process_is_alive_and_pid_zero_is_refused() {
-        let mut own = ProcessHandle::open(std::process::id()).unwrap();
+    fn the_current_process_is_alive() {
+        let mut own = ProcessHandle::open(ProcessId::current()).unwrap();
         assert!(!own.has_exited().unwrap());
-        assert_eq!(process_state(std::process::id()), ProcessState::Alive);
-        assert!(!process_has_exited(std::process::id()));
-
-        let error = ProcessHandle::open(0).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(process_state(0), ProcessState::Unknown);
-        assert!(!process_has_exited(0));
+        assert_eq!(process_state(ProcessId::current()), ProcessState::Alive);
+        assert!(!process_has_exited(ProcessId::current()));
     }
 
     #[test]
@@ -483,7 +472,7 @@ mod tests {
     #[cfg(unix)]
     fn pid_only(child: &Child) -> ProcessHandle {
         ProcessHandle {
-            pid: child.id(),
+            pid: ProcessId::of(child),
             source: Source::Pid,
         }
     }

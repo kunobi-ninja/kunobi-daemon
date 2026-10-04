@@ -1,14 +1,17 @@
 //! The blocking control client against a real control service, and against a
 //! server that misreports its process.
 
-#![cfg(all(unix, feature = "wire-async", feature = "local"))]
+#![cfg(all(unix, feature = "wire-async", feature = "local-async"))]
 
+use kunobi_daemon::ProcessId;
 use kunobi_daemon::{
     Lifecycle, ServiceIdentity,
+    admission::{Admission, Limits, Pool},
     client::{self, RequestError},
     control::ControlService,
     local::unix_socket::{self, Bound},
-    peer::{ProcessId, Rejected},
+    peer::{Rejected, SameUser},
+    serve::serve,
     wire::{self, Health, Hello, capability},
 };
 use std::{
@@ -49,15 +52,25 @@ fn spawn_service(listener: tokio::net::UnixListener) -> Arc<Lifecycle> {
         1,
     ));
     service.mark_ready();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let service = Arc::clone(&service);
-            tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                let _ = service.serve(stream, &offer(), deadline).await;
-            });
-        }
-    });
+    tokio::spawn(
+        serve(
+            listener,
+            Arc::clone(&lifecycle),
+            Arc::new(Admission::new(Limits::default())),
+            SameUser,
+        )
+        .run(
+            |()| Pool::Control,
+            move |stream, permit| {
+                let service = Arc::clone(&service);
+                async move {
+                    let _permit = permit;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let _ = service.serve(stream, &offer(), deadline).await;
+                }
+            },
+        ),
+    );
     lifecycle
 }
 
@@ -95,7 +108,7 @@ async fn a_peer_that_is_not_the_expected_process_is_refused() {
     assert!(
         matches!(
             error,
-            RequestError::Peer(Rejected::Different { expected, observed })
+            RequestError::Peer(Rejected::OtherProcess { expected, observed })
                 if expected == other && observed == own_pid()
         ),
         "{error:?}"
