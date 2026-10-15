@@ -86,7 +86,8 @@ across individual reads and writes. The async adapter can be wrapped in
 
 1. Client writes the eight bytes `KNDPB002`, then its framed `Hello`.
 2. Server validates the application identifier, version overlap, required
-   capabilities and frame limits. It replies with its framed `Hello`.
+   capabilities and frame limits. It replies with its framed `Hello`, or with
+   a refusal and closes (see below).
 3. Client independently validates the agreement and writes byte `1`.
 4. Server reads that acceptance and writes byte `1`.
 5. Both sides may now exchange framed `Control` messages.
@@ -96,6 +97,37 @@ currently selects binary version 2. Unknown optional capability bits are ignored
 unknown required bits fail the connection. A supported capability must have its
 handler installed by the application. Application operations require their own stable registry and capability
 negotiation within that service identity.
+
+## Refusals
+
+A server that will not serve a client can say why before it closes:
+
+| `Refused` | Sent when | The client should |
+| --- | --- | --- |
+| `ProtocolTooOld` | `Session::accept` finds the client's newest version older than the server's, or the client lacks a capability the server requires | Stop retrying with this build |
+| `PeerRejected` | The server calls `refuse` for a peer its policy rejected | Not retry as this process |
+| `Retiring` | The server calls `refuse` while it retires | Read discovery again for the successor |
+
+The refusal replaces the server's `Hello`: a `Hello` whose only field is
+`refusal`. `Session::connect` and `AsyncSession::connect` return it as an
+`io::ErrorKind::ConnectionRefused` error; `Refused::of(&error)` reads the
+reason. A refusal with a reason this build does not know is still refused.
+`Session::refuse` and `AsyncSession::refuse` read the client's offer, send the
+refusal and close. `serve::serve` drops rejected peers before any handler runs;
+a server that wants to send `PeerRejected` reads the offer in its own handler.
+
+A server sends a refusal only to a client whose offer sets `reads_refusal`.
+`Hello::new` sets it. Every other client sees the connection close, as it did
+before refusals existed, and so does a client that names another service or
+sends a malformed offer. A server too old for the client, for example one
+that lacks a capability the client requires, also closes without a reason.
+A new client that meets an older server sees that same close as an ordinary
+I/O error, never as a refusal.
+
+Refusals add optional fields to `Hello`; `wire::VERSION` stays 2. The
+cross-version CI job runs the current server in retiring mode against both
+the current and the previous client, and accepts only schema changes that
+keep every existing line.
 
 ## Frames and evolution
 

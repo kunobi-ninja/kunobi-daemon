@@ -109,6 +109,8 @@ pub mod operation {
 impl Hello {
     /// Offer capabilities for a stable service installation. Use the same
     /// identity to derive resource paths and negotiate on both endpoints.
+    /// The offer reads refusals: [`Session::connect`] reports a server's
+    /// [`Refused`] reason.
     pub fn new(identity: &ServiceIdentity, supported: u64, required: u64) -> Self {
         Self {
             minimum: VERSION,
@@ -120,6 +122,7 @@ impl Hello {
             profile: identity.profile().into(),
             instance: identity.instance().into(),
             service_id: identity.id().to_vec(),
+            reads_refusal: true,
             ..Default::default()
         }
     }
@@ -207,14 +210,15 @@ pub struct Agreement {
 pub fn negotiate(local: &Hello, remote: &Hello) -> io::Result<Agreement> {
     local.validate()?;
     remote.validate()?;
-    if local.service_id != remote.service_id
-        || local.application != remote.application
-        || local.profile != remote.profile
-        || local.instance != remote.instance
-    {
+    if !same_service(local, remote) {
         return Err(invalid("service identity mismatch"));
     }
     Terms::of(local).agree(Terms::of(remote))
+}
+
+fn same_service(a: &Hello, b: &Hello) -> bool {
+    (&a.service_id, &a.application, &a.profile, &a.instance)
+        == (&b.service_id, &b.application, &b.profile, &b.instance)
 }
 
 fn required_capability(message: &Control) -> io::Result<u64> {
@@ -256,6 +260,49 @@ impl Refused {
     pub fn of(error: &io::Error) -> Option<Self> {
         error.get_ref()?.downcast_ref::<Self>().copied()
     }
+
+    /// The frame refusing `remote`, if that client reads refusals and names the
+    /// service `offer` serves. A wrong identity gets no reply, as before.
+    fn frame(self, offer: &Hello, remote: &Hello) -> Option<Hello> {
+        let reason = match self {
+            Self::ProtocolTooOld => Refusal::PROTOCOL_TOO_OLD,
+            Self::PeerRejected => Refusal::PEER_REJECTED,
+            Self::Retiring => Refusal::SERVER_RETIRING,
+        };
+        (remote.reads_refusal && same_service(offer, remote)).then(|| Hello {
+            refusal: reason.into(),
+            ..Default::default()
+        })
+    }
+}
+
+/// What a server sends before closing on a failed negotiation: a refusal only
+/// to a well-formed offer that lacks a version or capability `offer` requires.
+/// A server too old for the client, or a malformed offer, gets only the close.
+fn rejection(offer: &Hello, remote: &Hello) -> Option<Hello> {
+    let too_old = remote.maximum < VERSION || offer.required & !remote.supported != 0;
+    if too_old && Terms::of(remote).valid() {
+        Refused::ProtocolTooOld.frame(offer, remote)
+    } else {
+        None
+    }
+}
+
+/// Fail with the server's refusal if `remote` is one rather than an offer.
+fn check_refusal(remote: &Hello) -> io::Result<()> {
+    let refused = match remote.refusal.as_known() {
+        Some(Refusal::NOT_REFUSED) => return Ok(()),
+        Some(Refusal::PROTOCOL_TOO_OLD) => Refused::ProtocolTooOld,
+        Some(Refusal::PEER_REJECTED) => Refused::PeerRejected,
+        Some(Refusal::SERVER_RETIRING) => Refused::Retiring,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection refused for an unknown reason",
+            ));
+        }
+    };
+    Err(refused.into())
 }
 
 impl fmt::Display for Refused {
@@ -388,6 +435,7 @@ impl<S: Read + Write> Session<S> {
         let mut frames = Framed::new(io, HELLO_LIMIT)?;
         frames.send(offer)?;
         let remote: Hello = frames.receive()?;
+        check_refusal(&remote)?;
         let agreement = negotiate(offer, &remote)?;
         frames.io.write_all(&[1])?;
         frames.io.flush()?;
@@ -398,16 +446,19 @@ impl<S: Read + Write> Session<S> {
 
     /// Admit a connection on the separate v2 listener, after authenticating its
     /// OS peer. No request is dispatched if either peer rejects the negotiation.
-    pub fn accept(mut io: S, offer: &Hello) -> io::Result<Self> {
+    pub fn accept(io: S, offer: &Hello) -> io::Result<Self> {
         offer.validate()?;
-        let mut magic = [0; 8];
-        io.read_exact(&mut magic)?;
-        if magic != MAGIC {
-            return Err(invalid("wrong binary protocol magic"));
-        }
-        let mut frames = Framed::new(io, HELLO_LIMIT)?;
-        let remote: Hello = frames.receive()?;
-        let agreement = negotiate(offer, &remote)?;
+        let (mut frames, remote) = Self::offered(io)?;
+        let agreement = match negotiate(offer, &remote) {
+            Ok(agreement) => agreement,
+            Err(error) => {
+                if let Some(refusal) = rejection(offer, &remote) {
+                    // The failed negotiation is the error to report.
+                    let _ = frames.send(&refusal);
+                }
+                return Err(error);
+            }
+        };
         frames.send(offer)?;
         read_acceptance(&mut frames.io)?;
         frames.io.write_all(&[1])?;
@@ -421,9 +472,23 @@ impl<S: Read + Write> Session<S> {
     /// A client that does not read refusals, or that names another service,
     /// sees only the close, as from an older server.
     pub fn refuse(io: S, offer: &Hello, reason: Refused) -> io::Result<()> {
-        let _ = (offer, reason);
-        drop(io);
-        Ok(())
+        let (mut frames, remote) = Self::offered(io)?;
+        match reason.frame(offer, &remote) {
+            Some(refusal) => frames.send(&refusal),
+            None => Ok(()),
+        }
+    }
+
+    /// Read the magic and the client's offer.
+    fn offered(mut io: S) -> io::Result<(Framed<S>, Hello)> {
+        let mut magic = [0; 8];
+        io.read_exact(&mut magic)?;
+        if magic != MAGIC {
+            return Err(invalid("wrong binary protocol magic"));
+        }
+        let mut frames = Framed::new(io, HELLO_LIMIT)?;
+        let remote = frames.receive()?;
+        Ok((frames, remote))
     }
 
     /// Access the transport to change I/O deadlines after establishment.
