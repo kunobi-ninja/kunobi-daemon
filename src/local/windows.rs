@@ -514,7 +514,13 @@ const CTRL_CLOSE_EVENT: u32 = 2;
 const CTRL_LOGOFF_EVENT: u32 = 5;
 const CTRL_SHUTDOWN_EVENT: u32 = 6;
 
+/// Every call of [`session_end_handler`], so a test can see what Windows ran.
+#[cfg(test)]
+static HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
+    #[cfg(test)]
+    HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
     if !matches!(
         event,
         CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
@@ -703,6 +709,77 @@ mod session_end_tests {
                 .recv_timeout(Duration::from_millis(200))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_shutdown_signal_no_longer_holds_the_process() {
+        drop(shutdown_signal().unwrap());
+        let (returned, handler_returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: the handler reads its argument and touches statics only.
+            let _ = returned.send(unsafe { session_end_handler(CTRL_LOGOFF_EVENT) });
+        });
+        // Nothing waits any more, so Windows may end the process as before.
+        assert_eq!(
+            handler_returned.recv_timeout(Duration::from_secs(10)),
+            Ok(1)
+        );
+        assert!(session_end_requested());
+    }
+}
+
+#[cfg(test)]
+mod session_end_registration_tests {
+    use super::*;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FreeConsole() -> i32;
+        fn AllocConsole() -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
+    }
+
+    const CTRL_BREAK_EVENT: u32 = 1;
+    static BREAKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Ends a Ctrl+Break so the default handler does not end the test.
+    unsafe extern "system" fn swallow_break(event: u32) -> i32 {
+        if event == CTRL_BREAK_EVENT {
+            BREAKS.fetch_add(1, Ordering::SeqCst);
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn every_install_registers_the_handler_again() {
+        // A console of its own: Ctrl+Break reaches every process on a console,
+        // and changing console is when a caller has to install again.
+        // SAFETY: these take no pointers; failures are checked.
+        unsafe {
+            FreeConsole();
+            assert_ne!(AllocConsole(), 0, "{}", io::Error::last_os_error());
+            assert_ne!(SetConsoleCtrlHandler(Some(swallow_break), 1), 0);
+        }
+        install_session_end_handler().unwrap();
+        install_session_end_handler().unwrap();
+        let before = HANDLER_CALLS.load(Ordering::SeqCst);
+        // SAFETY: as above. Group 0 is every process on this new console,
+        // which is only this one.
+        let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) };
+        assert_ne!(sent, 0, "{}", io::Error::last_os_error());
+        // Windows runs the handlers newest first on one thread, so once the
+        // oldest has run both registrations of the session-end handler have.
+        let delivered =
+            crate::readiness::wait_until(Instant::now() + Duration::from_secs(10), |_| {
+                Ok::<_, io::Error>((BREAKS.load(Ordering::SeqCst) == 1).then_some(()))
+            })
+            .unwrap();
+        assert!(delivered.is_some(), "Ctrl+Break was not delivered");
+        assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst) - before, 2);
+        // Ctrl+Break is not a session end, whichever copy saw it.
+        assert!(!session_end_requested());
     }
 }
 
