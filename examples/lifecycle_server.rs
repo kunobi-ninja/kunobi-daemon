@@ -9,14 +9,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local::unix_socket::{self, Bound, SocketGuard},
         peer::SameUser,
         serve::serve,
-        wire::{Hello, capability},
+        wire::{AsyncSession, Hello, Refused, capability},
     };
     use std::{io, path::PathBuf, sync::Arc, time::Duration};
     let root = PathBuf::from(
         std::env::args_os()
             .nth(1)
-            .ok_or("usage: lifecycle_server DIRECTORY")?,
+            .ok_or("usage: lifecycle_server DIRECTORY [retiring]")?,
     );
+    // A retiring server whose successor is already published refuses new
+    // clients, so they read discovery again instead of retrying here.
+    let retiring = std::env::args().nth(2).as_deref() == Some("retiring");
     unix_socket::ensure_private_dir(&root)?;
     let _owner = ProcessLock::try_acquire(root.join("run.lock"))?.ok_or("already owned")?;
     let path = root.join("control.sock");
@@ -56,6 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 async move {
                     let _permit = permit;
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    if retiring {
+                        let refusal = AsyncSession::refuse(connection, &offer, Refused::Retiring);
+                        let _ = tokio::time::timeout_at(deadline, refusal).await;
+                        return;
+                    }
                     let _ = service.serve(connection, &offer, deadline).await;
                 }
             },

@@ -129,6 +129,78 @@ impl ::buffa::Enumeration for LifecycleChange {
         ]
     }
 }
+/// Why a server closes a connection during negotiation.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(i32)]
+pub enum Refusal {
+    /// Not a refusal; an offer leaves this unset.
+    NOT_REFUSED = 0i32,
+    /// The client lacks a binary version or capability the server requires.
+    PROTOCOL_TOO_OLD = 1i32,
+    /// The server's peer policy rejected this client.
+    PEER_REJECTED = 2i32,
+    /// The server is retiring. Read discovery again to find its successor.
+    SERVER_RETIRING = 3i32,
+}
+impl Refusal {
+    ///Idiomatic alias for [`Self::NOT_REFUSED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const NotRefused: Self = Self::NOT_REFUSED;
+    ///Idiomatic alias for [`Self::PROTOCOL_TOO_OLD`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ProtocolTooOld: Self = Self::PROTOCOL_TOO_OLD;
+    ///Idiomatic alias for [`Self::PEER_REJECTED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const PeerRejected: Self = Self::PEER_REJECTED;
+    ///Idiomatic alias for [`Self::SERVER_RETIRING`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const ServerRetiring: Self = Self::SERVER_RETIRING;
+}
+impl ::core::default::Default for Refusal {
+    fn default() -> Self {
+        Self::NOT_REFUSED
+    }
+}
+impl ::buffa::Enumeration for Refusal {
+    fn from_i32(value: i32) -> ::core::option::Option<Self> {
+        match value {
+            0i32 => ::core::option::Option::Some(Self::NOT_REFUSED),
+            1i32 => ::core::option::Option::Some(Self::PROTOCOL_TOO_OLD),
+            2i32 => ::core::option::Option::Some(Self::PEER_REJECTED),
+            3i32 => ::core::option::Option::Some(Self::SERVER_RETIRING),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn to_i32(&self) -> i32 {
+        *self as i32
+    }
+    fn proto_name(&self) -> &'static str {
+        match self {
+            Self::NOT_REFUSED => "NOT_REFUSED",
+            Self::PROTOCOL_TOO_OLD => "PROTOCOL_TOO_OLD",
+            Self::PEER_REJECTED => "PEER_REJECTED",
+            Self::SERVER_RETIRING => "SERVER_RETIRING",
+        }
+    }
+    fn from_proto_name(name: &str) -> ::core::option::Option<Self> {
+        match name {
+            "NOT_REFUSED" => ::core::option::Option::Some(Self::NOT_REFUSED),
+            "PROTOCOL_TOO_OLD" => ::core::option::Option::Some(Self::PROTOCOL_TOO_OLD),
+            "PEER_REJECTED" => ::core::option::Option::Some(Self::PEER_REJECTED),
+            "SERVER_RETIRING" => ::core::option::Option::Some(Self::SERVER_RETIRING),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn values() -> &'static [Self] {
+        &[
+            Self::NOT_REFUSED,
+            Self::PROTOCOL_TOO_OLD,
+            Self::PEER_REJECTED,
+            Self::SERVER_RETIRING,
+        ]
+    }
+}
 /// Version/capability offer. Field numbers are part of the wire contract.
 /// Never reuse a removed field number or change its type.
 #[derive(Clone, PartialEq, Default)]
@@ -170,6 +242,16 @@ pub struct Hello {
     ///
     /// Field 9: `service_id`
     pub service_id: ::buffa::alloc::vec::Vec<u8>,
+    /// This client reads a refusal in place of the server's offer. A server sends
+    /// one only when this is set; any other client sees the connection close.
+    ///
+    /// Field 10: `reads_refusal`
+    pub reads_refusal: bool,
+    /// Set only in a server's refusal, which carries no other field. The server
+    /// closes the connection after sending it.
+    ///
+    /// Field 11: `refusal`
+    pub refusal: ::buffa::EnumValue<Refusal>,
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -185,6 +267,8 @@ impl ::core::fmt::Debug for Hello {
             .field("profile", &self.profile)
             .field("instance", &self.instance)
             .field("service_id", &self.service_id)
+            .field("reads_refusal", &self.reads_refusal)
+            .field("refusal", &self.refusal)
             .finish()
     }
 }
@@ -242,6 +326,15 @@ impl ::buffa::Message for Hello {
         if !self.service_id.is_empty() {
             size += 1u64 + ::buffa::types::bytes_encoded_len(&self.service_id) as u64;
         }
+        if self.reads_refusal {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        {
+            let val = self.refusal.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -278,6 +371,15 @@ impl ::buffa::Message for Hello {
         }
         if !self.service_id.is_empty() {
             ::buffa::types::put_shared_bytes_field(9u32, &self.service_id, buf);
+        }
+        if self.reads_refusal {
+            ::buffa::types::put_bool_field(10u32, self.reads_refusal, buf);
+        }
+        {
+            let val = self.refusal.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(11u32, val, buf);
+            }
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -355,6 +457,22 @@ impl ::buffa::Message for Hello {
                 )?;
                 ::buffa::types::merge_bytes(&mut self.service_id, buf)?;
             }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.reads_refusal = ::buffa::types::decode_bool(buf)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.refusal = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(buf)?,
+                );
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -372,6 +490,8 @@ impl ::buffa::Message for Hello {
         self.profile.clear();
         self.instance.clear();
         self.service_id.clear();
+        self.reads_refusal = false;
+        self.refusal = ::buffa::EnumValue::from(0);
         self.__buffa_unknown_fields.clear();
     }
 }

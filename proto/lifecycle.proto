@@ -24,6 +24,12 @@ message Hello {
   // Package-owned UUID, exactly 16 bytes, non-nil and stable across upgrades.
   // This is an identity check, not an authentication credential.
   bytes service_id = 9;
+  // This client reads a refusal in place of the server's offer. A server sends
+  // one only when this is set; any other client sees the connection close.
+  bool reads_refusal = 10;
+  // Set only in a server's refusal, which carries no other field. The server
+  // closes the connection after sending it.
+  Refusal refusal = 11;
 }
 
 // Separates shared lifecycle operation IDs from application-owned operation IDs.
@@ -91,4 +97,16 @@ message LifecycleEvent {
   optional uint64 selected_generation = 8;
   string selected_build = 9;
   bool retiring = 10;
+}
+
+// Why a server closes a connection during negotiation.
+enum Refusal {
+  // Not a refusal; an offer leaves this unset.
+  NOT_REFUSED = 0;
+  // The client lacks a binary version or capability the server requires.
+  PROTOCOL_TOO_OLD = 1;
+  // The server's peer policy rejected this client.
+  PEER_REJECTED = 2;
+  // The server is retiring. Read discovery again to find its successor.
+  SERVER_RETIRING = 3;
 }

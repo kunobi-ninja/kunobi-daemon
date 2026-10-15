@@ -3,7 +3,8 @@
 
 use buffa::Message;
 use kunobi_daemon::wire::{
-    self, Control, Endpoint, Framed, Hello, Session, capability as c, operation as o,
+    self, Control, Endpoint, Framed, Hello, Refusal, Refused, Session, capability as c,
+    operation as o,
 };
 use std::{
     io::{self, Cursor, Read, Write},
@@ -410,6 +411,8 @@ fn protoc_golden_bodies_preserve_all_fields_and_explicit_zero() {
     let hello = Hello {
         supported: (1 << 63) | c::HEALTH | c::HANDOFF,
         required: c::HANDOFF,
+        reads_refusal: true,
+        refusal: Refusal::ServerRetiring.into(),
         ..offer()
     };
     let hello_bytes = include_bytes!("fixtures/wire/hello.bin");
@@ -486,6 +489,271 @@ fn wrong_service_identity_gets_no_server_reply() {
         );
         server.join().unwrap();
     }
+}
+
+/// An offer that reads refusals.
+fn reading() -> Hello {
+    Hello {
+        reads_refusal: true,
+        ..offer()
+    }
+}
+
+/// A client whose newest version predates the server's.
+fn outdated() -> Hello {
+    Hello {
+        minimum: 1,
+        maximum: 1,
+        ..reading()
+    }
+}
+
+fn refusal(reason: Refusal) -> Hello {
+    Hello {
+        refusal: reason.into(),
+        ..Default::default()
+    }
+}
+
+fn frame(message: &Hello) -> Vec<u8> {
+    let mut io = Memory::default();
+    Framed::new(&mut io, 1024).unwrap().send(message).unwrap();
+    io.output
+}
+
+/// Send `client` as an offer on a raw connection while `server` handles the
+/// other end, and return every byte the server wrote before closing.
+fn reply_to(client: &Hello, server: impl FnOnce(TcpStream) + Send + 'static) -> Vec<u8> {
+    let (mut stream, peer) = sockets();
+    let server = std::thread::spawn(move || server(peer));
+    stream.write_all(&wire::MAGIC).unwrap();
+    stream.write_all(&frame(client)).unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    server.join().unwrap();
+    reply
+}
+
+fn accept_fails(peer: TcpStream) {
+    assert!(Session::accept(peer, &offer()).is_err());
+}
+
+#[test]
+fn a_new_offer_reads_refusals_and_refuses_nothing() {
+    let hello = offer();
+    assert!(hello.reads_refusal);
+    assert_eq!(hello.refusal, Refusal::NotRefused);
+}
+
+#[test]
+fn each_refusal_reaches_the_client_as_its_own_error() {
+    for refused in [
+        Refused::ProtocolTooOld,
+        Refused::PeerRejected,
+        Refused::Retiring,
+    ] {
+        let (client, server) = sockets();
+        let server =
+            std::thread::spawn(move || Session::refuse(server, &offer(), refused).unwrap());
+        let error = Session::connect(client, &reading()).err().unwrap();
+        server.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(Refused::of(&error), Some(refused));
+    }
+}
+
+#[test]
+fn a_client_too_old_for_the_server_is_told_so_and_nothing_else() {
+    let (client, server) = sockets();
+    let server = std::thread::spawn(move || accept_fails(server));
+    let error = Session::connect(client, &outdated()).err().unwrap();
+    server.join().unwrap();
+    assert_eq!(Refused::of(&error), Some(Refused::ProtocolTooOld));
+    // The server requires HEALTH.
+    let lacking = Hello {
+        supported: c::DRAIN,
+        required: 0,
+        ..reading()
+    };
+    for client in [outdated(), lacking] {
+        assert_eq!(
+            reply_to(&client, accept_fails),
+            frame(&refusal(Refusal::ProtocolTooOld)),
+            "{client:?}"
+        );
+    }
+}
+
+#[test]
+fn every_other_failed_negotiation_gets_only_the_close() {
+    let cases = [
+        // The server is the older side: the client requires what it lacks.
+        Hello {
+            supported: c::HEALTH | (1 << 40),
+            required: 1 << 40,
+            ..reading()
+        },
+        Hello {
+            minimum: 0,
+            ..outdated()
+        },
+        // An older client, which reads no refusals.
+        Hello {
+            reads_refusal: false,
+            ..outdated()
+        },
+        Hello {
+            application: "different.service".into(),
+            ..outdated()
+        },
+    ];
+    for client in cases {
+        assert!(reply_to(&client, accept_fails).is_empty(), "{client:?}");
+    }
+}
+
+#[test]
+fn a_refusal_goes_only_to_a_client_of_this_service_that_reads_it() {
+    let retire = |peer: TcpStream| Session::refuse(peer, &offer(), Refused::Retiring).unwrap();
+    assert_eq!(
+        reply_to(&reading(), retire),
+        frame(&refusal(Refusal::ServerRetiring))
+    );
+    let older = Hello {
+        reads_refusal: false,
+        ..offer()
+    };
+    let stranger = Hello {
+        application: "different.service".into(),
+        ..reading()
+    };
+    for client in [older, stranger] {
+        assert!(reply_to(&client, retire).is_empty(), "{client:?}");
+    }
+}
+
+#[test]
+fn an_older_server_closing_without_a_reason_stays_an_ordinary_error() {
+    let (client, mut server) = sockets();
+    let server = std::thread::spawn(move || {
+        // What every server did with a failed negotiation before refusals.
+        server.read_exact(&mut [0; 8]).unwrap();
+        Framed::new(&mut server, 1024)
+            .unwrap()
+            .receive::<Hello>()
+            .unwrap();
+    });
+    let error = Session::connect(client, &reading()).err().unwrap();
+    server.join().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(Refused::of(&error), None);
+}
+
+#[test]
+fn a_refusal_for_an_unknown_reason_still_refuses() {
+    let (client, mut server) = sockets();
+    let server = std::thread::spawn(move || {
+        server.read_exact(&mut [0; 8]).unwrap();
+        let mut frames = Framed::new(&mut server, 1024).unwrap();
+        frames.receive::<Hello>().unwrap();
+        frames
+            .send(&Hello {
+                refusal: buffa::EnumValue::from(9),
+                ..Default::default()
+            })
+            .unwrap();
+    });
+    let error = Session::connect(client, &reading()).err().unwrap();
+    server.join().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(Refused::of(&error), None);
+}
+
+#[test]
+fn a_refusal_says_what_the_client_should_do() {
+    for (refused, text) in [
+        (
+            Refused::ProtocolTooOld,
+            "the server requires a newer protocol than this client offers",
+        ),
+        (
+            Refused::PeerRejected,
+            "the server's peer policy rejected this client",
+        ),
+        (
+            Refused::Retiring,
+            "the server is retiring; read discovery again",
+        ),
+    ] {
+        assert_eq!(refused.to_string(), text);
+        assert_eq!(Refused::of(&refused.into()), Some(refused));
+    }
+    assert_eq!(Refused::of(&io::Error::other("closed")), None);
+    assert_eq!(Refused::of(&io::ErrorKind::UnexpectedEof.into()), None);
+}
+
+#[cfg(feature = "wire-async")]
+#[tokio::test]
+async fn async_peers_send_and_read_refusals() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wire::AsyncSession;
+    fn within<F: std::future::Future>(future: F) -> tokio::time::Timeout<F> {
+        tokio::time::timeout(Duration::from_secs(5), future)
+    }
+    let (server_offer, reading, outdated) = (offer(), reading(), outdated());
+    for refused in [
+        Refused::ProtocolTooOld,
+        Refused::PeerRejected,
+        Refused::Retiring,
+    ] {
+        let (client, server) = tokio::io::duplex(1024);
+        let (client, server) = within(async {
+            tokio::join!(
+                AsyncSession::connect(client, &reading),
+                AsyncSession::refuse(server, &server_offer, refused),
+            )
+        })
+        .await
+        .unwrap();
+        server.unwrap();
+        assert_eq!(Refused::of(&client.err().unwrap()), Some(refused));
+    }
+    let (client, server) = tokio::io::duplex(1024);
+    let (client, server) = within(async {
+        tokio::join!(
+            AsyncSession::connect(client, &outdated),
+            AsyncSession::accept(server, &server_offer),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(server.is_err());
+    assert_eq!(
+        Refused::of(&client.err().unwrap()),
+        Some(Refused::ProtocolTooOld)
+    );
+    // An older client sees only the close.
+    let older = frame(&Hello {
+        reads_refusal: false,
+        ..offer()
+    });
+    let (mut client, server) = tokio::io::duplex(1024);
+    let (reply, server) = within(async {
+        tokio::join!(
+            async {
+                client.write_all(&wire::MAGIC).await?;
+                client.write_all(&older).await?;
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).await?;
+                Ok::<_, io::Error>(reply)
+            },
+            AsyncSession::refuse(server, &server_offer, Refused::Retiring),
+        )
+    })
+    .await
+    .unwrap();
+    server.unwrap();
+    assert!(reply.unwrap().is_empty());
 }
 
 #[test]

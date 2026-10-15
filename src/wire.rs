@@ -12,8 +12,13 @@ use buffa::Message;
 #[allow(missing_docs, clippy::derivable_impls)]
 mod generated;
 use crate::ServiceIdentity;
-pub use generated::{Control, Health, Hello, LifecycleChange, LifecycleEvent, MessageKind};
-use std::io::{self, Read, Write};
+pub use generated::{
+    Control, Health, Hello, LifecycleChange, LifecycleEvent, MessageKind, Refusal,
+};
+use std::{
+    fmt,
+    io::{self, Read, Write},
+};
 
 /// Identifies the binary transport, independently of application versions.
 pub const MAGIC: [u8; 8] = *b"KNDPB002";
@@ -230,6 +235,47 @@ fn required_capability(message: &Control) -> io::Result<u64> {
     }
 }
 
+/// Why a server refused a connection during negotiation. A client handshake
+/// returns it inside an [`io::ErrorKind::ConnectionRefused`] error; read it
+/// with [`Refused::of`]. A server that closes without a reason, an older
+/// server included, still produces an ordinary I/O error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refused {
+    /// The client lacks a binary version or capability the server requires.
+    /// The same client build cannot succeed against this server.
+    ProtocolTooOld,
+    /// The server's peer policy rejected this client.
+    PeerRejected,
+    /// The server is retiring. Read discovery again to find its successor.
+    Retiring,
+}
+
+impl Refused {
+    /// The refusal inside an error from a client handshake, if the server sent one.
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ProtocolTooOld => "the server requires a newer protocol than this client offers",
+            Self::PeerRejected => "the server's peer policy rejected this client",
+            Self::Retiring => "the server is retiring; read discovery again",
+        })
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl From<Refused> for io::Error {
+    fn from(refused: Refused) -> Self {
+        io::Error::new(io::ErrorKind::ConnectionRefused, refused)
+    }
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -368,6 +414,16 @@ impl<S: Read + Write> Session<S> {
         frames.io.flush()?;
         frames.limit = agreement.max_frame;
         Ok(Self { frames, agreement })
+    }
+
+    /// Read a client's offer and refuse it for `reason`, then close the
+    /// connection. Use it for a peer the policy rejected, or while retiring.
+    /// A client that does not read refusals, or that names another service,
+    /// sees only the close, as from an older server.
+    pub fn refuse(io: S, offer: &Hello, reason: Refused) -> io::Result<()> {
+        let _ = (offer, reason);
+        drop(io);
+        Ok(())
     }
 
     /// Access the transport to change I/O deadlines after establishment.

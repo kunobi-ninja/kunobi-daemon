@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build two crate revisions and check health and drain in every pairing."""
+"""Build two crate revisions and check health and drain in every pairing, and
+that a retiring server's refusal reaches new clients without breaking old ones."""
 import argparse
 import os
 from pathlib import Path
@@ -20,8 +21,16 @@ def build(source, target):
     return target / "debug" / "examples"
 
 
+def additive(old, new):
+    """Every line of the old text survives, in order. The schema may gain fields,
+    values and messages; it may not change or remove any."""
+    lines = iter(new.splitlines())
+    return all(line in lines for line in old.splitlines())
+
+
 def frozen_contract(old, new):
-    assert (old / "proto/lifecycle.proto").read_bytes() == (new / "proto/lifecycle.proto").read_bytes(), "lifecycle schema changed"
+    schema = "proto/lifecycle.proto"
+    assert additive((old / schema).read_text(), (new / schema).read_text()), "lifecycle schema changed or lost a line"
     for file, pattern in [
         ("src/wire.rs", r"pub const VERSION: u32 = \d+;"),
         ("src/readiness/channel.rs", r'pub const ENV: &str = "[^"]+";'),
@@ -62,6 +71,31 @@ def check(server, client):
                     process.wait(timeout=5)
 
 
+def refusal(server, client, reads_refusal):
+    """A client that reads refusals learns the server is retiring. Any other
+    client sees the connection close, as it always has."""
+    with tempfile.TemporaryDirectory(prefix="kdaemon-refusal-") as directory:
+        root = Path(directory)
+        with (root / "server.log").open("w+") as log:
+            process = subprocess.Popen([str(server / "lifecycle_server"), directory, "retiring"], stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 15
+                while not (root / "control.sock").exists():
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        log.seek(0)
+                        raise AssertionError(f"server did not bind: {log.read()}")
+                    time.sleep(0.05)
+                result = subprocess.run([str(client / "blocking_health"), directory], capture_output=True, text=True, timeout=5)
+                assert result.returncode != 0, result.stdout
+                if reads_refusal:
+                    assert "ConnectionRefused" in result.stderr and "Retiring" in result.stderr, result.stderr
+                else:
+                    assert "UnexpectedEof" in result.stderr, result.stderr
+            finally:
+                process.kill()
+                process.wait(timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("old", type=Path)
@@ -75,6 +109,10 @@ def main():
             for client_name, client in binaries.items():
                 check(server, client)
                 print(f"PASS server={server_name} client={client_name}", flush=True)
+        # Only the current server can retire; the old one ignores the argument.
+        for client_name, client in binaries.items():
+            refusal(binaries["current"], client, reads_refusal=client_name == "current")
+            print(f"PASS refusal server=current client={client_name}", flush=True)
 
 
 if __name__ == "__main__":

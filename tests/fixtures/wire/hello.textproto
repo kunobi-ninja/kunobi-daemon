@@ -7,3 +7,5 @@ application: "fixture"
 profile: "stable"
 instance: "default"
 service_id: "\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001\001"
+reads_refusal: true
+refusal: SERVER_RETIRING

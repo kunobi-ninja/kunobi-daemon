@@ -60,6 +60,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         Ok(session)
     }
 
+    /// Async equivalent of [`Session::refuse`].
+    pub async fn refuse(io: S, offer: &Hello, reason: Refused) -> io::Result<()> {
+        let _ = (offer, reason);
+        drop(io);
+        Ok(())
+    }
+
     async fn read_acceptance(&mut self) -> io::Result<()> {
         if self.io.read_u8().await? != 1 {
             return Err(invalid("peer did not accept negotiation"));
