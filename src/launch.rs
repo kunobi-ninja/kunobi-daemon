@@ -304,7 +304,7 @@ impl DaemonCommand {
             // Dropping this copy of the daemon's end leaves the daemon the
             // only writer, so its exit ends the channel.
             Ok(DaemonChild {
-                inner,
+                inner: crate::candidate::Reaped::new(inner),
                 exit,
                 readiness: readiness.map(|(channel, _child_end)| channel),
             })
@@ -389,7 +389,18 @@ impl DaemonCommand {
 /// such as `arg0`, `pre_exec` or creation flags.
 impl From<&Command> for DaemonCommand {
     fn from(command: &Command) -> Self {
-        Self::new(command.get_program())
+        let mut daemon = Self::new(command.get_program());
+        daemon.args(command.get_args());
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => daemon.env(name, value),
+                None => daemon.env_remove(name),
+            };
+        }
+        if let Some(dir) = command.get_current_dir() {
+            daemon.current_dir(dir);
+        }
+        daemon
     }
 }
 
@@ -404,15 +415,17 @@ fn unix_stdio(target: &DaemonOutput) -> io::Result<Stdio> {
 /// A daemon started by [`DaemonCommand::spawn`].
 ///
 /// Dropping it leaves the daemon running, as dropping a `std::process::Child`
-/// does. A caller that never waits should keep SIGCHLD reaping in mind on
-/// Unix, as with any child.
+/// does. On Unix the daemon is also reaped once it exits, so a launcher that
+/// gives up on it leaves no zombie: at once if it has exited, otherwise by a
+/// thread that waits for it while it runs. [`Candidate::from`](crate::Candidate)
+/// takes it as a candidate that is stopped unless selected.
 ///
 /// Its [`ProcessHandle`] is opened at spawn, before anything can reap the
 /// daemon, so it follows the daemon even in a process that ignores SIGCHLD.
 #[derive(Debug)]
 pub struct DaemonChild {
     #[cfg(unix)]
-    inner: Child,
+    inner: crate::candidate::Reaped,
     #[cfg(windows)]
     inner: crate::local::windows_spawn::WindowsChild,
     exit: ProcessHandle,
