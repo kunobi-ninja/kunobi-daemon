@@ -97,13 +97,14 @@ impl Generation {
     /// Refresh application discovery until this process can retire. This loop
     /// owns session wakeups and retirement; the callback reads application
     /// selection and may invoke the shared replacement transaction.
+    ///
+    /// With a drain limit, the limit is checked before and after every refresh,
+    /// so no refresh starts once it has passed. The limit is only as prompt as
+    /// `refresh`: a callback that never completes also delays retirement.
     #[expect(
         clippy::disallowed_methods,
         reason = "Discovery has no change notification; session changes wake the same select immediately."
     )]
-    ///
-    /// With a drain limit, a superseded generation also retires once the limit
-    /// has passed, checked at least every `interval`.
     pub async fn run_until_retired<F, Fut>(
         &self,
         interval: Duration,
@@ -117,6 +118,9 @@ impl Generation {
         let mut changes = self.subscribe();
         loop {
             changes.borrow_and_update();
+            if let Some(retirement) = self.try_retire(staging_lifetime, false, true) {
+                return retirement;
+            }
             refresh().await;
             if let Some(retirement) = self.retire(staging_lifetime) {
                 return retirement;
@@ -160,6 +164,9 @@ impl Generation {
     }
     /// Observe a committed selection. Binary rollback still requires a larger epoch.
     pub fn select(&self, selected: u64) -> io::Result<()> {
+        // Under the session lock, so retirement decides against a selection
+        // and drain clock that cannot change underneath it.
+        let mut state = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let previous = self
             .selected
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
@@ -168,12 +175,9 @@ impl Generation {
             .map_err(|_| io::Error::other("generation selection moved backwards"))?;
         if previous != selected {
             if selected > self.own {
-                self.sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .superseded_since
-                    .get_or_insert_with(Instant::now);
+                state.superseded_since.get_or_insert_with(Instant::now);
             }
+            drop(state);
             self.changes.send_replace(());
         }
         Ok(())
@@ -194,38 +198,45 @@ impl Generation {
     ///
     /// Ignores the drain limit; see [`Self::retire`].
     pub fn retire_if_idle(&self, staging_lifetime: Duration) -> bool {
-        self.try_retire(staging_lifetime, false).is_some()
+        self.try_retire(staging_lifetime, true, false).is_some()
     }
     /// Retire an idle superseded generation or expired unselected candidate,
     /// or a superseded generation whose drain limit has passed.
     pub fn retire(&self, staging_lifetime: Duration) -> Option<Retirement> {
-        self.try_retire(staging_lifetime, true)
+        self.try_retire(staging_lifetime, true, true)
     }
-    fn try_retire(&self, staging_lifetime: Duration, drain: bool) -> Option<Retirement> {
+    /// `idle` retires an eligible generation without leases; `drain` retires a
+    /// superseded one whose drain limit has passed.
+    fn try_retire(
+        &self,
+        staging_lifetime: Duration,
+        idle: bool,
+        drain: bool,
+    ) -> Option<Retirement> {
+        let mut state = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let selected = self.selected();
         if selected <= self.own
             && !(self.staged && selected < self.own && self.started.elapsed() > staging_lifetime)
         {
             return None;
         }
-        let mut state = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if state.active == 0 {
-            state.retired = true;
-            return Some(Retirement::Idle);
-        }
+        // Set only once a newer generation is selected; selection never moves back.
         let expired = drain
-            && selected > self.own
             && self
                 .drain_limit
                 .zip(state.superseded_since)
                 .is_some_and(|(limit, since)| since.elapsed() >= limit);
-        if !expired {
+        if !expired && !(idle && state.active == 0) {
             return None;
         }
         state.retired = true;
-        Some(Retirement::DrainExpired {
-            active: state.active,
-            legacy: state.legacy,
+        Some(if state.active == 0 {
+            Retirement::Idle
+        } else {
+            Retirement::DrainExpired {
+                active: state.active,
+                legacy: state.legacy,
+            }
         })
     }
     /// Snapshot without waiting for any transport I/O.

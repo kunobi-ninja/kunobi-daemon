@@ -84,8 +84,10 @@ async fn drain_limit_retires_a_superseded_generation_that_still_holds_a_lease() 
     generation.select(3).unwrap();
     tokio::time::advance(Duration::from_secs(59)).await;
     assert_eq!(generation.retire(Duration::ZERO), None);
-    assert!(!generation.retire_if_idle(Duration::ZERO));
     tokio::time::advance(Duration::from_secs(2)).await;
+    // The idle-only check keeps its meaning after the limit.
+    assert!(!generation.retire_if_idle(Duration::ZERO));
+    assert!(!generation.snapshot().retired);
     assert_eq!(
         generation.retire(Duration::ZERO),
         Some(Retirement::DrainExpired {
@@ -138,6 +140,11 @@ async fn superseded_time_starts_at_the_first_newer_selection() {
         Some(Duration::from_secs(6))
     );
 
+    let promoted = Generation::new(3, 2, true);
+    promoted.select(3).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(promoted.snapshot().superseded_for, None);
+
     let started_behind = Generation::new(2, 3, false);
     tokio::time::advance(Duration::from_secs(4)).await;
     assert_eq!(
@@ -170,4 +177,42 @@ async fn run_until_retired_reports_why_it_returned() {
         .run_until_retired(Duration::from_secs(1), Duration::ZERO, || async {})
         .await;
     assert_eq!(retirement, Retirement::Idle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_refresh_starts_after_the_drain_limit_passes() {
+    let generation =
+        Arc::new(Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(10)));
+    let _session = generation.admit().unwrap();
+    let started = tokio::time::Instant::now();
+    let calls = std::sync::Mutex::new(Vec::new());
+    let retirement = tokio::time::timeout(
+        Duration::from_secs(3600),
+        generation.run_until_retired(Duration::from_secs(1), Duration::ZERO, || {
+            calls.lock().unwrap().push(started.elapsed());
+            async {}
+        }),
+    )
+    .await
+    .expect("a superseded generation must retire once its drain limit passes");
+    assert_eq!(
+        retirement,
+        Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        }
+    );
+    let calls = calls.into_inner().unwrap();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|at| *at < Duration::from_secs(10)),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_drain_with_no_lease_reports_idle() {
+    let generation = Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(1));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(generation.retire(Duration::ZERO), Some(Retirement::Idle));
 }
