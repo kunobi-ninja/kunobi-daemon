@@ -118,3 +118,33 @@ fn verbatim(path: &Path) -> OsString {
         _ => path.as_os_str().to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn a_record_another_process_holds_open_is_replaced_in_one_step() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("record");
+        std::fs::write(&record, b"old").unwrap();
+        // A reader's handle. Legacy replacement refuses a target that is open.
+        let mut reader = std::fs::File::open(&record).unwrap();
+        let temporary = root.path().join("temporary");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(super::ACCESS)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(b"new").unwrap();
+        super::rename_posix(&file, &record).unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        assert!(!temporary.exists());
+        let mut old = Vec::new();
+        reader.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old");
+    }
+}
