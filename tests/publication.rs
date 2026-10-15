@@ -21,11 +21,13 @@ fn old_record_cleanup_preserves_a_new_publication_and_its_lock_inode() {
 #[test]
 fn concurrent_publishers_and_readers_only_observe_complete_records() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    // Readers keep reading for as long as both publishers replace the record,
-    // so a replacement that briefly hides the record is caught on every run
-    // rather than now and then.
+    // A reader keeps reading for as long as both publishers replace the
+    // record, so a replacement that briefly hides the record is caught on
+    // every run rather than now and then. One reader leaves moments with no
+    // handle open, which is when a replacement can leave the old record
+    // pending deletion on Windows.
     const PUBLISHERS: usize = 2;
-    const READERS: usize = 2;
+    const READERS: usize = 1;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("discovery");
     let a = Arc::new(vec![b'a'; 32_768]);
@@ -46,7 +48,7 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
                 }
                 let _finished = Finished(publishing);
                 barrier.wait();
-                for _ in 0..200 {
+                for _ in 0..500 {
                     publish_record(path, bytes).unwrap();
                 }
             });
