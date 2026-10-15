@@ -20,30 +20,49 @@ fn old_record_cleanup_preserves_a_new_publication_and_its_lock_inode() {
 
 #[test]
 fn concurrent_publishers_and_readers_only_observe_complete_records() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Readers keep reading for as long as both publishers replace the record,
+    // so a replacement that briefly hides the record is caught on every run
+    // rather than now and then.
+    const PUBLISHERS: usize = 2;
+    const READERS: usize = 2;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("discovery");
     let a = Arc::new(vec![b'a'; 32_768]);
     let b = Arc::new(vec![b'b'; 65_536]);
     publish_record(&path, &a).unwrap();
+    let publishing = AtomicUsize::new(PUBLISHERS);
+    let barrier = std::sync::Barrier::new(PUBLISHERS + READERS);
     std::thread::scope(|scope| {
-        let barrier = Arc::new(std::sync::Barrier::new(3));
         for bytes in [&a, &b] {
-            let barrier = Arc::clone(&barrier);
-            let path = &path;
+            let (barrier, publishing, path) = (&barrier, &publishing, &path);
             scope.spawn(move || {
+                // Counts this publisher out even if it panics, so readers stop.
+                struct Finished<'a>(&'a AtomicUsize);
+                impl Drop for Finished<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Release);
+                    }
+                }
+                let _finished = Finished(publishing);
                 barrier.wait();
-                for _ in 0..25 {
+                for _ in 0..200 {
                     publish_record(path, bytes).unwrap();
                 }
             });
         }
-        barrier.wait();
-        for _ in 0..100 {
-            let contents = std::fs::read(&path).unwrap();
-            assert!(
-                contents == **a || contents == **b,
-                "reader saw a partial publication"
-            );
+        for _ in 0..READERS {
+            let (barrier, publishing, path, a, b) = (&barrier, &publishing, &path, &a, &b);
+            scope.spawn(move || {
+                barrier.wait();
+                while publishing.load(Ordering::Acquire) > 0 {
+                    let contents = std::fs::read(path).unwrap();
+                    assert!(
+                        contents == **a || contents == **b,
+                        "reader saw a partial publication"
+                    );
+                }
+            });
         }
     });
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
