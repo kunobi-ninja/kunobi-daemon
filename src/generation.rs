@@ -213,8 +213,20 @@ impl Generation {
             state.retired = true;
             return Some(Retirement::Idle);
         }
-        let _ = (drain, self.drain_limit);
-        None
+        let expired = drain
+            && selected > self.own
+            && self
+                .drain_limit
+                .zip(state.superseded_since)
+                .is_some_and(|(limit, since)| since.elapsed() >= limit);
+        if !expired {
+            return None;
+        }
+        state.retired = true;
+        Some(Retirement::DrainExpired {
+            active: state.active,
+            legacy: state.legacy,
+        })
     }
     /// Snapshot without waiting for any transport I/O.
     pub fn snapshot(&self) -> Snapshot {
