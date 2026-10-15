@@ -49,6 +49,9 @@ exclude_re = [
     # These functions compile only on macOS. Its native job checks them;
     # Linux mutation runs cannot execute them. The Linux credential reader stays in scope.
     '^src/local/unix\.rs:.*\b(macos_credentials|macos_peer_pid|macos_peer_uid)\b',
+    # Reads the SID from this process's token, so it compiles only on Windows;
+    # the Windows job tests it. The name it composes stays in scope.
+    '^src/local/pipe_name\.rs:.*\bfor_current_user\b',
     # Built only without the `local` feature, and mutants are tested with all
     # features. The `--no-default-features` test runs still exercise it.
     '^src/warmup\.rs:.*\bpolled_exit_by\b',
