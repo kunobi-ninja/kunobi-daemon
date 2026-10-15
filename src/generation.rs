@@ -98,9 +98,9 @@ impl Generation {
     /// owns session wakeups and retirement; the callback reads application
     /// selection and may invoke the shared replacement transaction.
     ///
-    /// With a drain limit, the limit is checked before and after every refresh,
-    /// so no refresh starts once it has passed. The limit is only as prompt as
-    /// `refresh`: a callback that never completes also delays retirement.
+    /// With a drain limit, the loop also wakes when the limit passes, and checks
+    /// it before and after every refresh, so no refresh starts once it has
+    /// passed. A `refresh` callback that never completes still delays retirement.
     #[expect(
         clippy::disallowed_methods,
         reason = "Discovery has no change notification; session changes wake the same select immediately."
@@ -125,8 +125,12 @@ impl Generation {
             if let Some(retirement) = self.retire(staging_lifetime) {
                 return retirement;
             }
+            // Wake for the drain limit too, not only the refresh interval.
+            let wait = self
+                .drain_remaining()
+                .map_or(interval, |remaining| remaining.min(interval));
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {},
+                _ = tokio::time::sleep(wait) => {},
                 _ = changes.changed() => {},
             }
         }
@@ -239,6 +243,13 @@ impl Generation {
                 legacy: state.legacy,
             }
         })
+    }
+    /// Time left before the drain limit retires this generation, once superseded.
+    fn drain_remaining(&self) -> Option<Duration> {
+        let state = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain_limit
+            .zip(state.superseded_since)
+            .map(|(limit, since)| limit.saturating_sub(since.elapsed()))
     }
     /// Snapshot without waiting for any transport I/O.
     pub fn snapshot(&self) -> Snapshot {
