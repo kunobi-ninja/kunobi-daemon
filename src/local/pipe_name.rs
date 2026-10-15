@@ -22,8 +22,8 @@ use crate::{ServiceIdentity, socket_path::SocketName};
 use std::io;
 
 /// Longest pipe name, in UTF-16 code units, after the `\\.\pipe\` prefix the
-/// crate's named-pipe adapters add: a pipe path can be at most 256
-/// characters, and the prefix takes 9.
+/// crate's named-pipe adapters add: Windows documents a pipe path of at most
+/// 256 characters, and the prefix takes 9.
 pub const MAX_PIPE_NAME_UNITS: usize = 247;
 
 /// This process's pipe name for the endpoint `name` of `identity`, scoped by
@@ -171,7 +171,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_creates_a_pipe_at_the_limit_and_refuses_one_unit_more() {
+    fn windows_creates_a_pipe_whose_name_is_at_the_limit() {
+        // The limit is the documented one. Current Windows also accepts longer
+        // names, so only this side can be checked against the OS.
         use crate::local::{Bound, socket::acquire};
         let unique = format!("{}-", std::process::id());
         let at_limit = format!("{unique}{}", "a".repeat(MAX_PIPE_NAME_UNITS - unique.len()));
@@ -179,7 +181,6 @@ mod tests {
             acquire(std::path::Path::new(&at_limit)).unwrap(),
             Bound::Won(_)
         ));
-        assert!(acquire(std::path::Path::new(&format!("{at_limit}a"))).is_err());
     }
 
     #[cfg(windows)]
