@@ -126,8 +126,10 @@ I/O error, never as a refusal.
 
 Refusals add optional fields to `Hello`; `wire::VERSION` stays 2. The
 cross-version CI job runs the current server in retiring mode against both
-the current and the previous client, and accepts only schema changes that
-keep every existing line.
+the current and the previous client. It also compiles the released and the
+current schema with `protoc` and fails if any released field disappeared or
+changed its type, label or presence, or any message, enum or enum value
+disappeared. Fields, values and messages may be added.
 
 ## Frames and evolution
 

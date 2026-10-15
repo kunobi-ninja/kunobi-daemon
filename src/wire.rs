@@ -261,15 +261,17 @@ impl Refused {
         error.get_ref()?.downcast_ref::<Self>().copied()
     }
 
-    /// The frame refusing `remote`, if that client reads refusals and names the
-    /// service `offer` serves. A wrong identity gets no reply, as before.
+    /// The frame refusing `remote`, if that client reads refusals and sends a
+    /// well-formed offer for the service `offer` serves. A wrong identity or a
+    /// malformed offer gets no reply, as from [`Session::accept`].
     fn frame(self, offer: &Hello, remote: &Hello) -> Option<Hello> {
         let reason = match self {
             Self::ProtocolTooOld => Refusal::PROTOCOL_TOO_OLD,
             Self::PeerRejected => Refusal::PEER_REJECTED,
             Self::Retiring => Refusal::SERVER_RETIRING,
         };
-        (remote.reads_refusal && same_service(offer, remote)).then(|| Hello {
+        let answered = remote.reads_refusal && same_service(offer, remote);
+        (answered && remote.validate().is_ok()).then(|| Hello {
             refusal: reason.into(),
             ..Default::default()
         })
@@ -277,11 +279,10 @@ impl Refused {
 }
 
 /// What a server sends before closing on a failed negotiation: a refusal only
-/// to a well-formed offer that lacks a version or capability `offer` requires.
-/// A server too old for the client, or a malformed offer, gets only the close.
+/// to a client that lacks a version or capability `offer` requires. A server
+/// too old for the client gets only the close.
 fn rejection(offer: &Hello, remote: &Hello) -> Option<Hello> {
-    let too_old = remote.maximum < VERSION || offer.required & !remote.supported != 0;
-    if too_old && Terms::of(remote).valid() {
+    if remote.maximum < VERSION || offer.required & !remote.supported != 0 {
         Refused::ProtocolTooOld.frame(offer, remote)
     } else {
         None
