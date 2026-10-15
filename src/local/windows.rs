@@ -305,6 +305,7 @@ unsafe extern "system" {
     ) -> i32;
     fn GetHandleInformation(object: Handle, flags: *mut u32) -> i32;
     fn SetHandleInformation(object: Handle, mask: u32, flags: u32) -> i32;
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "advapi32")]
@@ -318,6 +319,44 @@ unsafe extern "system" {
         needed: *mut u32,
     ) -> i32;
     fn EqualSid(first: *const c_void, second: *const c_void) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+}
+
+/// Memory the OS allocated with `LocalAlloc`.
+struct LocalMemory(*mut c_void);
+
+impl Drop for LocalMemory {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from an API that allocates with LocalAlloc
+        // and is freed exactly once, here.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+/// This process's token user as a SID string, such as `S-1-5-21-…-1001`.
+pub(crate) fn current_user_sid() -> io::Result<String> {
+    // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
+    let user = token_user(unsafe { GetCurrentProcess() })?;
+    let mut text: *mut u16 = ptr::null_mut();
+    // SAFETY: TOKEN_USER starts with the SID pointer, so element 0 of `user`
+    // points at the SID inside that live buffer; `text` is a valid output slot.
+    if unsafe { ConvertSidToStringSidW(user[0] as *mut c_void, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let text = LocalMemory(text.cast());
+    let sid = text.0.cast::<u16>();
+    let mut length = 0;
+    // SAFETY: the string is NUL-terminated, so every index up to and including
+    // the NUL is inside it.
+    while unsafe { *sid.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the `length` units before the NUL are initialised and live until
+    // `text` is freed at the end of this function.
+    let sid = unsafe { std::slice::from_raw_parts(sid, length) };
+    String::from_utf16(sid).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn token_user(process: Handle) -> io::Result<Vec<usize>> {
@@ -728,12 +767,10 @@ pub(crate) mod ready {
             wait_all: i32,
             milliseconds: u32,
         ) -> u32;
-        fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
 
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
         fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
             text: *const u16,
             revision: u32,
@@ -757,19 +794,6 @@ pub(crate) mod ready {
     const ERROR_PIPE_CONNECTED: i32 = 535;
     const ERROR_OPERATION_ABORTED: i32 = 995;
 
-    /// Memory the OS allocated with `LocalAlloc`.
-    struct LocalMemory(*mut c_void);
-
-    impl Drop for LocalMemory {
-        fn drop(&mut self) {
-            // SAFETY: the pointer came from an API that allocates with
-            // LocalAlloc and is freed exactly once, here.
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-
     /// A pipe name with 128 bits from the OS random source.
     fn random_name() -> io::Result<String> {
         let mut bytes = [0u8; 16];
@@ -784,30 +808,8 @@ pub(crate) mod ready {
     /// A security descriptor whose protected DACL grants the current user,
     /// and nobody else, access.
     fn current_user_only() -> io::Result<LocalMemory> {
-        // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
-        let user = token_user(unsafe { GetCurrentProcess() })?;
-        let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: TOKEN_USER starts with the SID pointer, so element 0 of
-        // `user` points at the SID inside that live buffer; `text` is a valid
-        // output slot.
-        if unsafe { ConvertSidToStringSidW(user[0] as *mut c_void, &mut text) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let text = LocalMemory(text.cast());
-        let sid = text.0.cast::<u16>();
-        let mut length = 0;
-        // SAFETY: the string is NUL-terminated, so every index up to and
-        // including the NUL is inside it.
-        while unsafe { *sid.add(length) } != 0 {
-            length += 1;
-        }
-        // SAFETY: the `length` units before the NUL are initialised and live
-        // until `text` is freed at the end of this function.
-        let sid = unsafe { std::slice::from_raw_parts(sid, length) };
-        let sddl: Vec<u16> = "D:P(A;;GA;;;"
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{})", current_user_sid()?)
             .encode_utf16()
-            .chain(sid.iter().copied())
-            .chain(")".encode_utf16())
             .chain(std::iter::once(0))
             .collect();
         let mut descriptor = ptr::null_mut();

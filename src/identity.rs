@@ -105,8 +105,10 @@ pub const CONTROL_SOCKET: SocketName = SocketName::new("control.sock");
 /// Conventional resource paths for one service identity under a per-user root.
 ///
 /// This is a naming helper, not peer authentication or a directory-security API.
-/// Windows named-pipe users must scope their pipe name by both this identity and
-/// the user's SID, and enforce a same-user ACL; filesystem paths do not do that.
+/// A Windows named pipe is not a file in this directory: name it with
+/// `local::pipe_name::for_current_user`, which scopes it by this identity and
+/// the user's SID, and bind it with `local::socket::acquire`, which restricts
+/// it to its owner, SYSTEM and Administrators.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServicePaths {
     directory: PathBuf,

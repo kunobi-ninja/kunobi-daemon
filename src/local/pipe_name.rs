@@ -35,14 +35,32 @@ pub const MAX_PIPE_NAME_UNITS: usize = 256 - r"\\.\pipe\".len();
 /// [`super::Duplex::connect`].
 #[cfg(windows)]
 pub fn for_current_user(identity: &ServiceIdentity, name: SocketName) -> io::Result<String> {
-    user_pipe_name("", identity, name)
+    user_pipe_name(&super::windows::current_user_sid()?, identity, name)
 }
 
 /// The pipe name for the endpoint `name` of `identity`, for the user whose SID
 /// string is `sid`.
 fn user_pipe_name(sid: &str, identity: &ServiceIdentity, name: SocketName) -> io::Result<String> {
-    let _ = (sid, identity, name);
-    Ok(String::new())
+    // `_` appears in no SID, UUID or identity component, so components cannot
+    // alias. The endpoint name may contain one, so it comes last.
+    let pipe = format!(
+        "{sid}_service-{:032x}_profile-{}_instance-{}_{}",
+        u128::from_be_bytes(*identity.id()),
+        identity.profile(),
+        identity.instance(),
+        name.as_str()
+    );
+    let units = pipe.encode_utf16().count();
+    if units > MAX_PIPE_NAME_UNITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "pipe name is {units} characters, but a named pipe name can be at most \
+                 {MAX_PIPE_NAME_UNITS}: {pipe}"
+            ),
+        ));
+    }
+    Ok(pipe)
 }
 
 #[cfg(test)]
