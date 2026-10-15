@@ -577,10 +577,37 @@ pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
     }
 }
 
-/// Complete when this process is asked to stop.
+/// Wait for this process to be asked to stop.
+///
+/// The future completes on SIGTERM or SIGINT on Unix. On Windows it completes
+/// on Ctrl+C, or when the console closes, the user logs off or the system
+/// shuts down.
+///
+/// Handlers are installed before this returns, so a request that arrives
+/// afterwards is not lost even if the future has not been polled yet. From
+/// then on those requests no longer end the process by themselves: the caller
+/// decides when to exit.
+///
+/// On Windows this is built on `local::windows::install_session_end_handler`,
+/// and `local::windows::session_end_requested` reports the same events.
+/// Windows ends the process as soon as that handler returns for close, logoff
+/// or shutdown, so once this has been called the handler does not return for
+/// them: the process runs until it exits on its own or until Windows' timeout
+/// for that event ends it.
+///
+/// Call it inside a Tokio runtime with I/O enabled (`enable_io` or
+/// `enable_all`); it panics outside one.
 #[cfg(feature = "async")]
 pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
-    Ok(std::future::pending())
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
 impl super::peer::PeerCredentials for UnixDuplex {

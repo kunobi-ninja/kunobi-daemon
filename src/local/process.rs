@@ -258,6 +258,13 @@ impl ProcessHandle {
 /// handle cannot be opened, for example because access was denied, Unix
 /// falls back to `kill(pid, 0)`, which reports a process this user may not
 /// signal as alive, and Windows reports `Unknown`.
+///
+/// PID 1 is answered like any other: on Unix it is init or launchd, or a
+/// container's entrypoint, which may be the daemon itself, so it reads as
+/// alive. Only the caller knows whether its daemon can run as an entrypoint;
+/// one that cannot should treat a record naming PID 1 as corrupt rather than
+/// as a live owner. PID 0 never reaches this function: [`ProcessId`] excludes
+/// it.
 pub fn process_state(pid: ProcessId) -> ProcessState {
     match ProcessHandle::open(pid).and_then(|mut handle| handle.has_exited()) {
         Ok(true) => ProcessState::Exited,

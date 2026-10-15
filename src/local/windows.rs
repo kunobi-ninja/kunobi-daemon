@@ -173,14 +173,11 @@ impl super::peer::PeerCredentials for WindowsDuplex {
     }
 }
 
-/// Windows can report a busy named pipe outside the portable I/O categories.
-pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
+/// Every instance of the pipe is serving another client. The standard library
+/// maps this outside the portable I/O categories.
+pub(crate) fn busy_pipe(error: &io::Error) -> bool {
     const ERROR_PIPE_BUSY: i32 = 231;
-    if error.raw_os_error() == Some(ERROR_PIPE_BUSY) {
-        ConnectError::ConnectTimeout
-    } else {
-        super::connect_error(error)
-    }
+    error.raw_os_error() == Some(ERROR_PIPE_BUSY)
 }
 
 impl Duplex for WindowsDuplex {
@@ -204,7 +201,7 @@ impl Duplex for WindowsDuplex {
                 stream,
                 read_deadline: Cell::new(None),
             })
-            .map_err(|error| connect_error(&error))
+            .map_err(|error| super::connect_error(&error))
     }
 
     /// Arm an absolute deadline for reads performed during session setup.
@@ -504,32 +501,57 @@ fn cancel_and_reap(
 }
 
 static SESSION_END: AtomicBool = AtomicBool::new(false);
+/// Wakes [`shutdown_signal`] futures when [`SESSION_END`] is set.
+#[cfg(feature = "async")]
+static SESSION_END_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// Set once [`shutdown_signal`] has been called: the handler then keeps the
+/// process alive after a session end instead of returning.
+#[cfg(feature = "async")]
+static HOLD_SESSION_END: AtomicBool = AtomicBool::new(false);
+static SESSION_END_HANDLER: std::sync::OnceLock<Result<(), i32>> = std::sync::OnceLock::new();
 
 const CTRL_CLOSE_EVENT: u32 = 2;
 const CTRL_LOGOFF_EVENT: u32 = 5;
 const CTRL_SHUTDOWN_EVENT: u32 = 6;
 
 unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
-    if matches!(
+    if !matches!(
         event,
         CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
     ) {
-        SESSION_END.store(true, Ordering::Release);
-        1
-    } else {
-        0
+        return 0;
     }
+    SESSION_END.store(true, Ordering::Release);
+    #[cfg(feature = "async")]
+    {
+        SESSION_END_WAKE.notify_waiters();
+        // Windows ends the process when this returns. Park this callback
+        // thread instead, so the process can finish on its own; its exit, or
+        // Windows' timeout for the event, ends the thread.
+        if HOLD_SESSION_END.load(Ordering::Acquire) {
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    1
 }
 
 /// Arm CLOSE/LOGOFF/SHUTDOWN so a published pipe is not left after logoff.
+///
+/// The handler is registered once per process; later calls return the first
+/// call's result.
 pub fn install_session_end_handler() -> io::Result<()> {
-    // SAFETY: `session_end_handler` is process-lifetime and only stores an
-    // atomic, which is safe on the system-created callback thread.
-    if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    let installed = *SESSION_END_HANDLER.get_or_init(|| {
+        // SAFETY: `session_end_handler` is process-lifetime and touches only
+        // statics that are safe to use from the system-created callback thread.
+        if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    });
+    installed.map_err(io::Error::from_raw_os_error)
 }
 
 /// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
@@ -537,10 +559,41 @@ pub fn session_end_requested() -> bool {
     SESSION_END.load(Ordering::Acquire)
 }
 
-/// Complete when this process is asked to stop.
+/// Wait for this process to be asked to stop: Ctrl+C, or the console closing,
+/// the user logging off or the system shutting down.
+///
+/// Handlers are installed before this returns, so a request that arrives
+/// afterwards is not lost even if the future has not been polled yet. This is
+/// built on [`install_session_end_handler`], and [`session_end_requested`]
+/// reports the same events. Windows ends the process as soon as that handler
+/// returns for close, logoff or shutdown, so once this has been called the
+/// handler does not return for them: the process runs until it exits on its
+/// own or until Windows' timeout for that event ends it.
+///
+/// Call it inside a Tokio runtime.
 #[cfg(feature = "async")]
 pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
-    Ok(std::future::pending())
+    install_session_end_handler()?;
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    HOLD_SESSION_END.store(true, Ordering::Release);
+    Ok(async move {
+        tokio::select! {
+            _ = ctrl_c.recv() => {}
+            () = session_end() => {}
+        }
+    })
+}
+
+/// Complete once [`session_end_requested`] is true, without polling it.
+#[cfg(feature = "async")]
+async fn session_end() {
+    let mut woken = std::pin::pin!(SESSION_END_WAKE.notified());
+    // Register before checking, so a session end between the check and the
+    // await still wakes this future.
+    woken.as_mut().enable();
+    if !session_end_requested() {
+        woken.await;
+    }
 }
 
 const HANDLE_FLAG_INHERIT: u32 = 0x00000001;

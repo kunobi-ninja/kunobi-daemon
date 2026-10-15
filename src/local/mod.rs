@@ -196,28 +196,60 @@ impl std::fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {}
 impl ConnectError {
     /// Whether a later attempt can succeed: nothing accepted the connection in
-    /// time, which includes an endpoint that does not exist yet.
+    /// time, which includes an endpoint that does not exist yet. Every failure
+    /// [`is_transient`] lists becomes [`Self::ConnectTimeout`].
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::ConnectTimeout)
     }
 }
 
-/// Whether an attempt that failed with `error` can succeed if repeated.
-pub fn is_transient(_error: &io::Error) -> bool {
+/// Whether a local connection or exchange that failed with `error` can
+/// succeed if repeated.
+///
+/// True when the endpoint does not exist yet or refused the connection, when
+/// the peer left mid-exchange, or when a deadline passed. A departing peer
+/// shows up as a reset, an end of stream or a broken pipe depending on timing
+/// the caller does not control, so all of them count: retrying only one makes
+/// surviving the same event a matter of chance. A denial and every other
+/// failure are final. [`ConnectError`] classifies connection setup through
+/// this list.
+pub fn is_transient(error: &io::Error) -> bool {
+    use io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted,
+        NotConnected, NotFound, TimedOut, UnexpectedEof, WouldBlock,
+    };
+    matches!(
+        error.kind(),
+        NotFound
+            | ConnectionRefused
+            | ConnectionReset
+            | ConnectionAborted
+            | NotConnected
+            | UnexpectedEof
+            | BrokenPipe
+            | TimedOut
+            | WouldBlock
+            | Interrupted
+    ) || busy_pipe(error)
+}
+
+#[cfg(windows)]
+use windows::busy_pipe;
+/// Only a named pipe can be busy; Unix reports nothing outside the portable
+/// kinds above.
+#[cfg(unix)]
+fn busy_pipe(_: &io::Error) -> bool {
     false
 }
 
 /// Classify a failed connection attempt, the same way on every platform.
 pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
-    use io::ErrorKind::{
-        ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted, NotConnected, NotFound,
-        PermissionDenied, TimedOut, WouldBlock,
-    };
-    match error.kind() {
-        PermissionDenied => ConnectError::PermissionDenied,
-        NotFound | ConnectionRefused | TimedOut | WouldBlock | Interrupted | ConnectionReset
-        | ConnectionAborted | NotConnected => ConnectError::ConnectTimeout,
-        kind => ConnectError::Failed(kind),
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        ConnectError::PermissionDenied
+    } else if is_transient(error) {
+        ConnectError::ConnectTimeout
+    } else {
+        ConnectError::Failed(error.kind())
     }
 }
 
@@ -299,9 +331,6 @@ mod connect_error_tests {
 
     #[test]
     fn a_busy_pipe_is_retried_only_on_windows() {
-        #[cfg(windows)]
-        let busy = super::windows::connect_error(&io::Error::from_raw_os_error(231));
-        #[cfg(not(windows))]
         let busy = connect_error(&io::Error::from_raw_os_error(231));
         if cfg!(windows) {
             assert_eq!(busy, ConnectError::ConnectTimeout);

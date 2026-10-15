@@ -68,7 +68,14 @@ checking the PID, and says so.
 `local::process_state` answers once for a PID: alive, exited or unknown. It
 never folds an access-denied query into either answer. Alive describes the PID,
 which the OS reuses, so confirm the daemon through its endpoint before trusting
-it.
+it. PID 1 reads as alive on Unix, since it may be a container's entrypoint; a
+daemon that never runs as one can treat a record naming PID 1 as corrupt.
+
+`local::is_transient` says whether a failed local connection or exchange is
+worth repeating: a missing or refusing endpoint, a peer that left (reset, end
+of stream or broken pipe) or a passed deadline. `ConnectError::is_transient`
+uses the same list. With `async`, `local::shutdown_signal` completes on SIGTERM
+or SIGINT, and on Windows on Ctrl+C, console close, logoff or shutdown.
 
 ## Knowing when a started daemon is ready
 
