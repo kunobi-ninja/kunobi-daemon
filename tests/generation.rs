@@ -203,7 +203,8 @@ async fn no_refresh_starts_after_the_drain_limit_passes() {
         }
     );
     let calls = calls.into_inner().unwrap();
-    assert!(!calls.is_empty());
+    // One refresh per one-second interval until the limit, none after it.
+    assert_eq!(calls.len(), 10, "{calls:?}");
     assert!(
         calls.iter().all(|at| *at < Duration::from_secs(10)),
         "{calls:?}"
@@ -215,4 +216,26 @@ async fn an_expired_drain_with_no_lease_reports_idle() {
     let generation = Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(1));
     tokio::time::advance(Duration::from_secs(2)).await;
     assert_eq!(generation.retire(Duration::ZERO), Some(Retirement::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_drain_limit_wakes_a_controller_with_a_long_refresh_interval() {
+    let generation =
+        Arc::new(Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(10)));
+    let _session = generation.admit().unwrap();
+    let started = tokio::time::Instant::now();
+    let retirement = tokio::time::timeout(
+        Duration::from_secs(7200),
+        generation.run_until_retired(Duration::from_secs(3600), Duration::ZERO, || async {}),
+    )
+    .await
+    .expect("a superseded generation must retire once its drain limit passes");
+    assert_eq!(
+        retirement,
+        Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        }
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
 }

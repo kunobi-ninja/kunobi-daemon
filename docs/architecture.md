@@ -309,9 +309,9 @@ still has obligations. Without a drain limit that wait is unbounded, so one leas
 that is never released keeps a superseded generation alive and can block later
 upgrades. `Generation::with_drain_limit` bounds it: once the limit has passed since
 a newer generation was first selected, the generation retires with its remaining
-leases and `run_until_retired` returns `Retirement::DrainExpired`. The limit is
-checked before and after each refresh, so it is only as prompt as the refresh
-callback, which must complete in bounded time. The application decides how to end
+leases and `run_until_retired` returns `Retirement::DrainExpired`. The loop wakes
+when the limit passes and checks it before and after each refresh; a refresh
+callback that never completes still delays it, so refresh must be bounded. The application decides how to end
 those sessions. `Snapshot::superseded_for` reports how long the
 drain has been running. Persist `retry::State` against the application's candidate
 fingerprint before a recovery launch, including candidates that can die after commit.
