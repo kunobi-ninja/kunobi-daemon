@@ -46,6 +46,7 @@ struct Sessions {
     active: usize,
     legacy: usize,
     retired: bool,
+    superseded_since: Option<Instant>,
 }
 
 /// A process generation keeps admitted sessions alive until their leases drop.
@@ -56,6 +57,23 @@ pub struct Generation {
     changes: watch::Sender<()>,
     started: Instant,
     staged: bool,
+    drain_limit: Option<Duration>,
+}
+
+/// Why [`Generation::run_until_retired`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Retirement {
+    /// No session lease was held.
+    Idle,
+    /// The drain limit expired while leases were still held. Admission is
+    /// closed; the application decides how to end the remaining sessions.
+    DrainExpired {
+        /// Session leases still held at retirement.
+        active: usize,
+        /// Of those, sessions using a legacy protocol.
+        legacy: usize,
+    },
 }
 
 /// Local session state. Counts describe leases, not application operations.
@@ -72,6 +90,8 @@ pub struct Snapshot {
     pub legacy: usize,
     /// Admission closed permanently after retirement.
     pub retired: bool,
+    /// How long a newer generation has been selected, if one has.
+    pub superseded_for: Option<Duration>,
 }
 impl Generation {
     /// Refresh application discovery until this process can retire. This loop
@@ -81,12 +101,16 @@ impl Generation {
         clippy::disallowed_methods,
         reason = "Discovery has no change notification; session changes wake the same select immediately."
     )]
+    ///
+    /// With a drain limit, a superseded generation also retires once the limit
+    /// has passed, checked at least every `interval`.
     pub async fn run_until_retired<F, Fut>(
         &self,
         interval: Duration,
         staging_lifetime: Duration,
         mut refresh: F,
-    ) where
+    ) -> Retirement
+    where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
@@ -94,8 +118,8 @@ impl Generation {
         loop {
             changes.borrow_and_update();
             refresh().await;
-            if self.retire_if_idle(staging_lifetime) {
-                return;
+            if let Some(retirement) = self.retire(staging_lifetime) {
+                return retirement;
             }
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {},
@@ -105,14 +129,30 @@ impl Generation {
     }
     /// Initialize from the persisted selection and the process's startup record.
     pub fn new(own: u64, selected: u64, staged: bool) -> Self {
+        let started = Instant::now();
         Self {
             own,
             selected: AtomicU64::new(selected),
-            sessions: Mutex::new(Sessions::default()),
+            sessions: Mutex::new(Sessions {
+                superseded_since: (selected > own).then_some(started),
+                ..Sessions::default()
+            }),
             changes: watch::channel(()).0,
-            started: Instant::now(),
+            started,
             staged,
+            drain_limit: None,
         }
+    }
+    /// Bound how long a superseded generation waits for its session leases.
+    ///
+    /// Without a limit a held lease keeps a superseded generation alive
+    /// indefinitely. With one, [`Self::retire`] and [`Self::run_until_retired`]
+    /// retire it once the limit has passed since a newer generation was first
+    /// selected, whatever leases remain.
+    #[must_use]
+    pub fn with_drain_limit(mut self, limit: Duration) -> Self {
+        self.drain_limit = Some(limit);
+        self
     }
     /// Return the latest observed selected epoch.
     pub fn selected(&self) -> u64 {
@@ -127,6 +167,13 @@ impl Generation {
             })
             .map_err(|_| io::Error::other("generation selection moved backwards"))?;
         if previous != selected {
+            if selected > self.own {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .superseded_since
+                    .get_or_insert_with(Instant::now);
+            }
             self.changes.send_replace(());
         }
         Ok(())
@@ -144,19 +191,30 @@ impl Generation {
         })
     }
     /// Retire only an idle superseded generation or expired unselected candidate.
+    ///
+    /// Ignores the drain limit; see [`Self::retire`].
     pub fn retire_if_idle(&self, staging_lifetime: Duration) -> bool {
+        self.try_retire(staging_lifetime, false).is_some()
+    }
+    /// Retire an idle superseded generation or expired unselected candidate,
+    /// or a superseded generation whose drain limit has passed.
+    pub fn retire(&self, staging_lifetime: Duration) -> Option<Retirement> {
+        self.try_retire(staging_lifetime, true)
+    }
+    fn try_retire(&self, staging_lifetime: Duration, drain: bool) -> Option<Retirement> {
         let selected = self.selected();
         if selected <= self.own
             && !(self.staged && selected < self.own && self.started.elapsed() > staging_lifetime)
         {
-            return false;
+            return None;
         }
         let mut state = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if state.active != 0 {
-            return false;
+        if state.active == 0 {
+            state.retired = true;
+            return Some(Retirement::Idle);
         }
-        state.retired = true;
-        true
+        let _ = (drain, self.drain_limit);
+        None
     }
     /// Snapshot without waiting for any transport I/O.
     pub fn snapshot(&self) -> Snapshot {
@@ -167,6 +225,7 @@ impl Generation {
             active: state.active,
             legacy: state.legacy,
             retired: state.retired,
+            superseded_for: state.superseded_since.map(|since| since.elapsed()),
         }
     }
     /// Subscribe before reading state so a concurrent release is not missed.

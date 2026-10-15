@@ -305,7 +305,13 @@ reserves independent control capacity before calling `serve`.
 `Generation::run_until_retired` owns refresh scheduling and session notifications.
 The refresh callback reads application manifests and maps reports. Selection only
 wakes observers when it advances. Session leases prevent retirement while a client
-still has obligations. Persist `retry::State` against the application's candidate
+still has obligations. Without a drain limit that wait is unbounded, so one lease
+that is never released keeps a superseded generation alive and can block later
+upgrades. `Generation::with_drain_limit` bounds it: once the limit has passed since
+a newer generation was first selected, the generation retires with its remaining
+leases and `run_until_retired` returns `Retirement::DrainExpired`. The application
+decides how to end those sessions. `Snapshot::superseded_for` reports how long the
+drain has been running. Persist `retry::State` against the application's candidate
 fingerprint before a recovery launch, including candidates that can die after commit.
 
 ## Migration map
