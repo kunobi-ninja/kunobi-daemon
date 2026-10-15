@@ -64,6 +64,15 @@ impl Candidate {
         self.selected = true;
     }
 }
+/// A daemon started by [`DaemonCommand`](crate::launch::DaemonCommand) as a
+/// candidate: dropped before [`Candidate::selected`], it is stopped. Take its
+/// readiness channel first; the candidate keeps it but does not give it out.
+#[cfg(feature = "launch")]
+impl From<crate::launch::DaemonChild> for Candidate {
+    fn from(_daemon: crate::launch::DaemonChild) -> Self {
+        unimplemented!("kunobi-daemon#69")
+    }
+}
 impl Drop for Candidate {
     fn drop(&mut self) {
         let Some(mut process) = self.process.take() else {
