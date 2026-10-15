@@ -72,3 +72,32 @@ fn a_published_record_is_owner_only() {
         0o600
     );
 }
+
+#[test]
+fn a_slot_waits_for_its_lock_holder_and_times_out_while_it_stays() {
+    use kunobi_daemon::ProcessLock;
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    let holder = ProcessLock::try_acquire(root.path().join("selected.record.lock"))
+        .unwrap()
+        .unwrap();
+    let start = Instant::now();
+    let refused = slot.replace(b"blocked").unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() >= Duration::from_secs(2));
+    assert!(!path.exists());
+
+    let release = std::thread::spawn(move || {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The holder keeps the slot lock for a measured time so the publisher must wait for it."
+        )]
+        std::thread::sleep(Duration::from_millis(100));
+        drop(holder);
+    });
+    slot.replace(b"after").unwrap();
+    release.join().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"after");
+}
