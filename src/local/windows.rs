@@ -537,6 +537,12 @@ pub fn session_end_requested() -> bool {
     SESSION_END.load(Ordering::Acquire)
 }
 
+/// Complete when this process is asked to stop.
+#[cfg(feature = "async")]
+pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    Ok(std::future::pending())
+}
+
 const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
@@ -612,6 +618,38 @@ impl StdioInheritGuard {
 impl Drop for StdioInheritGuard {
     fn drop(&mut self) {
         let _ = self.restore();
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+mod session_end_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_session_end_completes_the_shutdown_signal_and_holds_the_process() {
+        let signal = shutdown_signal().unwrap();
+        // Ctrl+C is left to the next handler; it is not a session end.
+        // SAFETY: the handler reads its argument and touches statics only.
+        assert_eq!(unsafe { session_end_handler(0) }, 0);
+        assert!(!session_end_requested());
+
+        let (returned, handler_returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: as above. Windows also runs it on a thread of its own.
+            unsafe { session_end_handler(CTRL_LOGOFF_EVENT) };
+            let _ = returned.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(10), signal)
+            .await
+            .expect("a logoff completes the shutdown signal");
+        assert!(session_end_requested());
+        // Windows ends the process once the handler returns, so it must not.
+        // A wait cannot prove "never"; this one can only miss a regression.
+        assert!(
+            handler_returned
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
     }
 }
 

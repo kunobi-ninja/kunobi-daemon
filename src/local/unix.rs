@@ -577,6 +577,12 @@ pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
     }
 }
 
+/// Complete when this process is asked to stop.
+#[cfg(feature = "async")]
+pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    Ok(std::future::pending())
+}
+
 impl super::peer::PeerCredentials for UnixDuplex {
     fn credentials(&self) -> io::Result<crate::peer::Credentials> {
         fd_credentials(self.stream.as_raw_fd())
