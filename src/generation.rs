@@ -226,7 +226,8 @@ impl Generation {
                 .drain_limit
                 .zip(state.superseded_since)
                 .is_some_and(|(limit, since)| since.elapsed() >= limit);
-        if !expired && !(idle && state.active == 0) {
+        let idle = idle && state.active == 0;
+        if !(expired || idle) {
             return None;
         }
         state.retired = true;
