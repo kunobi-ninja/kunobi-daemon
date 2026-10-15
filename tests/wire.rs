@@ -632,6 +632,39 @@ fn a_refusal_goes_only_to_a_client_of_this_service_that_reads_it() {
     }
 }
 
+/// Offers from this service that read refusals but that `accept` would drop
+/// as malformed.
+fn malformed() -> [Hello; 3] {
+    [
+        Hello {
+            minimum: 0,
+            ..reading()
+        },
+        Hello {
+            minimum: 3,
+            maximum: 2,
+            ..reading()
+        },
+        Hello {
+            max_frame: 0,
+            ..reading()
+        },
+    ]
+}
+
+#[test]
+fn refuse_gives_a_malformed_offer_only_the_close() {
+    for reason in [Refused::PeerRejected, Refused::Retiring] {
+        for client in malformed() {
+            let refuse = move |peer: TcpStream| Session::refuse(peer, &offer(), reason).unwrap();
+            assert!(
+                reply_to(&client, refuse).is_empty(),
+                "{reason:?} {client:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn an_older_server_closing_without_a_reason_stays_an_ordinary_error() {
     let (client, mut server) = sockets();
@@ -754,6 +787,33 @@ async fn async_peers_send_and_read_refusals() {
     .unwrap();
     server.unwrap();
     assert!(reply.unwrap().is_empty());
+}
+
+#[cfg(feature = "wire-async")]
+#[tokio::test]
+async fn async_refuse_gives_a_malformed_offer_only_the_close() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server_offer = offer();
+    for client_offer in malformed() {
+        let sent = frame(&client_offer);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (reply, server) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    client.write_all(&wire::MAGIC).await?;
+                    client.write_all(&sent).await?;
+                    let mut reply = Vec::new();
+                    client.read_to_end(&mut reply).await?;
+                    Ok::<_, io::Error>(reply)
+                },
+                wire::AsyncSession::refuse(server, &server_offer, Refused::Retiring),
+            )
+        })
+        .await
+        .unwrap();
+        server.unwrap();
+        assert!(reply.unwrap().is_empty(), "{client_offer:?}");
+    }
 }
 
 #[test]

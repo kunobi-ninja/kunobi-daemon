@@ -28,9 +28,39 @@ def additive(old, new):
     return all(line in lines for line in old.splitlines())
 
 
+def schema_problems(old, new):
+    """Why the new schema text cannot replace the old one; empty if it can."""
+    return [] if additive(old, new) else ["the schema changed or lost a line"]
+
+
+# Edits of the released schema, and whether a peer built from the edited one
+# still interoperates with the released one. The checker must agree with each.
+SCHEMA_EDITS = [
+    ("  uint64 sequence = 2;\n", "  /*\n  uint64 sequence = 2;\n  */\n  fixed64 sequence = 2;\n", False),
+    ("bytes token = 4;", "bytes attempt = 4;", True),
+    ("  bool retiring = 10;\n}", "  bool retiring = 10;\n  string reason = 11;\n}", True),
+    ("uint32 process_id = 1;\n  uint64 generation = 2;", "string process_id = 1;\n  uint64 generation = 2;", False),
+    ("optional uint64 offset = 5;", "uint64 offset = 5;", False),
+    ("bytes payload = 6;", "repeated bytes payload = 6;", False),
+    ("  string build = 3;\n", "  reserved 3;\n", False),
+    ("  RETIRING = 4;\n", "", False),
+    ("MessageKind kind = 7;", "LifecycleChange kind = 7;", False),
+]
+
+
+def check_schema_checker(released):
+    for before, after, compatible in SCHEMA_EDITS:
+        assert released.count(before) == 1, f"edit no longer applies: {before!r}"
+        problems = schema_problems(released, released.replace(before, after))
+        assert (not problems) == compatible, f"checker misjudged {before!r} -> {after!r}: {problems}"
+
+
 def frozen_contract(old, new):
     schema = "proto/lifecycle.proto"
-    assert additive((old / schema).read_text(), (new / schema).read_text()), "lifecycle schema changed or lost a line"
+    released = (old / schema).read_text()
+    check_schema_checker(released)
+    problems = schema_problems(released, (new / schema).read_text())
+    assert not problems, f"lifecycle schema is incompatible: {problems}"
     for file, pattern in [
         ("src/wire.rs", r"pub const VERSION: u32 = \d+;"),
         ("src/readiness/channel.rs", r'pub const ENV: &str = "[^"]+";'),
