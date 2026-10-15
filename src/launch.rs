@@ -417,7 +417,9 @@ fn unix_stdio(target: &DaemonOutput) -> io::Result<Stdio> {
 /// Dropping it leaves the daemon running, as dropping a `std::process::Child`
 /// does. On Unix the daemon is also reaped once it exits, so a launcher that
 /// gives up on it leaves no zombie: at once if it has exited, otherwise by a
-/// thread that waits for it while it runs. [`Candidate::from`](crate::Candidate)
+/// thread that waits for it while it runs. That thread is best effort: if it
+/// cannot be created, a running daemon becomes a zombie when it exits, as
+/// before. [`Candidate::from`](crate::Candidate)
 /// takes it as a candidate that is stopped unless selected.
 ///
 /// Its [`ProcessHandle`] is opened at spawn, before anything can reap the

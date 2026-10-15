@@ -125,7 +125,8 @@ impl Drop for Candidate {
 
 /// A child that is reaped, never stopped, when dropped: at once if it has
 /// exited, otherwise by a thread that waits for it. On Unix a child nothing
-/// waits for stays a zombie after it exits.
+/// waits for stays a zombie after it exits. Reaping a running child is best
+/// effort: if no thread can be created, nothing waits for it.
 #[derive(Debug)]
 pub(crate) struct Reaped(Option<Child>);
 impl Reaped {
@@ -156,6 +157,8 @@ impl Drop for Reaped {
         if child.try_wait().is_ok_and(|status| status.is_some()) {
             return;
         }
+        // A failed spawn drops the closure and the child with it; the
+        // `try_wait` above was the last chance to reap it.
         let _ = std::thread::Builder::new()
             .name("daemon-reaper".into())
             .spawn(move || {
