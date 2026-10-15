@@ -74,8 +74,9 @@ caller's pipes is suppressed around spawn (`StdioInheritGuard`).
 On Windows, `local::windows::install_session_end_handler` arms CLOSE, LOGOFF
 and SHUTDOWN so a published pipe is not left behind after logoff.
 `local::shutdown_signal` builds on it: the handler wakes waiting futures, and
-because Windows ends the process once the handler returns, it then holds the
-callback thread until the process exits or Windows' timeout ends it. On Unix
+because Windows ends the process once the handler returns, it holds the
+callback thread while such a future is alive, until the process exits or
+Windows' timeout ends it. On Unix
 the same function waits for SIGTERM or SIGINT. Handlers are installed before it
 returns, so an early request is not lost.
 

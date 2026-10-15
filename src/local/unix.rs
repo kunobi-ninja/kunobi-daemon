@@ -591,9 +591,12 @@ pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
 /// On Windows this is built on `local::windows::install_session_end_handler`,
 /// and `local::windows::session_end_requested` reports the same events.
 /// Windows ends the process as soon as that handler returns for close, logoff
-/// or shutdown, so once this has been called the handler does not return for
-/// them: the process runs until it exits on its own or until Windows' timeout
-/// for that event ends it.
+/// or shutdown, so while a future from this function is alive the handler
+/// holds such an event instead: the process runs until it exits on its own or
+/// until Windows' timeout for the event ends it. Once every future has
+/// completed or been dropped, a later session end ends the process at once.
+/// The future completes whichever of this crate's and Tokio's console handlers
+/// Windows calls first.
 ///
 /// Call it inside a Tokio runtime with I/O enabled (`enable_io` or
 /// `enable_all`); it panics outside one.

@@ -504,11 +504,10 @@ static SESSION_END: AtomicBool = AtomicBool::new(false);
 /// Wakes [`shutdown_signal`] futures when [`SESSION_END`] is set.
 #[cfg(feature = "async")]
 static SESSION_END_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
-/// Set once [`shutdown_signal`] has been called: the handler then keeps the
-/// process alive after a session end instead of returning.
+/// Live [`shutdown_signal`] futures. While any exists, the handler holds a
+/// session end instead of returning.
 #[cfg(feature = "async")]
-static HOLD_SESSION_END: AtomicBool = AtomicBool::new(false);
-static SESSION_END_HANDLER: std::sync::OnceLock<Result<(), i32>> = std::sync::OnceLock::new();
+static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 const CTRL_CLOSE_EVENT: u32 = 2;
 const CTRL_LOGOFF_EVENT: u32 = 5;
@@ -527,6 +526,10 @@ unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
     ) {
         return 0;
     }
+    // Decide before waking: a waiter may complete and be dropped at once, and
+    // the session end it reported still needs the hold for its cleanup.
+    #[cfg(feature = "async")]
+    let hold = WAITERS.load(Ordering::SeqCst) > 0;
     SESSION_END.store(true, Ordering::Release);
     #[cfg(feature = "async")]
     {
@@ -534,7 +537,7 @@ unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
         // Windows ends the process when this returns. Park this callback
         // thread instead, so the process can finish on its own; its exit, or
         // Windows' timeout for the event, ends the thread.
-        if HOLD_SESSION_END.load(Ordering::Acquire) {
+        if hold {
             loop {
                 std::thread::park();
             }
@@ -545,19 +548,17 @@ unsafe extern "system" fn session_end_handler(event: u32) -> i32 {
 
 /// Arm CLOSE/LOGOFF/SHUTDOWN so a published pipe is not left after logoff.
 ///
-/// The handler is registered once per process; later calls return the first
-/// call's result.
+/// Each call registers the handler again. Registering it more than once is
+/// harmless: for a session end the first copy Windows calls returns or holds,
+/// so the others are not called, and other events pass every copy unchanged.
 pub fn install_session_end_handler() -> io::Result<()> {
-    let installed = *SESSION_END_HANDLER.get_or_init(|| {
-        // SAFETY: `session_end_handler` is process-lifetime and touches only
-        // statics that are safe to use from the system-created callback thread.
-        if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
-        }
-    });
-    installed.map_err(io::Error::from_raw_os_error)
+    // SAFETY: `session_end_handler` is process-lifetime and touches only
+    // statics that are safe to use from the system-created callback thread.
+    if unsafe { SetConsoleCtrlHandler(Some(session_end_handler), 1) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
@@ -571,23 +572,65 @@ pub fn session_end_requested() -> bool {
 /// Handlers are installed before this returns, so a request that arrives
 /// afterwards is not lost even if the future has not been polled yet. This is
 /// built on [`install_session_end_handler`], and [`session_end_requested`]
-/// reports the same events. Windows ends the process as soon as that handler
-/// returns for close, logoff or shutdown, so once this has been called the
-/// handler does not return for them: the process runs until it exits on its
-/// own or until Windows' timeout for that event ends it.
+/// reports the same events.
 ///
-/// Call it inside a Tokio runtime.
+/// Windows ends the process as soon as a handler returns for close, logoff or
+/// shutdown. While a future from this function is alive, the handler holds
+/// such an event instead: the process runs until it exits on its own or until
+/// Windows' timeout for the event ends it. Once every future has completed or
+/// been dropped, a later session end ends the process at once, as it did
+/// before this was called.
+///
+/// Windows calls console handlers newest first. Tokio's handler is registered
+/// before this crate's, so this crate's normally sees a session end first. If
+/// Tokio's runs first anyway, for example because the process changed console,
+/// the future still completes: it also listens to Tokio's close, logoff and
+/// shutdown streams.
+///
+/// Each call registers the session-end handler again. Call it inside a Tokio
+/// runtime.
 #[cfg(feature = "async")]
 pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    // Tokio registers its console handler with its first stream. Create the
+    // streams first so this crate's handler, registered next, runs before it.
+    let mut interrupt = ctrl_c()?;
+    let mut close = ctrl_close()?;
+    let mut logoff = ctrl_logoff()?;
+    let mut shutdown = ctrl_shutdown()?;
     install_session_end_handler()?;
-    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
-    HOLD_SESSION_END.store(true, Ordering::Release);
+    let waiter = Waiter::new();
     Ok(async move {
+        let _waiter = waiter;
         tokio::select! {
-            _ = ctrl_c.recv() => {}
+            _ = interrupt.recv() => {}
             () = session_end() => {}
+            // Tokio's handler ran first and ends the event, so this crate's
+            // never saw it.
+            _ = close.recv() => SESSION_END.store(true, Ordering::Release),
+            _ = logoff.recv() => SESSION_END.store(true, Ordering::Release),
+            _ = shutdown.recv() => SESSION_END.store(true, Ordering::Release),
         }
     })
+}
+
+/// Counts one live [`shutdown_signal`] future in [`WAITERS`].
+#[cfg(feature = "async")]
+struct Waiter;
+
+#[cfg(feature = "async")]
+impl Waiter {
+    fn new() -> Self {
+        WAITERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(feature = "async")]
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Complete once [`session_end_requested`] is true, without polling it.
