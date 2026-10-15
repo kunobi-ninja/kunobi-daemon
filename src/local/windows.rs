@@ -23,6 +23,27 @@ use super::{ConnectError, Endpoint};
 use crate::local::Duplex;
 use crate::transport::WriteHalf;
 
+/// Open or create a lock file, refusing a symlink or junction in its place.
+///
+/// The refusal is `PermissionDenied`. Who may open the file is decided by the
+/// directory's ACL, which the file inherits.
+pub(crate) fn open_private(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Opens a reparse point itself instead of what it names.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(file)
+}
+
 /// A named-pipe connection with independent read and write ownership.
 pub struct WindowsDuplex {
     stream: Stream,

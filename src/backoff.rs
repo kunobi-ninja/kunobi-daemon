@@ -1,8 +1,9 @@
 //! A check repeated with a growing pause, where the OS offers no event.
 //!
-//! Two places need it: a `local::ProcessHandle` that can only follow a PID,
-//! and a child this process owns whose exit cannot be observed as an event,
-//! which is asked through `try_wait` instead.
+//! Three places need it: a `local::ProcessHandle` that can only follow a PID,
+//! a child this process owns whose exit cannot be observed as an event, which
+//! is asked through `try_wait` instead, and a wait for a `ProcessLock`, whose
+//! release the OS does not signal.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -28,7 +29,7 @@ pub(crate) fn poll(
         };
         #[expect(
             clippy::disallowed_methods,
-            reason = "OS exit events are unavailable on this fallback path; bound polling with backoff."
+            reason = "The OS signals neither this exit nor a lock release; bound polling with backoff."
         )]
         std::thread::sleep(nap);
     }

@@ -75,15 +75,9 @@ where
         {
             return Ok(current);
         }
-        let _upgrade = loop {
-            if let Some(guard) =
-                ProcessLock::try_acquire(upgrade_lock).map_err(UpgradeError::Lock)?
-            {
-                break guard;
-            }
-            #[expect(clippy::disallowed_methods, reason = "The cross-process upgrade lock exposes try_acquire but no async wake source.")]
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
+        let _upgrade = ProcessLock::acquire_async(upgrade_lock)
+            .await
+            .map_err(UpgradeError::Lock)?;
         if let Some(current) = probe().await.map_err(UpgradeError::Probe)?
             && accepts(&current)
         {

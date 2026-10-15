@@ -253,6 +253,35 @@ pub(crate) fn own_uid() -> u32 {
     unsafe { geteuid() }
 }
 
+/// Open or create a lock file private to the effective user.
+///
+/// The final component must not be a symlink and the file must belong to this
+/// user. Either refusal is `PermissionDenied`. The mode becomes 0600.
+pub(crate) fn open_private(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            // O_NOFOLLOW reports a symlink as ELOOP.
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                io::ErrorKind::PermissionDenied.into()
+            } else {
+                error
+            }
+        })?;
+    if file.metadata()?.uid() != own_uid() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 /// The user `getpeereid` reports for a connected socket, captured at connect.
 #[cfg(target_os = "macos")]
 fn macos_peer_uid(fd: RawFd) -> io::Result<u32> {

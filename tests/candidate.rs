@@ -52,7 +52,9 @@ fn cancelling_a_candidate_releases_ownership_but_a_selected_process_keeps_workin
         } else {
             assert!(!dir.path().join("completed").exists());
         }
-        wait(|_| ProcessLock::try_acquire(&lock));
+        ProcessLock::acquire_until(&lock, Instant::now() + Duration::from_secs(10))
+            .unwrap()
+            .expect("the child released ownership");
     }
 }
 
