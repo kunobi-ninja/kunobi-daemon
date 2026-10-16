@@ -12,8 +12,13 @@ use buffa::Message;
 #[allow(missing_docs, clippy::derivable_impls)]
 mod generated;
 use crate::ServiceIdentity;
-pub use generated::{Control, Health, Hello, LifecycleChange, LifecycleEvent, MessageKind};
-use std::io::{self, Read, Write};
+pub use generated::{
+    Control, Health, Hello, LifecycleChange, LifecycleEvent, MessageKind, Refusal,
+};
+use std::{
+    fmt,
+    io::{self, Read, Write},
+};
 
 /// Identifies the binary transport, independently of application versions.
 pub const MAGIC: [u8; 8] = *b"KNDPB002";
@@ -104,6 +109,8 @@ pub mod operation {
 impl Hello {
     /// Offer capabilities for a stable service installation. Use the same
     /// identity to derive resource paths and negotiate on both endpoints.
+    /// The offer reads refusals: [`Session::connect`] reports a server's
+    /// [`Refused`] reason.
     pub fn new(identity: &ServiceIdentity, supported: u64, required: u64) -> Self {
         Self {
             minimum: VERSION,
@@ -115,6 +122,7 @@ impl Hello {
             profile: identity.profile().into(),
             instance: identity.instance().into(),
             service_id: identity.id().to_vec(),
+            reads_refusal: true,
             ..Default::default()
         }
     }
@@ -202,14 +210,15 @@ pub struct Agreement {
 pub fn negotiate(local: &Hello, remote: &Hello) -> io::Result<Agreement> {
     local.validate()?;
     remote.validate()?;
-    if local.service_id != remote.service_id
-        || local.application != remote.application
-        || local.profile != remote.profile
-        || local.instance != remote.instance
-    {
+    if !same_service(local, remote) {
         return Err(invalid("service identity mismatch"));
     }
     Terms::of(local).agree(Terms::of(remote))
+}
+
+fn same_service(a: &Hello, b: &Hello) -> bool {
+    (&a.service_id, &a.application, &a.profile, &a.instance)
+        == (&b.service_id, &b.application, &b.profile, &b.instance)
 }
 
 fn required_capability(message: &Control) -> io::Result<u64> {
@@ -227,6 +236,91 @@ fn required_capability(message: &Control) -> io::Result<u64> {
         o::PREPARE..=o::ABORT => Ok(c::HANDOFF),
         o::WATCH => Ok(c::WATCH),
         _ => Err(invalid("unknown control operation")),
+    }
+}
+
+/// Why a server refused a connection during negotiation. A client handshake
+/// returns it inside an [`io::ErrorKind::ConnectionRefused`] error; read it
+/// with [`Refused::of`]. A server that closes without a reason, an older
+/// server included, still produces an ordinary I/O error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refused {
+    /// The client lacks a binary version or capability the server requires.
+    /// The same client build cannot succeed against this server.
+    ProtocolTooOld,
+    /// The server's peer policy rejected this client.
+    PeerRejected,
+    /// The server is retiring. Read discovery again to find its successor.
+    Retiring,
+}
+
+impl Refused {
+    /// The refusal inside an error from a client handshake, if the server sent one.
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+
+    /// The frame refusing `remote`, if that client reads refusals and sends a
+    /// well-formed offer for the service `offer` serves. A wrong identity or a
+    /// malformed offer gets no reply, as from [`Session::accept`].
+    fn frame(self, offer: &Hello, remote: &Hello) -> Option<Hello> {
+        let reason = match self {
+            Self::ProtocolTooOld => Refusal::PROTOCOL_TOO_OLD,
+            Self::PeerRejected => Refusal::PEER_REJECTED,
+            Self::Retiring => Refusal::SERVER_RETIRING,
+        };
+        let answered = remote.reads_refusal && same_service(offer, remote);
+        (answered && remote.validate().is_ok()).then(|| Hello {
+            refusal: reason.into(),
+            ..Default::default()
+        })
+    }
+}
+
+/// What a server sends before closing on a failed negotiation: a refusal only
+/// to a client that lacks a version or capability `offer` requires. A server
+/// too old for the client gets only the close.
+fn rejection(offer: &Hello, remote: &Hello) -> Option<Hello> {
+    if remote.maximum < VERSION || offer.required & !remote.supported != 0 {
+        Refused::ProtocolTooOld.frame(offer, remote)
+    } else {
+        None
+    }
+}
+
+/// Fail with the server's refusal if `remote` is one rather than an offer.
+fn check_refusal(remote: &Hello) -> io::Result<()> {
+    let refused = match remote.refusal.as_known() {
+        Some(Refusal::NOT_REFUSED) => return Ok(()),
+        Some(Refusal::PROTOCOL_TOO_OLD) => Refused::ProtocolTooOld,
+        Some(Refusal::PEER_REJECTED) => Refused::PeerRejected,
+        Some(Refusal::SERVER_RETIRING) => Refused::Retiring,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection refused for an unknown reason",
+            ));
+        }
+    };
+    Err(refused.into())
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ProtocolTooOld => "the server requires a newer protocol than this client offers",
+            Self::PeerRejected => "the server's peer policy rejected this client",
+            Self::Retiring => "the server is retiring; read discovery again",
+        })
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl From<Refused> for io::Error {
+    fn from(refused: Refused) -> Self {
+        io::Error::new(io::ErrorKind::ConnectionRefused, refused)
     }
 }
 
@@ -342,6 +436,7 @@ impl<S: Read + Write> Session<S> {
         let mut frames = Framed::new(io, HELLO_LIMIT)?;
         frames.send(offer)?;
         let remote: Hello = frames.receive()?;
+        check_refusal(&remote)?;
         let agreement = negotiate(offer, &remote)?;
         frames.io.write_all(&[1])?;
         frames.io.flush()?;
@@ -352,22 +447,49 @@ impl<S: Read + Write> Session<S> {
 
     /// Admit a connection on the separate v2 listener, after authenticating its
     /// OS peer. No request is dispatched if either peer rejects the negotiation.
-    pub fn accept(mut io: S, offer: &Hello) -> io::Result<Self> {
+    pub fn accept(io: S, offer: &Hello) -> io::Result<Self> {
         offer.validate()?;
-        let mut magic = [0; 8];
-        io.read_exact(&mut magic)?;
-        if magic != MAGIC {
-            return Err(invalid("wrong binary protocol magic"));
-        }
-        let mut frames = Framed::new(io, HELLO_LIMIT)?;
-        let remote: Hello = frames.receive()?;
-        let agreement = negotiate(offer, &remote)?;
+        let (mut frames, remote) = Self::offered(io)?;
+        let agreement = match negotiate(offer, &remote) {
+            Ok(agreement) => agreement,
+            Err(error) => {
+                if let Some(refusal) = rejection(offer, &remote) {
+                    // The failed negotiation is the error to report.
+                    let _ = frames.send(&refusal);
+                }
+                return Err(error);
+            }
+        };
         frames.send(offer)?;
         read_acceptance(&mut frames.io)?;
         frames.io.write_all(&[1])?;
         frames.io.flush()?;
         frames.limit = agreement.max_frame;
         Ok(Self { frames, agreement })
+    }
+
+    /// Read a client's offer and refuse it for `reason`, then close the
+    /// connection. Use it for a peer the policy rejected, or while retiring.
+    /// A client that does not read refusals, or that names another service,
+    /// sees only the close, as from an older server.
+    pub fn refuse(io: S, offer: &Hello, reason: Refused) -> io::Result<()> {
+        let (mut frames, remote) = Self::offered(io)?;
+        match reason.frame(offer, &remote) {
+            Some(refusal) => frames.send(&refusal),
+            None => Ok(()),
+        }
+    }
+
+    /// Read the magic and the client's offer.
+    fn offered(mut io: S) -> io::Result<(Framed<S>, Hello)> {
+        let mut magic = [0; 8];
+        io.read_exact(&mut magic)?;
+        if magic != MAGIC {
+            return Err(invalid("wrong binary protocol magic"));
+        }
+        let mut frames = Framed::new(io, HELLO_LIMIT)?;
+        let remote = frames.receive()?;
+        Ok((frames, remote))
     }
 
     /// Access the transport to change I/O deadlines after establishment.

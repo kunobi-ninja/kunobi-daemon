@@ -33,6 +33,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
         session.io.write_all(&MAGIC).await?;
         session.send_message(offer).await?;
         let remote: Hello = session.receive_message().await?;
+        check_refusal(&remote)?;
         let agreement = negotiate(offer, &remote)?;
         session.io.write_all(&[1]).await?;
         session.io.flush().await?;
@@ -44,20 +45,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncSession<S> {
     /// Establish a server session after the caller has authenticated the peer.
     pub async fn accept(io: S, offer: &Hello) -> io::Result<Self> {
         offer.validate()?;
-        let mut session = Self::unestablished(io);
-        let mut magic = [0; 8];
-        session.io.read_exact(&mut magic).await?;
-        if magic != MAGIC {
-            return Err(invalid("wrong binary protocol magic"));
-        }
-        let remote: Hello = session.receive_message().await?;
-        let agreement = negotiate(offer, &remote)?;
+        let (mut session, remote) = Self::offered(io).await?;
+        let agreement = match negotiate(offer, &remote) {
+            Ok(agreement) => agreement,
+            Err(error) => {
+                if let Some(refusal) = rejection(offer, &remote) {
+                    // The failed negotiation is the error to report.
+                    let _ = session.send_message(&refusal).await;
+                }
+                return Err(error);
+            }
+        };
         session.send_message(offer).await?;
         session.read_acceptance().await?;
         session.io.write_all(&[1]).await?;
         session.io.flush().await?;
         session.agreement = agreement;
         Ok(session)
+    }
+
+    /// Async equivalent of [`Session::refuse`].
+    pub async fn refuse(io: S, offer: &Hello, reason: Refused) -> io::Result<()> {
+        let (mut session, remote) = Self::offered(io).await?;
+        match reason.frame(offer, &remote) {
+            Some(refusal) => session.send_message(&refusal).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Read the magic and the client's offer.
+    async fn offered(io: S) -> io::Result<(Self, Hello)> {
+        let mut session = Self::unestablished(io);
+        let mut magic = [0; 8];
+        session.io.read_exact(&mut magic).await?;
+        if magic != MAGIC {
+            return Err(invalid("wrong binary protocol magic"));
+        }
+        let remote = session.receive_message().await?;
+        Ok((session, remote))
     }
 
     async fn read_acceptance(&mut self) -> io::Result<()> {

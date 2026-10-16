@@ -39,7 +39,8 @@ pub enum RequestError {
     },
     /// The deadline passed before a reply arrived.
     Late,
-    /// Negotiation, framing or the reply itself failed.
+    /// Negotiation, framing or the reply itself failed. A server that refused
+    /// the connection says why through [`wire::Refused::of`].
     Protocol(io::Error),
 }
 

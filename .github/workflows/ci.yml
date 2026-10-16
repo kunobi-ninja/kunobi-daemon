@@ -63,6 +63,8 @@ jobs:
           ref: v0.8.0
           path: previous
       - run: rustup toolchain install 1.95.0 --profile minimal
+      # The schema check compiles both schemas and compares their descriptors.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler python3-protobuf
       - run: python3 current/scripts/check-cross-version.py previous current
         env:
           RUSTUP_TOOLCHAIN: 1.95.0
