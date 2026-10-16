@@ -36,6 +36,20 @@ const FRESH: Duration = Duration::from_secs(10);
 /// recent temporary file of this record shows a publication in progress;
 /// without one the record is opened once more and that answer stands.
 pub(super) fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
+    retry_open(
+        || open.open(path),
+        || publishing(path),
+        Instant::now() + PUBLISHING,
+    )
+}
+
+/// [`open_record`] with the open and the check for a publication in
+/// progress passed in, so tests can drive each step.
+fn retry_open<T>(
+    mut open: impl FnMut() -> io::Result<T>,
+    mut publishing: impl FnMut() -> bool,
+    deadline: Instant,
+) -> io::Result<T> {
     let mut denied = 0;
     let mut rechecked = false;
     let mut opened = None;
@@ -43,7 +57,7 @@ pub(super) fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
     crate::backoff::poll(
         || {
             loop {
-                match open.open(path) {
+                match open() {
                     Ok(file) => {
                         opened = Some(file);
                         return Ok(true);
@@ -55,7 +69,7 @@ pub(super) fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
                         denied += 1;
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        if publishing(path) {
+                        if publishing() {
                             missing = Some(error);
                             return Ok(false);
                         }
@@ -68,7 +82,7 @@ pub(super) fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
                 }
             }
         },
-        Some(Instant::now() + PUBLISHING),
+        Some(deadline),
     )?;
     opened.ok_or_else(|| missing.unwrap_or_else(|| io::ErrorKind::NotFound.into()))
 }
@@ -95,9 +109,14 @@ fn publishing(path: &Path) -> bool {
             && entry
                 .metadata()
                 .and_then(|metadata| metadata.created())
-                // A creation time ahead of the clock counts as recent.
-                .is_ok_and(|created| now.duration_since(created).unwrap_or_default() < FRESH)
+                .is_ok_and(|created| fresh(created, now))
     })
+}
+
+/// Whether a temporary created at `created` can belong to a publication in
+/// progress at `now`.
+fn fresh(created: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(created).unwrap_or_default() < FRESH
 }
 
 fn is_temporary(name: &OsStr, record: &OsStr) -> bool {
@@ -236,8 +255,99 @@ fn verbatim(path: &Path) -> OsString {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// Drive `retry_open` through scripted opens and publication checks, and
+    /// return its result with what it did not use.
+    fn scripted(
+        opens: Vec<io::Result<u32>>,
+        publishing: Vec<bool>,
+    ) -> (io::Result<u32>, usize, usize) {
+        let mut opens = VecDeque::from(opens);
+        let mut publishing = VecDeque::from(publishing);
+        let result = super::retry_open(
+            || opens.pop_front().expect("one open too many"),
+            || publishing.pop_front().expect("one check too many"),
+            Instant::now() + Duration::from_secs(10),
+        );
+        (result, opens.len(), publishing.len())
+    }
+
+    fn missing() -> io::Result<u32> {
+        Err(io::ErrorKind::NotFound.into())
+    }
+
+    #[test]
+    fn a_missing_record_is_waited_for_while_it_is_published() {
+        let (opened, opens, checks) = scripted(vec![missing(), missing(), Ok(7)], vec![true, true]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    #[test]
+    fn without_a_publication_a_missing_record_is_opened_once_more() {
+        let (opened, opens, checks) = scripted(vec![missing(), Ok(7)], vec![false]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+
+        let (opened, opens, checks) = scripted(vec![missing(), missing()], vec![false, false]);
+        assert_eq!(opened.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    /// A publication ends between an open and the check, a second one
+    /// starts and is waited for, and it too ends between an open and the
+    /// check. The record is there by then, so it must be opened again.
+    #[test]
+    fn a_record_published_after_a_wait_is_opened_once_more() {
+        let (opened, opens, checks) = scripted(
+            vec![missing(), missing(), missing(), Ok(7)],
+            vec![false, true, false],
+        );
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    #[test]
+    fn a_publication_is_waited_for_only_until_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(20);
+        let opened: io::Result<u32> = super::retry_open(missing, || true, deadline);
+        assert_eq!(opened.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn a_refused_open_is_retried_a_few_times() {
+        let denied = || Err(io::Error::from_raw_os_error(super::ERROR_ACCESS_DENIED));
+        let (opened, opens, _) = scripted(vec![denied(), denied(), Ok(7)], vec![]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!(opens, 0);
+
+        let mut opens: Vec<_> = (0..=super::DENIED_RETRIES).map(|_| denied()).collect();
+        opens.push(Ok(7));
+        let (opened, opens, _) = scripted(opens, vec![]);
+        assert_eq!(
+            opened.unwrap_err().raw_os_error(),
+            Some(super::ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn only_a_recent_temporary_marks_a_publication() {
+        let now = SystemTime::now();
+        assert!(super::fresh(now, now));
+        assert!(super::fresh(now - Duration::from_secs(9), now));
+        assert!(!super::fresh(now - Duration::from_secs(11), now));
+        // A little ahead is clock granularity; far ahead is a clock that
+        // moved back since a crash left the temporary.
+        assert!(super::fresh(now + Duration::from_millis(500), now));
+        assert!(!super::fresh(now + Duration::from_secs(3600), now));
+    }
 
     #[test]
     fn a_record_another_handle_holds_open_is_replaced_in_one_step() {
@@ -270,6 +380,16 @@ mod tests {
         let temporary = |name: &str| super::is_temporary(OsStr::new(name), record);
         assert!(temporary(".discovery.json.4321.0.tmp"));
         assert!(temporary(".discovery.json.1.25.tmp"));
+        // NTFS names ignore case, beyond ASCII too.
+        assert!(temporary(".Discovery.JSON.1.0.tmp"));
+        assert!(super::is_temporary(
+            OsStr::new(".ÉTAT.1.0.tmp"),
+            OsStr::new("état")
+        ));
+        assert!(!super::is_temporary(
+            OsStr::new(".etat.1.0.tmp"),
+            OsStr::new("état")
+        ));
         for other in [
             "discovery.json",
             "discovery.json.1.0.tmp",

@@ -88,30 +88,26 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
 }
 
 /// On Windows a replacement can leave the record's name missing while the
-/// rename is in progress; the temporary file is still there. A read in that
-/// moment waits for the publication instead of reporting no record.
+/// rename is in progress; the temporary file is still there. A read then
+/// waits for the publication, up to 2 s, instead of reporting no record.
+/// NTFS names ignore case, so a temporary of the same record under another
+/// case counts. The record appearing during the wait is covered step by
+/// step by the unit tests in `src/publication/windows.rs`.
 #[cfg(windows)]
 #[test]
-fn a_slot_read_waits_for_a_record_being_published() {
-    use std::time::Duration;
+fn a_slot_read_waits_while_a_temporary_shows_a_publication() {
+    use std::time::{Duration, Instant};
     let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("discovery");
-    let temporary = root
-        .path()
-        .join(format!(".discovery.{}.0.tmp", std::process::id()));
-    std::fs::write(&temporary, b"new").unwrap();
-    let slot = kunobi_daemon::RecordSlot::new(&path);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "The publication must still be in progress when the reader finds no record."
-            )]
-            std::thread::sleep(Duration::from_millis(200));
-            std::fs::rename(&temporary, &path).unwrap();
-        });
-        assert_eq!(slot.read().unwrap().as_deref(), Some(&b"new"[..]));
-    });
+    std::fs::write(
+        root.path()
+            .join(format!(".DISCOVERY.{}.0.tmp", std::process::id())),
+        b"new",
+    )
+    .unwrap();
+    let slot = kunobi_daemon::RecordSlot::new(root.path().join("discovery"));
+    let start = Instant::now();
+    assert_eq!(slot.read().unwrap(), None);
+    assert!(start.elapsed() >= Duration::from_secs(2));
 }
 
 /// A missing record is reported at once when no publication is in progress,
