@@ -20,54 +20,70 @@ fn old_record_cleanup_preserves_a_new_publication_and_its_lock_inode() {
 
 #[test]
 fn concurrent_publishers_and_readers_only_observe_complete_records() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    // A reader keeps reading for as long as both publishers replace the
-    // record, so a replacement that briefly hides the record is caught on
-    // every run rather than now and then. One reader leaves moments with no
-    // handle open, which is when a replacement can leave the old record
-    // pending deletion on Windows.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    // Probabilistic coverage: a reader reads without pause while two
+    // publishers replace the record, and the publishers keep going until it
+    // has read at least READS times, so those reads overlapped publication.
+    // One reader leaves moments with no handle open, which is when a
+    // replacement can leave the old record pending deletion on Windows.
     const PUBLISHERS: usize = 2;
-    const READERS: usize = 1;
+    const PUBLICATIONS: usize = 500;
+    const READS: usize = 200;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("discovery");
     let a = Arc::new(vec![b'a'; 32_768]);
     let b = Arc::new(vec![b'b'; 65_536]);
     publish_record(&path, &a).unwrap();
     let publishing = AtomicUsize::new(PUBLISHERS);
-    let barrier = std::sync::Barrier::new(PUBLISHERS + READERS);
+    let reads = AtomicUsize::new(0);
+    let reading = AtomicBool::new(true);
+    let barrier = std::sync::Barrier::new(PUBLISHERS + 1);
     std::thread::scope(|scope| {
         for bytes in [&a, &b] {
-            let (barrier, publishing, path) = (&barrier, &publishing, &path);
+            let (barrier, publishing, reads, reading, path) =
+                (&barrier, &publishing, &reads, &reading, &path);
             scope.spawn(move || {
-                // Counts this publisher out even if it panics, so readers stop.
-                struct Finished<'a>(&'a AtomicUsize);
-                impl Drop for Finished<'_> {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, Ordering::Release);
+                // Counts this publisher out even if it panics, so the reader stops.
+                let _finished = OnDrop(|| {
+                    publishing.fetch_sub(1, Ordering::Release);
+                });
+                barrier.wait();
+                for published in 1.. {
+                    publish_record(path, bytes).unwrap();
+                    let enough_reads =
+                        reads.load(Ordering::Acquire) >= READS || !reading.load(Ordering::Acquire);
+                    if published >= PUBLICATIONS && enough_reads {
+                        break;
                     }
                 }
-                let _finished = Finished(publishing);
-                barrier.wait();
-                for _ in 0..500 {
-                    publish_record(path, bytes).unwrap();
-                }
             });
         }
-        for _ in 0..READERS {
-            let (barrier, publishing, path, a, b) = (&barrier, &publishing, &path, &a, &b);
-            scope.spawn(move || {
-                barrier.wait();
-                while publishing.load(Ordering::Acquire) > 0 {
-                    let contents = std::fs::read(path).unwrap();
-                    assert!(
-                        contents == **a || contents == **b,
-                        "reader saw a partial publication"
-                    );
-                }
-            });
-        }
+        let (barrier, publishing, reads, reading, path, a, b) =
+            (&barrier, &publishing, &reads, &reading, &path, &a, &b);
+        scope.spawn(move || {
+            // Lets the publishers stop even if a read panics.
+            let _finished = OnDrop(|| reading.store(false, Ordering::Release));
+            barrier.wait();
+            while publishing.load(Ordering::Acquire) > 0 {
+                let contents = std::fs::read(path).unwrap();
+                assert!(
+                    contents == **a || contents == **b,
+                    "reader saw a partial publication"
+                );
+                reads.fetch_add(1, Ordering::Release);
+            }
+        });
     });
+    assert!(reads.into_inner() >= READS);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+/// Runs a closure when dropped, including during a panic.
+struct OnDrop<F: FnMut()>(F);
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
 }
 
 #[test]
