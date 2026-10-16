@@ -530,7 +530,7 @@ pub fn install_session_end_handler() -> io::Result<()> {
 }
 
 /// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran,
-/// or once a [`shutdown_signal`] future completed on one of them.
+/// or once a `shutdown_signal` future completed on one of them.
 pub fn session_end_requested() -> bool {
     SESSION_END.load(Ordering::Acquire)
 }
