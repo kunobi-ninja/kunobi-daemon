@@ -16,19 +16,25 @@
 //! owner, so after a descriptor is passed or inherited the two can describe
 //! different processes.
 //!
-//! On Windows, a server sees its client's PID and a client sees the server's.
-//! `same_user` compares that process's token user with this process's: a
-//! lookup by PID, so if the original peer has exited while another process
-//! holds its handle, a process that reused the PID is checked instead. A pipe
-//! that reports no PID, or a process that cannot be queried, is an error.
+//! On Windows, a server sees its client's PID and a client sees the server's,
+//! reported as `pid`. A server reads its client's user from the connection
+//! itself when it can: it impersonates the client, reads that token's user,
+//! and returns the thread to the token it had before on every path, a panic
+//! included. The connection carries no user while a client under dynamic
+//! context tracking has not had a message read by the server yet, or when the client allows only
+//! anonymous impersonation; the server then looks the user up by PID instead.
+//! A client has no call that reads its server's context, so it always looks
+//! the server up by PID. A lookup by PID describes whichever process has the
+//! PID now: if the peer has exited while another process holds its handle, a
+//! process that reused the PID is checked instead. `user_evidence` says which
+//! of the two answered. A pipe that reports no PID, or a user that cannot be
+//! read, is an error.
 
 use crate::peer::Credentials;
 use std::io;
 
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
-pub(crate) use windows::pipe_credentials;
 
 /// A connection that can report [`Credentials`] for its peer: the crate's
 /// adapters, std and Tokio Unix streams, and `interprocess` local sockets on

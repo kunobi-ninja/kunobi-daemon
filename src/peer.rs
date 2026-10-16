@@ -28,20 +28,65 @@ use std::{borrow::Cow, fmt};
 /// Read them while the connection is open and before dispatching anything.
 /// Later fields, such as a code-signature result, will be added without a
 /// breaking change; construct them with [`Credentials::new`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality compares `pid` and `same_user` only. `user_evidence` says where
+/// `same_user` came from; compare it explicitly when it matters.
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Credentials {
     /// Kernel-reported PID of the peer, or `None` when the platform reports none.
     pub pid: Option<ProcessId>,
     /// Whether the peer runs as this process's OS user.
     pub same_user: bool,
+    /// Where `same_user` came from.
+    pub user_evidence: UserEvidence,
 }
+
+impl PartialEq for Credentials {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.same_user == other.same_user
+    }
+}
+
+impl Eq for Credentials {}
 
 impl Credentials {
     /// Credentials from an OS query, or for a consumer's own tests and sources.
+    /// The user check is taken to come from the connection; see
+    /// [`Self::with_user_evidence`].
     pub const fn new(pid: Option<ProcessId>, same_user: bool) -> Self {
-        Self { pid, same_user }
+        Self {
+            pid,
+            same_user,
+            user_evidence: UserEvidence::Connection,
+        }
     }
+
+    /// The same credentials, with `same_user` coming from `evidence`.
+    pub const fn with_user_evidence(self, evidence: UserEvidence) -> Self {
+        Self {
+            user_evidence: evidence,
+            ..self
+        }
+    }
+}
+
+/// Where [`Credentials::same_user`] came from.
+///
+/// A policy that must not rest on a PID can require [`Self::Connection`]; the
+/// built-in policies accept either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UserEvidence {
+    /// The user the OS recorded for the connection itself: the Unix kernel's
+    /// peer credentials, or a named-pipe client's own security context.
+    Connection,
+    /// The user of the process that has the connection's peer PID. If the peer
+    /// has exited while another process holds its end, a process that reused
+    /// the PID is checked instead. A Windows client checking its server gets
+    /// this, and so does a server that has not yet read from a client under
+    /// dynamic context tracking.
+    PidLookup,
 }
 
 /// Why a policy refused a connection.
@@ -358,6 +403,24 @@ mod tests {
 
     fn creds(pid_value: u32, same_user: bool) -> Credentials {
         Credentials::new(Some(pid(pid_value)), same_user)
+    }
+
+    #[test]
+    fn credentials_say_where_the_user_check_came_from() {
+        let connection = creds(7, true);
+        assert_eq!(connection.user_evidence, UserEvidence::Connection);
+        let lookup = connection
+            .clone()
+            .with_user_evidence(UserEvidence::PidLookup);
+        assert_eq!(lookup.user_evidence, UserEvidence::PidLookup);
+        assert_eq!(
+            (lookup.pid, lookup.same_user),
+            (connection.pid, connection.same_user)
+        );
+        // Equality is about what was reported, not where it came from.
+        assert_eq!(lookup, connection);
+        assert_ne!(creds(7, false), connection);
+        assert_ne!(creds(8, true), connection);
     }
 
     #[test]

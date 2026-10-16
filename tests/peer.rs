@@ -5,7 +5,9 @@
 #![cfg(feature = "local")]
 
 use kunobi_daemon::local::peer::PeerCredentials;
-use kunobi_daemon::peer::{Credentials, ExpectedProcess, First, Rejected, SameUser, authenticate};
+use kunobi_daemon::peer::{
+    Credentials, ExpectedProcess, First, Rejected, SameUser, UserEvidence, authenticate,
+};
 use kunobi_daemon::{Candidate, ProcessId};
 use std::{
     io::{Read, Write},
@@ -64,8 +66,12 @@ fn peer_fixture_process() {
     let mut stream = connect(&endpoint);
     let server_evidence = client_evidence(&stream);
     assert_eq!(
-        server_evidence,
-        Credentials::new(ProcessId::new(server), true)
+        (
+            server_evidence.pid,
+            server_evidence.same_user,
+            server_evidence.user_evidence
+        ),
+        (ProcessId::new(server), true, CLIENT_USER_EVIDENCE)
     );
     let accepted = authenticate(
         &stream,
@@ -77,9 +83,21 @@ fn peer_fixture_process() {
     let _ = stream.read(&mut [0u8; 1]);
 }
 
-/// The parent's checks on the connection it accepted from `child`.
+/// Where a client's check of its server's user comes from. A named pipe gives
+/// a client no call that reads the server's context.
+const CLIENT_USER_EVIDENCE: UserEvidence = if cfg!(windows) {
+    UserEvidence::PidLookup
+} else {
+    UserEvidence::Connection
+};
+
+/// The parent's checks on the connection it accepted from `child`, which
+/// wrote before they ran.
 fn check_accepted(peer: Credentials, child: ProcessId, announced: [u8; 4]) {
-    assert_eq!(peer, Credentials::new(Some(child), true));
+    assert_eq!(
+        (peer.pid, peer.same_user, peer.user_evidence),
+        (Some(child), true, UserEvidence::Connection)
+    );
     assert_eq!(peer.pid, ProcessId::new(u32::from_le_bytes(announced)));
     assert_ne!(peer.pid, Some(own_pid()));
 

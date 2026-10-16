@@ -66,12 +66,105 @@ pub(crate) fn process_runs_as_this_user(pid: crate::ProcessId) -> io::Result<boo
     let peer = token_user(process.0)?;
     // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
     let own = token_user(unsafe { GetCurrentProcess() })?;
+    Ok(same_sid(&peer, &own))
+}
+
+/// Whether the client of the server-end pipe `pipe` runs as this process's
+/// token user, read from the connection's own security context.
+///
+/// The thread impersonates the client, reads its token's user and goes back to
+/// the token it had before, on every path. Under dynamic context tracking
+/// Windows records a client's context each time it writes, so before the
+/// client's first bytes arrive this fails with `ERROR_CANNOT_IMPERSONATE`; a
+/// client that allows only anonymous impersonation gives
+/// `ERROR_CANT_OPEN_ANONYMOUS`. `Ok(false)` only after a successful SID
+/// comparison.
+pub(crate) fn pipe_client_runs_as_this_user(pipe: Handle) -> io::Result<bool> {
+    // Read first: as the client, this thread may not be allowed to open this
+    // process's token.
+    // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
+    let own = token_user(unsafe { GetCurrentProcess() })?;
+    let client = {
+        let _client = Impersonating::pipe_client(pipe)?;
+        thread_token_user()?
+    };
+    Ok(same_sid(&client, &own))
+}
+
+/// Whether two `TOKEN_USER` buffers name the same SID.
+fn same_sid(first: &[usize], second: &[usize]) -> bool {
     // SAFETY: TOKEN_USER starts with a SID_AND_ATTRIBUTES whose first member is
     // the SID pointer, so element 0 of each buffer is that pointer. Both
-    // buffers, and the SIDs the kernel wrote inside them, are owned locals that
-    // outlive this call. EqualSid only reads them.
-    let equal = unsafe { EqualSid(peer[0] as *const c_void, own[0] as *const c_void) };
-    Ok(equal != 0)
+    // buffers, and the SIDs the kernel wrote inside them, are borrowed for this
+    // call. EqualSid only reads them.
+    unsafe { EqualSid(first[0] as *const c_void, second[0] as *const c_void) != 0 }
+}
+
+/// This thread runs as a named-pipe client until the guard drops, then goes
+/// back to the token it had before: none, or the one it was impersonating.
+///
+/// Dropping restores the token on every path, a panic included. If Windows
+/// refuses, the process aborts: a thread left running as the client would run
+/// everything after this with the client's identity.
+struct Impersonating {
+    previous: Option<Event>,
+}
+
+impl Impersonating {
+    fn pipe_client(pipe: Handle) -> io::Result<Self> {
+        let previous = thread_token(TOKEN_QUERY | TOKEN_IMPERSONATE)?;
+        // SAFETY: `pipe` is the caller's live server-end pipe handle; the call
+        // only changes this thread's token.
+        if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for Impersonating {
+    fn drop(&mut self) {
+        let restored = match &self.previous {
+            // SAFETY: a null thread pointer names this thread, and `token` is
+            // the live token it had before, opened with TOKEN_IMPERSONATE.
+            Some(token) => unsafe { SetThreadToken(ptr::null_mut(), token.0) },
+            // SAFETY: ends this thread's impersonation; it had no token before.
+            None => unsafe { RevertToSelf() },
+        };
+        if restored == 0 {
+            std::process::abort();
+        }
+    }
+}
+
+const TOKEN_IMPERSONATE: u32 = 0x0004;
+const TOKEN_QUERY: u32 = 0x0008;
+const ERROR_NO_TOKEN: i32 = 1008;
+
+/// The token this thread is impersonating, or `None` when it has none.
+///
+/// Access is checked against the process's token (`OpenAsSelf`): a client's
+/// token at identification level could not open anything.
+fn thread_token(access: u32) -> io::Result<Option<Event>> {
+    let mut token = ptr::null_mut();
+    // SAFETY: GetCurrentThread returns this thread's pseudo-handle and `token`
+    // is a valid output slot.
+    if unsafe { OpenThreadToken(GetCurrentThread(), access, 1, &mut token) } != 0 {
+        return Ok(Some(Event(token)));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NO_TOKEN) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// The user of the token this thread is impersonating.
+fn thread_token_user() -> io::Result<Vec<usize>> {
+    let token =
+        thread_token(TOKEN_QUERY)?.ok_or_else(|| io::Error::from_raw_os_error(ERROR_NO_TOKEN))?;
+    query_token_user(&token)
 }
 
 /// One-time compatibility fallback for a protocol-v1 peer that cannot drain:
@@ -190,7 +283,7 @@ impl WriteHalf for WindowsWriter {
 
 impl super::peer::PeerCredentials for WindowsDuplex {
     fn credentials(&self) -> io::Result<crate::peer::Credentials> {
-        super::peer::pipe_credentials(&self.stream)
+        super::peer::PeerCredentials::credentials(&self.stream)
     }
 }
 
@@ -324,6 +417,7 @@ unsafe extern "system" {
     fn GetHandleInformation(object: Handle, flags: *mut u32) -> i32;
     fn SetHandleInformation(object: Handle, mask: u32, flags: u32) -> i32;
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn GetCurrentThread() -> Handle;
 }
 
 #[link(name = "advapi32")]
@@ -338,6 +432,10 @@ unsafe extern "system" {
     ) -> i32;
     fn EqualSid(first: *const c_void, second: *const c_void) -> i32;
     fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+    fn ImpersonateNamedPipeClient(pipe: Handle) -> i32;
+    fn OpenThreadToken(thread: Handle, access: u32, open_as_self: i32, token: *mut Handle) -> i32;
+    fn SetThreadToken(thread: *mut Handle, token: Handle) -> i32;
+    fn RevertToSelf() -> i32;
 }
 
 /// Memory the OS allocated with `LocalAlloc`.
@@ -377,13 +475,18 @@ pub(crate) fn current_user_sid() -> io::Result<String> {
     String::from_utf16(sid).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+/// The user of `process`'s token.
 fn token_user(process: Handle) -> io::Result<Vec<usize>> {
     let mut token = ptr::null_mut();
-    // SAFETY: process is live and token is a valid output slot; TOKEN_QUERY=8.
-    if unsafe { OpenProcessToken(process, 8, &mut token) } == 0 {
+    // SAFETY: process is live and token is a valid output slot.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = Event(token);
+    query_token_user(&Event(token))
+}
+
+/// `TOKEN_USER` for `token`, opened with `TOKEN_QUERY`.
+fn query_token_user(token: &Event) -> io::Result<Vec<usize>> {
     let mut needed = 0;
     // SAFETY: `token` is a live token handle and TokenUser is class 1. A null
     // buffer with length 0 is the documented size query: the call writes only
@@ -1376,5 +1479,246 @@ mod tests {
         read.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"x");
         server.join().unwrap();
+    }
+}
+
+/// Clients for tests of a server end's evidence, including one that writes as
+/// another user: the anonymous logon, which any thread can impersonate.
+#[cfg(test)]
+pub(crate) mod test_clients {
+    use super::*;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ImpersonateAnonymousToken(thread: Handle) -> i32;
+    }
+
+    /// Open the pipe `name` with dynamic context tracking at identification
+    /// level: the server sees the user of whichever thread wrote last.
+    pub(crate) fn connect_tracking(name: &str) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+        const SECURITY_CONTEXT_TRACKING: u32 = 0x0004_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION | SECURITY_CONTEXT_TRACKING)
+            .open(format!(r"\\.\pipe\{name}"))
+    }
+
+    /// Write `bytes` while this thread impersonates the anonymous logon, so a
+    /// tracking pipe records another user for this process's connection.
+    pub(crate) fn write_as_anonymous(pipe: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+        // SAFETY: GetCurrentThread returns a pseudo-handle for this thread.
+        if unsafe { ImpersonateAnonymousToken(GetCurrentThread()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let written = pipe.write_all(bytes);
+        // SAFETY: ends the impersonation this function started on this thread.
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0, "the test client must stop impersonating");
+        written
+    }
+}
+
+#[cfg(test)]
+mod server_end_evidence_tests {
+    use super::test_clients::{connect_tracking, write_as_anonymous};
+    use super::*;
+    use crate::{
+        ProcessId,
+        local::peer::PeerCredentials,
+        peer::{Credentials, UserEvidence},
+    };
+    use interprocess::local_socket::traits::Listener as _;
+    use interprocess::local_socket::{ListenerOptions, Stream as Client};
+    use std::sync::mpsc;
+
+    const BUDGET: Duration = Duration::from_secs(20);
+
+    /// Accept one connection on a fresh pipe, read the client's first byte
+    /// when `read_first`, and run `check` on the server end, on the thread
+    /// that accepted it. `client` runs on its own thread with the pipe's name
+    /// and should wait for the server to close before it exits.
+    fn on_server_end<T: Send + 'static>(
+        tag: &str,
+        read_first: bool,
+        client: impl FnOnce(String) + Send + 'static,
+        check: impl FnOnce(&Client) -> T + Send + 'static,
+    ) -> T {
+        let name = format!("daemon-evidence-{tag}-{}", std::process::id());
+        let listener = ListenerOptions::new()
+            .name(name.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .unwrap();
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut server = listener.accept().unwrap();
+            if read_first {
+                server.read_exact(&mut [0u8; 1]).unwrap();
+            }
+            let _ = sent.send(check(&server));
+        });
+        let client = std::thread::spawn(move || client(name));
+        let checked = received
+            .recv_timeout(BUDGET)
+            .expect("the server end was not checked within the budget");
+        client.join().unwrap();
+        checked
+    }
+
+    fn server_evidence(
+        tag: &str,
+        read_first: bool,
+        client: impl FnOnce(String) + Send + 'static,
+    ) -> io::Result<Credentials> {
+        on_server_end(tag, read_first, client, |server| server.credentials())
+    }
+
+    fn writes_as_anonymous(name: String) {
+        let mut pipe = connect_tracking(&name).unwrap();
+        write_as_anonymous(&mut pipe, b"x").unwrap();
+        let _ = pipe.read(&mut [0u8; 1]);
+    }
+
+    fn pipe_handle(server: &Client) -> Handle {
+        let Client::NamedPipe(pipe) = server;
+        pipe.as_handle().as_raw_handle()
+    }
+
+    fn thread_has_token() -> bool {
+        thread_token(TOKEN_QUERY).unwrap().is_some()
+    }
+
+    fn this_process() -> Option<ProcessId> {
+        ProcessId::new(std::process::id())
+    }
+
+    #[test]
+    fn a_server_end_reads_its_clients_user_from_the_connection() {
+        // The client is this process, so a lookup by PID would find this
+        // process's user. The connection carries the user that wrote.
+        let evidence = server_evidence("anonymous", true, writes_as_anonymous);
+        let evidence = evidence.unwrap();
+        assert_eq!(
+            (evidence.pid, evidence.same_user, evidence.user_evidence),
+            (this_process(), false, UserEvidence::Connection)
+        );
+    }
+
+    #[test]
+    fn a_panic_while_impersonating_still_restores_the_thread() {
+        let outcome = on_server_end("panic", true, writes_as_anonymous, |server| {
+            let pipe = pipe_handle(server);
+            let mut impersonating = false;
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _client = Impersonating::pipe_client(pipe).unwrap();
+                impersonating = thread_has_token();
+                panic!("inside the impersonation");
+            }));
+            (impersonating, panicked.is_err(), thread_has_token())
+        });
+        assert_eq!(outcome, (true, true, false));
+    }
+
+    /// The `TokenId` of `token`: unique to that token, unlike its user.
+    fn token_id(token: &Event) -> u64 {
+        // TOKEN_STATISTICS is 56 bytes and starts with the TokenId LUID.
+        let mut statistics = [0u64; 8];
+        let mut needed = 0;
+        // SAFETY: `token` is a live token handle opened with TOKEN_QUERY,
+        // TokenStatistics is class 10, and the aligned buffer is larger than
+        // TOKEN_STATISTICS.
+        let read = unsafe {
+            GetTokenInformation(
+                token.0,
+                10,
+                statistics.as_mut_ptr().cast(),
+                std::mem::size_of_val(&statistics) as u32,
+                &mut needed,
+            )
+        };
+        assert_ne!(read, 0, "{}", io::Error::last_os_error());
+        statistics[0]
+    }
+
+    #[test]
+    fn an_impersonating_thread_gets_its_own_token_back() {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn ImpersonateSelf(level: i32) -> i32;
+        }
+        const SECURITY_IMPERSONATION: i32 = 2;
+        // The thread already impersonates a copy of this process's token.
+        // Reading the client must leave that copy in place, not drop it.
+        let outcome = on_server_end("previous", true, writes_as_anonymous, |server| {
+            // SAFETY: changes only this thread's token; reverted below.
+            assert_ne!(unsafe { ImpersonateSelf(SECURITY_IMPERSONATION) }, 0);
+            let before = thread_token(TOKEN_QUERY)
+                .unwrap()
+                .map(|token| token_id(&token));
+            let same_user = server.credentials().map(|evidence| evidence.same_user);
+            let token = thread_token(TOKEN_QUERY).unwrap();
+            // The very token it had, not a fresh token for the same user.
+            let kept = before.is_some() && token.as_ref().map(token_id) == before;
+            let user = token.map(|token| query_token_user(&token).unwrap());
+            // SAFETY: ends the impersonation ImpersonateSelf started.
+            assert_ne!(unsafe { RevertToSelf() }, 0);
+            // SAFETY: GetCurrentProcess returns a borrowed pseudo-handle.
+            let own = token_user(unsafe { GetCurrentProcess() }).unwrap();
+            (same_user.ok(), user.map(|user| same_sid(&user, &own)), kept)
+        });
+        assert_eq!(outcome, (Some(false), Some(true), true));
+    }
+
+    #[test]
+    fn a_same_user_client_that_wrote_is_the_same_user() {
+        let evidence = server_evidence("same-user", true, |name| {
+            let mut pipe =
+                Client::connect(name.as_str().to_ns_name::<GenericNamespaced>().unwrap()).unwrap();
+            pipe.write_all(b"x").unwrap();
+            let _ = pipe.read(&mut [0u8; 1]);
+        });
+        let evidence = evidence.unwrap();
+        assert_eq!(
+            (evidence.pid, evidence.same_user, evidence.user_evidence),
+            (this_process(), true, UserEvidence::Connection)
+        );
+    }
+
+    #[test]
+    fn a_client_that_allows_only_anonymous_impersonation_falls_back_to_its_pid() {
+        let evidence = server_evidence("anonymous-level", true, |name| {
+            use std::os::windows::fs::OpenOptionsExt;
+            const SECURITY_ANONYMOUS: u32 = 0;
+            let mut pipe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_ANONYMOUS)
+                .open(format!(r"\\.\pipe\{name}"))
+                .unwrap();
+            pipe.write_all(b"x").unwrap();
+            let _ = pipe.read(&mut [0u8; 1]);
+        });
+        let evidence = evidence.unwrap();
+        assert_eq!(
+            (evidence.pid, evidence.same_user, evidence.user_evidence),
+            (this_process(), true, UserEvidence::PidLookup)
+        );
+    }
+
+    #[test]
+    fn a_server_end_whose_client_has_not_written_falls_back_to_its_pid() {
+        // The connection carries no user yet, so the evidence is the same as
+        // a lookup by PID gives, and says so.
+        let evidence = server_evidence("silent", false, |name| {
+            let mut pipe = connect_tracking(&name).unwrap();
+            let _ = pipe.read(&mut [0u8; 1]);
+        });
+        let evidence = evidence.unwrap();
+        assert_eq!(
+            (evidence.pid, evidence.same_user, evidence.user_evidence),
+            (this_process(), true, UserEvidence::PidLookup)
+        );
     }
 }
