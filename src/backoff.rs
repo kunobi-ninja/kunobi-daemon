@@ -93,6 +93,11 @@ mod tests {
         assert!(!poll(|| Ok(false), Some(deadline)).unwrap());
         assert!(Instant::now() >= deadline);
 
+        // A check that would only hold after the deadline is not made: the
+        // last pause ends at the deadline, and success then would be late.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(!poll(|| Ok(Instant::now() >= deadline), Some(deadline)).unwrap());
+
         let error = poll(|| Err(io::Error::other("check failed")), None).unwrap_err();
         assert_eq!(error.to_string(), "check failed");
     }
