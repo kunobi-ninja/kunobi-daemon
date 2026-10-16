@@ -31,8 +31,8 @@ impl ProcessLock {
     ///
     /// Opens the file as [`Self::try_acquire`] does. Returns `Ok(None)` if the
     /// lock is still held at the deadline; a deadline already passed still gets
-    /// one attempt. The OS signals no release, so contention is rechecked after
-    /// a pause that grows to 50 ms.
+    /// one attempt, and no later attempt is made after it. The OS signals no
+    /// release, so contention is rechecked after a pause that grows to 50 ms.
     pub fn acquire_until(path: impl AsRef<Path>, deadline: Instant) -> io::Result<Option<Self>> {
         Self::lock_until(open_or_create(path.as_ref())?, deadline)
     }
@@ -42,8 +42,10 @@ impl ProcessLock {
     /// Refuses a lock file that is a symlink, or a junction on Windows. On Unix
     /// the file must also belong to the effective user, and its mode becomes
     /// 0600. Either refusal is `PermissionDenied`. Directories on the path are
-    /// not checked: keep the lock in a private application-owned directory,
-    /// whose ACL is also what makes the file private on Windows.
+    /// not checked: keep the lock in a private application-owned directory.
+    /// On Windows nothing about access is checked: a new file inherits the
+    /// directory's ACL, but an existing lock file keeps its own, so the caller
+    /// must secure a lock file it did not create.
     #[cfg(feature = "local")]
     pub fn acquire_private_until(
         path: impl AsRef<Path>,

@@ -14,7 +14,8 @@ pub(crate) const FIRST: Duration = Duration::from_millis(1);
 const LONGEST: Duration = Duration::from_millis(50);
 
 /// Check `done` until it holds or `deadline` passes, or without a deadline.
-/// True once it held.
+/// True once it held. The first check is made even if the deadline has
+/// passed; later checks are made only before it.
 pub(crate) fn poll(
     mut done: impl FnMut() -> io::Result<bool>,
     deadline: Option<Instant>,
@@ -32,6 +33,13 @@ pub(crate) fn poll(
             reason = "The OS signals neither this exit nor a lock release; bound polling with backoff."
         )]
         std::thread::sleep(nap);
+        // A pause may overrun. Success after the deadline is late, as in
+        // `readiness::wait_until`, so it is not checked for.
+        if deadline
+            .is_some_and(|deadline| deadline.saturating_duration_since(Instant::now()).is_zero())
+        {
+            return Ok(false);
+        }
     }
 }
 

@@ -25,8 +25,8 @@ use crate::transport::WriteHalf;
 
 /// Open or create a lock file, refusing a symlink or junction in its place.
 ///
-/// The refusal is `PermissionDenied`. Who may open the file is decided by the
-/// directory's ACL, which the file inherits.
+/// The refusal is `PermissionDenied`. Access is not checked: a new file
+/// inherits the directory's ACL, and an existing one keeps its own.
 pub(crate) fn open_private(path: &std::path::Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     // Opens a reparse point itself instead of what it names.
