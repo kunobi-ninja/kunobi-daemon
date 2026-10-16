@@ -12,7 +12,7 @@ use std::{
 #[allow(unsafe_code)]
 mod windows;
 #[cfg(windows)]
-use windows::replace;
+use windows::{open_record, replace};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -88,14 +88,15 @@ impl RecordOptions {
 /// directory is not synced; this does not promise survival across power loss.
 /// With `durable`, [`publish_record_with`] syncs it.
 ///
-/// A reader opens either the old record or the new one. On Windows the
-/// temporary file is renamed through its own handle with POSIX semantics, so
-/// the record is never briefly pending deletion, which a reader's open would
-/// see as `PermissionDenied`. A file system without POSIX renames falls back
-/// to `std::fs::rename`, where that window remains. The publisher keeps its
-/// handle open for a moment after the rename: a reader that does not share
-/// write and delete access can get a sharing violation then. `File::open`
-/// shares both.
+/// A reader reads either the old record or the new one, never part of one.
+/// On Windows the temporary file is renamed through its own handle with POSIX
+/// semantics, falling back to `std::fs::rename` on a file system without
+/// them. Neither makes the replacement atomic for an open running at the same
+/// time: the open can fail with `PermissionDenied`, or find no record while
+/// the rename is in progress. [`RecordSlot::read`] and the slot's other reads
+/// retry both; any other reader must too. The publisher keeps its handle open
+/// for a moment after the rename: a reader that does not share write and
+/// delete access can get a sharing violation then. `File::open` shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     publish_record_with(path, contents, RecordOptions::new())
 }
@@ -160,6 +161,13 @@ fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Open a record. A Unix rename replaces the name in one step, so an open
+/// finds the old record or the new one.
+#[cfg(not(windows))]
+fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
+    open.open(path)
+}
+
 /// After the rename, flush what records the new name.
 fn sync_renamed(to: &Path, parent: &Path) -> io::Result<()> {
     let synced = if cfg!(windows) {
@@ -194,7 +202,7 @@ fn read_regular(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
         // directory at all, so both are refused below.
         open.custom_flags(0x0220_0000);
     }
-    let file = match open.open(path) {
+    let file = match open_record(&open, path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         // O_NOFOLLOW reports a symlink as ELOOP.
@@ -331,12 +339,18 @@ impl RecordSlot {
     /// sees one complete version. `None` when there is none. A record that
     /// is not a regular file, a symlink included, or that is longer than the
     /// read limit is `InvalidData`.
+    ///
+    /// On Windows an open that races a replacement can be refused, or find
+    /// no record while the rename is in progress. A refused open is retried a
+    /// few times. A missing record is waited for, up to 2 s, while a
+    /// temporary file of this record created in the last 10 s shows a
+    /// publication in progress; otherwise it is `None` at once.
     pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
         read_regular(&self.0, self.1.read_limit)
     }
 
     fn matches(&self, contents: &[u8]) -> io::Result<bool> {
-        let file = match File::open(&self.0) {
+        let file = match open_record(OpenOptions::new().read(true), &self.0) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
