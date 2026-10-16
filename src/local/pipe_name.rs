@@ -150,10 +150,18 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        // "DOMAIN\user","S-1-5-..."
-        let text = String::from_utf8(output.stdout).unwrap();
-        let sid = text.trim().rsplit(',').next().unwrap().trim_matches('"');
-        assert!(sid.starts_with("S-1-"), "{text}");
+        // "DOMAIN\user","S-1-5-...". The account name is in the console code
+        // page and may not be UTF-8; only the last field, the ASCII SID, is read.
+        let line = output.stdout.trim_ascii();
+        let field = line.rsplit(|&byte| byte == b',').next().unwrap();
+        let sid = std::str::from_utf8(field.trim_ascii())
+            .unwrap()
+            .trim_matches('"');
+        assert!(
+            sid.starts_with("S-1-"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         sid.to_owned()
     }
 
