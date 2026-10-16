@@ -26,7 +26,8 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
     // readers have read at least READS times, so those reads overlapped
     // publication. On Windows an open that races a replacement can be
     // refused, or find the name missing while the rename is in progress;
-    // `RecordSlot::read` must ride out both.
+    // `RecordSlot::read` must ride out both. One publisher is durable: its
+    // publications must succeed while the other one renames.
     const PUBLISHERS: usize = 2;
     const READERS: usize = 4;
     const PUBLICATIONS: usize = 1_000;
@@ -41,9 +42,10 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
     let reading = AtomicUsize::new(READERS);
     let barrier = std::sync::Barrier::new(PUBLISHERS + READERS);
     std::thread::scope(|scope| {
-        for bytes in [&a, &b] {
+        for (bytes, durable) in [(&a, false), (&b, true)] {
             let (barrier, publishing, reads, reading, path) =
                 (&barrier, &publishing, &reads, &reading, &path);
+            let options = kunobi_daemon::RecordOptions::new().durable(durable);
             scope.spawn(move || {
                 // Counts this publisher out even if it panics, so the readers stop.
                 let _finished = OnDrop(|| {
@@ -51,7 +53,7 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
                 });
                 barrier.wait();
                 for published in 1.. {
-                    publish_record(path, bytes).unwrap();
+                    kunobi_daemon::publish_record_with(path, bytes, options).unwrap();
                     // A reader that stopped early has panicked.
                     let enough_reads = reads.load(Ordering::Acquire) >= READS
                         || reading.load(Ordering::Acquire) < READERS;

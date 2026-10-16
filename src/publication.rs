@@ -53,9 +53,11 @@ impl RecordOptions {
     /// Make the rename itself survive a crash, not only the contents.
     ///
     /// On Unix the parent directory is synced after the rename. Windows has no
-    /// directory sync, so the record is flushed again after the rename. An
-    /// error from that step means the record is in place but may not survive
-    /// a crash.
+    /// directory sync, so the record is flushed again after the rename,
+    /// through the publisher's own handle. On a file system without POSIX
+    /// renames the record is reopened by name for that, and the open waits out
+    /// a concurrent replacement as [`RecordSlot::read`] does. An error from
+    /// that step means the record is in place but may not survive a crash.
     pub const fn durable(mut self, durable: bool) -> Self {
         self.durable = durable;
         self
@@ -95,8 +97,9 @@ impl RecordOptions {
 /// time: the open can fail with `PermissionDenied`, or find no record while
 /// the rename is in progress. [`RecordSlot::read`] and the slot's other reads
 /// retry both; any other reader must too. The publisher keeps its handle open
-/// for a moment after the rename: a reader that does not share write and
-/// delete access can get a sharing violation then. `File::open` shares both.
+/// for a moment after the rename, longer with `durable` while it flushes: a
+/// reader that does not share write and delete access can get a sharing
+/// violation then. `File::open` shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     publish_record_with(path, contents, RecordOptions::new())
 }
@@ -147,18 +150,21 @@ pub fn publish_record_with(path: &Path, contents: &[u8], options: RecordOptions)
     }
     file.write_all(contents)?;
     file.sync_all()?;
-    replace(file, &temporary.0, path)?;
-    if options.durable {
-        sync_renamed(path, parent)?;
-    }
-    Ok(())
+    replace(file, &temporary.0, path, options.durable)
 }
 
-/// Close the written temporary file and rename it over the record.
+/// Close the written temporary file and rename it over the record. With
+/// `durable`, sync the directory, so the rename survives a crash.
 #[cfg(not(windows))]
-fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
+fn replace(file: File, from: &Path, to: &Path, durable: bool) -> io::Result<()> {
     drop(file);
-    std::fs::rename(from, to)
+    std::fs::rename(from, to)?;
+    if durable {
+        // The temporary is named inside the record's directory.
+        let directory = from.parent().expect("a temporary has a directory");
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Open a record. A Unix rename replaces the name in one step, so an open
@@ -166,16 +172,6 @@ fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
     open.open(path)
-}
-
-/// After the rename, flush what records the new name.
-fn sync_renamed(to: &Path, parent: &Path) -> io::Result<()> {
-    let synced = if cfg!(windows) {
-        OpenOptions::new().write(true).open(to)?
-    } else {
-        File::open(parent)?
-    };
-    synced.sync_all()
 }
 
 /// Read a record that must be a regular file no longer than `limit` bytes.

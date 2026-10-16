@@ -322,7 +322,8 @@ the lower-level atomic-write primitive for callers already holding shared owners
 `RecordOptions` sets the record mode, a read limit and durability; the defaults
 are the original behaviour. A durable publication syncs the directory after the
 rename on Unix. Windows has no directory sync, so the record is flushed again
-after the rename. `replace_if` and `remove_if` read the record and decide under
+after the rename, through the publisher's own handle: reopening it by name could
+find it missing while another publisher renames. `replace_if` and `remove_if` read the record and decide under
 the slot lock, and `read` refuses anything but a regular file within the limit.
 On Windows no rename replaces a name atomically for an open running at the same
 time: the open can be refused, or find the name missing while a slow rename is
