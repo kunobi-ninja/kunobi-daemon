@@ -216,11 +216,17 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Rename `file`, open at `from`, over `to`.
+/// Rename `file`, open at `from`, over `to`. With `durable`, flush the record
+/// afterwards: Windows has no directory sync.
 ///
 /// POSIX semantics replace the name in one step, so a reader opens the old
 /// record or the new one and never one pending deletion. A file system that
 /// does not support them gets `std::fs::rename`, and with it the window.
+///
+/// After a POSIX rename `file` is the record, so the flush goes through it.
+/// Reopening by name could find no record while another publisher's rename
+/// is in progress. After `std::fs::rename` the record is reopened by name for
+/// the flush, through [`open_record`], which waits that out.
 pub(super) fn replace(file: File, from: &Path, to: &Path, durable: bool) -> io::Result<()> {
     replace_with(file, from, to, durable, rename_posix)
 }
@@ -241,13 +247,14 @@ fn replace_with(
         {
             drop(file);
             std::fs::rename(from, to)?;
+            if durable {
+                open_record(OpenOptions::new().write(true), to)?.sync_all()?;
+            }
+            Ok(())
         }
-        result => result?,
+        Ok(()) if durable => file.sync_all(),
+        result => result,
     }
-    if durable {
-        OpenOptions::new().write(true).open(to)?.sync_all()?;
-    }
-    Ok(())
 }
 
 fn rename_posix(file: &File, to: &Path) -> io::Result<()> {

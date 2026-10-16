@@ -53,9 +53,11 @@ impl RecordOptions {
     /// Make the rename itself survive a crash, not only the contents.
     ///
     /// On Unix the parent directory is synced after the rename. Windows has no
-    /// directory sync, so the record is flushed again after the rename. An
-    /// error from that step means the record is in place but may not survive
-    /// a crash.
+    /// directory sync, so the record is flushed again after the rename,
+    /// through the publisher's own handle. On a file system without POSIX
+    /// renames the record is reopened by name for that, and the open waits out
+    /// a concurrent replacement as [`RecordSlot::read`] does. An error from
+    /// that step means the record is in place but may not survive a crash.
     pub const fn durable(mut self, durable: bool) -> Self {
         self.durable = durable;
         self
@@ -95,8 +97,9 @@ impl RecordOptions {
 /// time: the open can fail with `PermissionDenied`, or find no record while
 /// the rename is in progress. [`RecordSlot::read`] and the slot's other reads
 /// retry both; any other reader must too. The publisher keeps its handle open
-/// for a moment after the rename: a reader that does not share write and
-/// delete access can get a sharing violation then. `File::open` shares both.
+/// for a moment after the rename, longer with `durable` while it flushes: a
+/// reader that does not share write and delete access can get a sharing
+/// violation then. `File::open` shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     publish_record_with(path, contents, RecordOptions::new())
 }
