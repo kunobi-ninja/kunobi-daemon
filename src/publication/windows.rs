@@ -228,15 +228,18 @@ unsafe extern "system" {
 /// is in progress. After `std::fs::rename` the record is reopened by name for
 /// the flush, through [`open_record`], which waits that out.
 pub(super) fn replace(file: File, from: &Path, to: &Path, durable: bool) -> io::Result<()> {
-    replace_with(file, from, to, durable, rename_posix)
+    replace_with(file, from, to, durable, rename_posix, File::sync_all)
 }
 
+/// [`replace`] with the rename and the flush passed in, so tests can see
+/// which handle is flushed, and when.
 fn replace_with(
     file: File,
     from: &Path,
     to: &Path,
     durable: bool,
     rename: impl FnOnce(&File, &Path) -> io::Result<()>,
+    flush: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
     match rename(&file, to) {
         Err(error)
@@ -248,11 +251,11 @@ fn replace_with(
             drop(file);
             std::fs::rename(from, to)?;
             if durable {
-                open_record(OpenOptions::new().write(true), to)?.sync_all()?;
+                flush(&open_record(OpenOptions::new().write(true), to)?)?;
             }
             Ok(())
         }
-        Ok(()) if durable => file.sync_all(),
+        Ok(()) if durable => flush(&file),
         result => result,
     }
 }
@@ -313,9 +316,12 @@ fn verbatim(path: &Path) -> OsString {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime};
 
     /// Drive `retry_open` through scripted opens and publication checks, and
@@ -466,7 +472,6 @@ mod tests {
 
     #[test]
     fn a_lasting_denial_is_returned() {
-        use std::os::windows::io::AsRawHandle;
         let root = tempfile::tempdir().unwrap();
         let record = root.path().join("record");
         std::fs::write(&record, b"old").unwrap();
@@ -515,14 +520,14 @@ mod tests {
                 super::ERROR_NOT_SUPPORTED,
             ))
         };
-        super::replace_with(file, &temporary, &record, false, unsupported).unwrap();
+        super::replace_with(file, &temporary, &record, false, unsupported, sync).unwrap();
         assert_eq!(std::fs::read(&record).unwrap(), b"new");
         assert!(!temporary.exists());
 
         // A durable fallback flushes the record it renamed by path.
         std::fs::write(&temporary, b"durable").unwrap();
         let file = std::fs::File::open(&temporary).unwrap();
-        super::replace_with(file, &temporary, &record, true, unsupported).unwrap();
+        super::replace_with(file, &temporary, &record, true, unsupported, sync).unwrap();
         assert_eq!(std::fs::read(&record).unwrap(), b"durable");
         assert!(!temporary.exists());
 
@@ -530,7 +535,7 @@ mod tests {
             |_: &std::fs::File, _: &std::path::Path| Err(std::io::Error::from_raw_os_error(5));
         std::fs::write(&temporary, b"newer").unwrap();
         let file = std::fs::File::open(&temporary).unwrap();
-        assert!(super::replace_with(file, &temporary, &record, true, denied).is_err());
+        assert!(super::replace_with(file, &temporary, &record, true, denied, sync).is_err());
         assert_eq!(std::fs::read(&record).unwrap(), b"durable");
     }
 
@@ -557,9 +562,104 @@ mod tests {
             super::rename_posix(file, to)?;
             std::fs::rename(to, &aside)
         };
-        super::replace_with(file, &temporary, &record, true, renamed_away).unwrap();
+        super::replace_with(file, &temporary, &record, true, renamed_away, sync).unwrap();
         assert_eq!(std::fs::read(&aside).unwrap(), b"new");
         assert!(!record.exists());
         assert!(!temporary.exists());
+    }
+
+    /// The production flush.
+    fn sync(file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    /// A record holding `old`, and a temporary holding `new` opened as
+    /// `publish_record_with` opens it.
+    fn prepared(root: &Path) -> (PathBuf, PathBuf, File) {
+        let record = root.join("record");
+        std::fs::write(&record, b"old").unwrap();
+        let temporary = root.join("temporary");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(super::ACCESS)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(b"new").unwrap();
+        (record, temporary, file)
+    }
+
+    /// A rename through the handle, or one the file system does not support.
+    fn rename(posix: bool) -> impl Fn(&File, &Path) -> io::Result<()> {
+        move |file: &File, to: &Path| {
+            if posix {
+                super::rename_posix(file, to)
+            } else {
+                Err(io::Error::from_raw_os_error(super::ERROR_NOT_SUPPORTED))
+            }
+        }
+    }
+
+    #[test]
+    fn a_durable_replacement_flushes_the_publishers_handle_after_the_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let (record, temporary, file) = prepared(root.path());
+        let publisher = file.as_raw_handle() as usize;
+        let steps = RefCell::new(Vec::new());
+        let rename = |file: &File, to: &Path| {
+            steps.borrow_mut().push("rename");
+            super::rename_posix(file, to)
+        };
+        let flush = |file: &File| {
+            assert_eq!(file.as_raw_handle() as usize, publisher);
+            steps.borrow_mut().push("flush");
+            file.sync_all()
+        };
+        super::replace_with(file, &temporary, &record, true, rename, flush).unwrap();
+        assert_eq!(steps.into_inner(), ["rename", "flush"]);
+        assert_eq!(std::fs::read(&record).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_durable_fallback_flushes_the_record_it_reopened_after_the_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let (record, temporary, file) = prepared(root.path());
+        let flushes = RefCell::new(0);
+        let flush = |file: &File| {
+            // The record is in place under its name, and the publisher's
+            // handle is closed, so this is the reopened record.
+            assert!(!temporary.exists());
+            assert_eq!(std::fs::read(&record).unwrap(), b"new");
+            *flushes.borrow_mut() += 1;
+            file.sync_all()
+        };
+        super::replace_with(file, &temporary, &record, true, rename(false), flush).unwrap();
+        assert_eq!(flushes.into_inner(), 1);
+    }
+
+    #[test]
+    fn a_replacement_that_is_not_durable_is_not_flushed() {
+        for posix in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let (record, temporary, file) = prepared(root.path());
+            let flush = |_: &File| -> io::Result<()> { panic!("flushed (posix: {posix})") };
+            super::replace_with(file, &temporary, &record, false, rename(posix), flush).unwrap();
+            assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        }
+    }
+
+    /// A failed flush is reported. The record is in place, but may not
+    /// survive a crash.
+    #[test]
+    fn a_failed_flush_is_returned() {
+        for posix in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let (record, temporary, file) = prepared(root.path());
+            let flush = |_: &File| -> io::Result<()> { Err(io::Error::other("flush failed")) };
+            let error = super::replace_with(file, &temporary, &record, true, rename(posix), flush)
+                .unwrap_err();
+            assert_eq!(error.to_string(), "flush failed", "posix: {posix}");
+            assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        }
     }
 }
