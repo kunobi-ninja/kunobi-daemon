@@ -108,9 +108,9 @@ impl RecordSlot {
     fn lock(&self) -> io::Result<crate::ProcessLock> {
         let mut lock = self.0.as_os_str().to_owned();
         lock.push(".record.lock");
-        crate::readiness::wait_until(
+        crate::ProcessLock::acquire_until(
+            &lock,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
-            |_| crate::ProcessLock::try_acquire(Path::new(&lock)),
         )?
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
     }

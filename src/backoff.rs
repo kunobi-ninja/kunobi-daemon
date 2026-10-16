@@ -1,8 +1,9 @@
 //! A check repeated with a growing pause, where the OS offers no event.
 //!
-//! Two places need it: a `local::ProcessHandle` that can only follow a PID,
-//! and a child this process owns whose exit cannot be observed as an event,
-//! which is asked through `try_wait` instead.
+//! Three places need it: a `local::ProcessHandle` that can only follow a PID,
+//! a child this process owns whose exit cannot be observed as an event, which
+//! is asked through `try_wait` instead, and a wait for a `ProcessLock`, whose
+//! release the OS does not signal.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -13,7 +14,8 @@ pub(crate) const FIRST: Duration = Duration::from_millis(1);
 const LONGEST: Duration = Duration::from_millis(50);
 
 /// Check `done` until it holds or `deadline` passes, or without a deadline.
-/// True once it held.
+/// True once it held. The first check is made even if the deadline has
+/// passed; later checks are made only before it.
 pub(crate) fn poll(
     mut done: impl FnMut() -> io::Result<bool>,
     deadline: Option<Instant>,
@@ -28,9 +30,16 @@ pub(crate) fn poll(
         };
         #[expect(
             clippy::disallowed_methods,
-            reason = "OS exit events are unavailable on this fallback path; bound polling with backoff."
+            reason = "The OS signals neither this exit nor a lock release; bound polling with backoff."
         )]
         std::thread::sleep(nap);
+        // A pause may overrun. Success after the deadline is late, as in
+        // `readiness::wait_until`, so it is not checked for.
+        if deadline
+            .is_some_and(|deadline| deadline.saturating_duration_since(Instant::now()).is_zero())
+        {
+            return Ok(false);
+        }
     }
 }
 
@@ -91,6 +100,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(20);
         assert!(!poll(|| Ok(false), Some(deadline)).unwrap());
         assert!(Instant::now() >= deadline);
+
+        // A check that would only hold after the deadline is not made: the
+        // last pause ends at the deadline, and success then would be late.
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(!poll(|| Ok(Instant::now() >= deadline), Some(deadline)).unwrap());
 
         let error = poll(|| Err(io::Error::other("check failed")), None).unwrap_err();
         assert_eq!(error.to_string(), "check failed");

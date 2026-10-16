@@ -14,6 +14,12 @@ Never unlink or replace a lock file while another participant may use its inode.
 
 `ProcessLock::try_from_file` preserves an application's secure open policy and
 legacy lock path. `ProcessLock::is_held` observes without creating a lock file.
+`acquire_until` waits for a holder until a deadline, and `wait_released_until`
+waits for the release without keeping the lock. The OS does not signal a release,
+so both recheck after a pause that grows to 50 ms. Each check takes the lock for
+a moment, as `is_held` does: a process that tries to acquire it then sees
+contention. With `local`, `acquire_private_until` refuses a symlinked lock file
+and, on Unix, one that another user owns.
 A lock is coordination, not authentication. An application chooses an OS-protected
 instance directory and authenticates the socket peer separately from service UUID
 validation. A UUID prevents accidental cross-service dispatch; it is not a secret.
