@@ -316,6 +316,43 @@ those sessions. `Snapshot::superseded_for` reports how long the
 drain has been running. Persist `retry::State` against the application's candidate
 fingerprint before a recovery launch, including candidates that can die after commit.
 
+## Stable endpoint with listener handoff: not adopted
+
+Each generation binds its own endpoint and clients find the selected one through
+the published record. A common alternative keeps one path and passes the
+listening socket to the successor (`SCM_RIGHTS` on Unix), so clients never read
+discovery and the backlog queues connections during the switch. Issue #28 asked
+whether to adopt it. The answer, for now, is no.
+
+- **The bind is the election.** `unix_socket::acquire` and `windows_socket::acquire`
+  decide which process runs by who holds the path, and stale-socket recovery may
+  reclaim a path only after a refused connection under the bind lock. With a
+  shared path the owner changes without a bind, so a successor that dies after
+  receiving the listener leaves a path no live process owns, and recovery has to
+  tell "handed over" from "abandoned". Per-generation paths keep one owner per
+  path for its whole life.
+- **`Overlap` still needs a private endpoint.** A candidate must answer a live
+  readiness proof before `Commit`, and it cannot answer on a path the incumbent
+  still serves. Handoff would add a second endpoint for verification plus a
+  transfer step at commit; it removes nothing. `Exclusive` already gives a stable
+  path to applications that accept a gap between drain and start.
+- **Windows has no equivalent transfer.** Named pipes let several processes create
+  instances of the same name, so "handoff" there means the incumbent stops
+  creating instances. Only the first instance's creator is protected against
+  squatting, so a second creator weakens the peer guarantees the crate gives
+  today.
+- **The failure it would address has narrower fixes.** A client that reads a
+  record naming a retiring generation reconnects after rediscovery. A typed
+  `Retiring` refusal (#71) makes that one round trip, and a bounded drain
+  (`Generation::with_drain_limit`) stops a superseded generation from holding
+  clients indefinitely. Neither changes ownership rules.
+
+Revisit if measurements after those changes still show connections failing on a
+stale record often enough to matter, or if a consumer needs a path that never
+changes (for example one baked into third-party configuration). Start from an
+explicit ownership token handed over with the listener, and keep per-generation
+paths for verification.
+
 ## Migration map
 
 | Consumer code | Shared mechanism | Consumer responsibility |
