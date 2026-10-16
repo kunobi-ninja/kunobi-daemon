@@ -33,9 +33,13 @@ impl Drop for Temporary {
 /// directory is not synced; this does not promise survival across power loss.
 ///
 /// A reader opens either the old record or the new one. On Windows the
-/// temporary file is renamed through its own handle with POSIX semantics,
-/// so the record is never briefly pending deletion, which a reader's open
-/// would see as `PermissionDenied`.
+/// temporary file is renamed through its own handle with POSIX semantics, so
+/// the record is never briefly pending deletion, which a reader's open would
+/// see as `PermissionDenied`. A file system without POSIX renames falls back
+/// to `std::fs::rename`, where that window remains. The publisher keeps its
+/// handle open for a moment after the rename: a reader that does not share
+/// write and delete access can get a sharing violation then. `File::open`
+/// shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()

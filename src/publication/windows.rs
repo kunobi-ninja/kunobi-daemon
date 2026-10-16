@@ -49,9 +49,18 @@ unsafe extern "system" {
 ///
 /// POSIX semantics replace the name in one step, so a reader opens the old
 /// record or the new one and never one pending deletion. A file system that
-/// does not support them gets `std::fs::rename`.
+/// does not support them gets `std::fs::rename`, and with it the window.
 pub(super) fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
-    match rename_posix(&file, to) {
+    replace_with(file, from, to, rename_posix)
+}
+
+fn replace_with(
+    file: File,
+    from: &Path,
+    to: &Path,
+    rename: impl FnOnce(&File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match rename(&file, to) {
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -125,7 +134,7 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
 
     #[test]
-    fn a_record_another_process_holds_open_is_replaced_in_one_step() {
+    fn a_record_another_handle_holds_open_is_replaced_in_one_step() {
         let root = tempfile::tempdir().unwrap();
         let record = root.path().join("record");
         std::fs::write(&record, b"old").unwrap();
@@ -146,5 +155,30 @@ mod tests {
         let mut old = Vec::new();
         reader.read_to_end(&mut old).unwrap();
         assert_eq!(old, b"old");
+    }
+
+    #[test]
+    fn a_file_system_without_posix_renames_gets_std_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("record");
+        std::fs::write(&record, b"old").unwrap();
+        let temporary = root.path().join("temporary");
+        std::fs::write(&temporary, b"new").unwrap();
+        let file = std::fs::File::open(&temporary).unwrap();
+        let unsupported = |_: &std::fs::File, _: &std::path::Path| {
+            Err(std::io::Error::from_raw_os_error(
+                super::ERROR_NOT_SUPPORTED,
+            ))
+        };
+        super::replace_with(file, &temporary, &record, unsupported).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        assert!(!temporary.exists());
+
+        let denied =
+            |_: &std::fs::File, _: &std::path::Path| Err(std::io::Error::from_raw_os_error(5));
+        std::fs::write(&temporary, b"newer").unwrap();
+        let file = std::fs::File::open(&temporary).unwrap();
+        assert!(super::replace_with(file, &temporary, &record, denied).is_err());
+        assert_eq!(std::fs::read(&record).unwrap(), b"new");
     }
 }
