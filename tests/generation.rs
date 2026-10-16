@@ -2,7 +2,7 @@
 #![cfg(feature = "async")]
 use kunobi_daemon::{
     ProcessLock,
-    generation::{Generation, allocate},
+    generation::{Generation, Retirement, allocate},
 };
 use std::{sync::Arc, time::Duration};
 
@@ -74,4 +74,168 @@ fn unchanged_selection_does_not_wake_the_controller_into_a_busy_loop() {
     changes.borrow_and_update();
     generation.select(3).unwrap();
     assert!(!changes.has_changed().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_limit_retires_a_superseded_generation_that_still_holds_a_lease() {
+    let generation =
+        Arc::new(Generation::new(2, 2, false).with_drain_limit(Duration::from_secs(60)));
+    let session = generation.admit().unwrap();
+    generation.select(3).unwrap();
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert_eq!(generation.retire(Duration::ZERO), None);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    // The idle-only check keeps its meaning after the limit.
+    assert!(!generation.retire_if_idle(Duration::ZERO));
+    assert!(!generation.snapshot().retired);
+    assert_eq!(
+        generation.retire(Duration::ZERO),
+        Some(Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        })
+    );
+    assert!(generation.snapshot().retired);
+    assert!(generation.admit().is_none());
+    drop(session);
+    assert_eq!(generation.snapshot().active, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_drain_limit_a_held_lease_keeps_a_superseded_generation() {
+    let generation = Arc::new(Generation::new(2, 2, false));
+    let _session = generation.admit().unwrap();
+    generation.select(3).unwrap();
+    tokio::time::advance(Duration::from_secs(365 * 24 * 60 * 60)).await;
+    assert_eq!(generation.retire(Duration::ZERO), None);
+    assert!(!generation.snapshot().retired);
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_limit_never_retires_the_selected_generation_or_a_live_candidate() {
+    let selected = Arc::new(Generation::new(2, 2, false).with_drain_limit(Duration::from_secs(1)));
+    let candidate = Arc::new(Generation::new(3, 2, true).with_drain_limit(Duration::from_secs(1)));
+    let _held = selected.admit().unwrap();
+    let _staging = candidate.admit().unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(selected.retire(Duration::from_secs(30)), None);
+    assert_eq!(candidate.retire(Duration::from_secs(30)), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_time_starts_at_the_first_newer_selection() {
+    let generation = Generation::new(2, 2, false);
+    assert_eq!(generation.snapshot().superseded_for, None);
+    tokio::time::advance(Duration::from_secs(7)).await;
+    generation.select(3).unwrap();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(
+        generation.snapshot().superseded_for,
+        Some(Duration::from_secs(5))
+    );
+    generation.select(4).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        generation.snapshot().superseded_for,
+        Some(Duration::from_secs(6))
+    );
+
+    let promoted = Generation::new(3, 2, true);
+    promoted.select(3).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(promoted.snapshot().superseded_for, None);
+
+    let started_behind = Generation::new(2, 3, false);
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert_eq!(
+        started_behind.snapshot().superseded_for,
+        Some(Duration::from_secs(4))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_until_retired_reports_why_it_returned() {
+    let draining = Arc::new(Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(10)));
+    let _session = draining.admit().unwrap();
+    // Paused time advances on its own; the timeout fails the test instead of hanging it.
+    let retirement = tokio::time::timeout(
+        Duration::from_secs(3600),
+        draining.run_until_retired(Duration::from_secs(1), Duration::ZERO, || async {}),
+    )
+    .await
+    .expect("a superseded generation must retire once its drain limit passes");
+    assert_eq!(
+        retirement,
+        Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        }
+    );
+
+    let idle = Generation::new(2, 3, false);
+    let retirement = idle
+        .run_until_retired(Duration::from_secs(1), Duration::ZERO, || async {})
+        .await;
+    assert_eq!(retirement, Retirement::Idle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_refresh_starts_after_the_drain_limit_passes() {
+    let generation =
+        Arc::new(Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(10)));
+    let _session = generation.admit().unwrap();
+    let started = tokio::time::Instant::now();
+    let calls = std::sync::Mutex::new(Vec::new());
+    let retirement = tokio::time::timeout(
+        Duration::from_secs(3600),
+        generation.run_until_retired(Duration::from_secs(1), Duration::ZERO, || {
+            calls.lock().unwrap().push(started.elapsed());
+            async {}
+        }),
+    )
+    .await
+    .expect("a superseded generation must retire once its drain limit passes");
+    assert_eq!(
+        retirement,
+        Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        }
+    );
+    let calls = calls.into_inner().unwrap();
+    // One refresh per one-second interval until the limit, none after it.
+    assert_eq!(calls.len(), 10, "{calls:?}");
+    assert!(
+        calls.iter().all(|at| *at < Duration::from_secs(10)),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_drain_with_no_lease_reports_idle() {
+    let generation = Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(1));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(generation.retire(Duration::ZERO), Some(Retirement::Idle));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_drain_limit_wakes_a_controller_with_a_long_refresh_interval() {
+    let generation =
+        Arc::new(Generation::new(2, 3, false).with_drain_limit(Duration::from_secs(10)));
+    let _session = generation.admit().unwrap();
+    let started = tokio::time::Instant::now();
+    let retirement = tokio::time::timeout(
+        Duration::from_secs(7200),
+        generation.run_until_retired(Duration::from_secs(3600), Duration::ZERO, || async {}),
+    )
+    .await
+    .expect("a superseded generation must retire once its drain limit passes");
+    assert_eq!(
+        retirement,
+        Retirement::DrainExpired {
+            active: 1,
+            legacy: 0
+        }
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
 }
