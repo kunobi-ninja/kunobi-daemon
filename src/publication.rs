@@ -8,6 +8,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+#[cfg(windows)]
+use windows::replace;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Temporary(PathBuf);
@@ -25,6 +31,15 @@ impl Drop for Temporary {
 /// contents are written. The caller remains responsible for directory security,
 /// record format, ownership and eventual discovery repair after a crash. The
 /// directory is not synced; this does not promise survival across power loss.
+///
+/// A reader opens either the old record or the new one. On Windows the
+/// temporary file is renamed through its own handle with POSIX semantics, so
+/// the record is never briefly pending deletion, which a reader's open would
+/// see as `PermissionDenied`. A file system without POSIX renames falls back
+/// to `std::fs::rename`, where that window remains. The publisher keeps its
+/// handle open for a moment after the rename: a reader that does not share
+/// write and delete access can get a sharing violation then. `File::open`
+/// shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -52,6 +67,11 @@ pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.access_mode(windows::ACCESS);
+        }
         match options.open(&temporary) {
             Ok(file) => break (Temporary(temporary), file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -65,8 +85,14 @@ pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     file.write_all(contents)?;
     file.sync_all()?;
+    replace(file, &temporary.0, path)
+}
+
+/// Close the written temporary file and rename it over the record.
+#[cfg(not(windows))]
+fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
     drop(file);
-    std::fs::rename(&temporary.0, path)
+    std::fs::rename(from, to)
 }
 
 /// A discovery slot whose publishers and conditional cleanup share a lock.
