@@ -22,7 +22,7 @@ async = ["dep:tokio", "tokio/macros"]
 wire = ["dep:buffa"]
 # With `async`, `local::ProcessHandle` waits for an exit through Tokio's reactor
 # and `local::shutdown_signal` waits for a stop request.
-local = ["dep:interprocess", "dep:socket2", "dep:libc", "dep:widestring", "tokio?/net", "tokio?/signal"]
+local = ["dep:interprocess", "dep:socket2", "dep:widestring", "tokio?/net", "tokio?/signal"]
 local-async = ["local", "async", "interprocess/tokio"]
 wire-async = ["wire", "async", "tokio/io-util"]
 # Stdio clients that may start the daemon. Off by default so a process that
@@ -34,7 +34,8 @@ buffa = { version = "=0.9.2", optional = true, default-features = false, feature
 tokio = { version = "1", optional = true, features = ["sync", "time", "rt"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+# Always on Unix: record reads open with O_NOFOLLOW | O_NONBLOCK.
+libc = "0.2"
 socket2 = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]

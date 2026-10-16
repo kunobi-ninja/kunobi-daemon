@@ -49,7 +49,9 @@ pub use identity::{CONTROL_SOCKET, ServiceIdentity, ServicePaths};
 pub use lifecycle::{DrainOutcome, Lifecycle, LifecycleSnapshot, RequestGuard};
 pub use ownership::ProcessLock;
 pub use pid::ProcessId;
-pub use publication::{RecordSlot, publish_record};
+#[cfg(feature = "local")]
+pub use publication::ensure_private_dir;
+pub use publication::{RecordOptions, RecordSlot, publish_record, publish_record_with};
 #[cfg(feature = "async")]
 pub use upgrade::{UpgradeError, ensure_current};
 

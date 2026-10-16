@@ -44,14 +44,7 @@ fn lock_path(path: &Path) -> PathBuf {
     path.into()
 }
 /// Prepare an application-owned directory before creating its socket.
-pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let metadata = std::fs::symlink_metadata(dir)?;
-    if !metadata.is_dir() || metadata.uid() != super::unix::own_uid() {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
+pub use crate::ensure_private_dir;
 fn bind_private(socket: &Path) -> io::Result<UnixListener> {
     // The 0700 parent excludes other users during bind; never alter global umask.
     let listener = crate::spawn_lock::without_spawns(|| UnixListener::bind(socket))?;

@@ -56,4 +56,7 @@ exclude_re = [
     # Built only without the `local` feature, and mutants are tested with all
     # features. The `--no-default-features` test runs still exercise it.
     '^src/warmup\.rs:.*\bpolled_exit_by\b',
+    # O_NOFOLLOW and O_NONBLOCK share no bits, so `^` gives the same flags as
+    # `|`. The `&` mutant stays in scope.
+    '^src/publication\.rs:.*replace \| with \^ in read_regular',
 ]
