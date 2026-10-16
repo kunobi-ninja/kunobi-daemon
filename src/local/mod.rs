@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 /// What names a local endpoint on this platform.
 ///
 /// A Unix socket is a filesystem path; a named pipe is a name in its own
-/// namespace, with its own length limit and no directory. Deriving one from the
-/// other is the caller's decision, not this crate's: the endpoint name is where
-/// processes agree to meet, so a scheme chosen here would move the rendezvous
-/// of every consumer that already has one.
+/// namespace, with its own length limit and no directory. The crate does not
+/// derive one from the other: the endpoint name is where processes agree to
+/// meet, so a scheme imposed here would move the rendezvous of every consumer
+/// that already has one. A new Windows service can take its pipe name from
+/// `local::pipe_name::for_current_user`, which scopes it by user and service.
 #[cfg(unix)]
 pub type Endpoint = std::path::Path;
 /// What names a local endpoint on this platform.
@@ -235,6 +236,13 @@ fn test_handshake(write: &mut impl io::Write, read: &mut impl io::Read, _: &str)
 
 #[cfg(windows)]
 pub mod windows_socket;
+
+#[cfg(windows)]
+pub mod pipe_name;
+// Composing a name needs no Windows call, so the other platforms test it too,
+// including the Linux mutation runs.
+#[cfg(all(test, not(windows)))]
+mod pipe_name;
 
 #[cfg(any(all(windows, feature = "launch"), test))]
 pub(crate) mod command_line;

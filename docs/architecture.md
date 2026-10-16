@@ -289,6 +289,12 @@ runtime. `ServiceIdentity::paths` does the same for `control.sock`. Bind and
 connect check again; an endpoint too long to address fails at once with
 `ConnectError::EndpointTooLong` instead of being retried until the deadline.
 
+Named pipes share one namespace across the machine, so a pipe named only after
+the service could be created first by another user. `local::pipe_name` builds a
+Windows pipe name from the user SID in this process's token, never from the
+environment, and the service's UUID, profile, instance and endpoint name. The
+name is checked against the 256-character pipe path when it is built.
+
 Use `RecordSlot` when a publication can race an older owner's cleanup. Every
 publisher and conditional remover of that slot must use it. `publish_record` is
 the lower-level atomic-write primitive for callers already holding shared ownership.

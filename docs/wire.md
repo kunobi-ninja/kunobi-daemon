@@ -23,9 +23,11 @@ Existing consumers can retain their secure, application-specific paths when
 migrating, especially the legacy endpoint required by old clients.
 
 The caller owns the private per-user directory, permission checks and endpoint
-binding. Keep Unix socket paths within the platform's length limit. Windows
-named pipes must include the service identity and user SID and enforce a
-same-user ACL. UUIDs prevent accidental cross-service connections; they do not
+binding. Keep Unix socket paths within the platform's length limit. On
+Windows, `local::pipe_name::for_current_user` builds a pipe name from the
+service identity and the user SID in the process token, and
+`local::socket::acquire` restricts the pipe to its owner, SYSTEM and
+Administrators. UUIDs prevent accidental cross-service connections; they do not
 authenticate a process that copies another service's public UUID.
 
 ## Application-owned messages
