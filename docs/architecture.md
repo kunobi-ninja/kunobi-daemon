@@ -258,11 +258,15 @@ What the evidence describes differs by platform. Linux reports the PID and
 user captured when the peer connected, listened or created the socket pair.
 macOS reports the user captured then but the PID of the socket's most recent
 owner. A named pipe reports the other end's PID, the client to a server and
-the server to a client, and the user is then checked by opening that PID. If
-the original peer has exited while another process holds its descriptor or
-handle, a reused PID can make that check describe an unrelated process. On
-every platform a passed or inherited descriptor carries the connection to
-another process.
+the server to a client. A server reads its client's user from the connection
+itself by impersonating the client. Windows records that context from the
+last message the server read, so until the server has read from a client
+under dynamic context tracking there is none, and the server falls back to opening the client's
+PID, as a client always does for its server. A lookup by PID can describe an
+unrelated process when the peer has exited while another process holds its
+handle and the PID was reused. `Credentials::user_evidence` says which check
+answered, so a policy can require the connection's own. On every platform a
+passed or inherited descriptor carries the connection to another process.
 
 Byte counters and receipt boundaries do not establish exactly-once application
 execution. A relay may reconnect a transport; the application decides how to rebuild
