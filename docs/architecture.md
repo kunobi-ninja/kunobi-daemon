@@ -103,6 +103,10 @@ wait between rounds; a source that can be woken replaces it without changing
 these rules. A candidate's exit is such a source: `Candidate::exit_handle`
 gives a `local::ProcessHandle` to wait on between probes, so a candidate that
 dies before it is ready ends the wait at once instead of after the budget.
+`Candidate::from` takes a daemon started by `launch::DaemonCommand`, so a
+replacement started detached and with a readiness channel is still stopped if
+dropped before selection; take the channel before converting. A dropped
+`launch::DaemonChild` keeps running and, on Unix, is reaped once it exits.
 
 `readiness::channel::Signaled` is one: before the daemon says it
 is ready, a round starts on the channel's news. A dead or silent channel ends

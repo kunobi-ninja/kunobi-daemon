@@ -118,7 +118,7 @@ pub enum DaemonOutput {
     File(File),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum EnvChange {
     Set(OsString, OsString),
     Remove(OsString),
@@ -304,7 +304,7 @@ impl DaemonCommand {
             // Dropping this copy of the daemon's end leaves the daemon the
             // only writer, so its exit ends the channel.
             Ok(DaemonChild {
-                inner,
+                inner: crate::candidate::Reaped::new(inner),
                 exit,
                 readiness: readiness.map(|(channel, _child_end)| channel),
             })
@@ -381,6 +381,29 @@ impl DaemonCommand {
     }
 }
 
+/// The program, arguments, environment changes and working directory of
+/// `command`, as a daemon to start detached.
+///
+/// Nothing else carries over: not its stdio, which [`DaemonOutput`] sets,
+/// nor `env_clear`, which `Command` does not report, nor platform settings
+/// such as `arg0`, `pre_exec` or creation flags.
+impl From<&Command> for DaemonCommand {
+    fn from(command: &Command) -> Self {
+        let mut daemon = Self::new(command.get_program());
+        daemon.args(command.get_args());
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => daemon.env(name, value),
+                None => daemon.env_remove(name),
+            };
+        }
+        if let Some(dir) = command.get_current_dir() {
+            daemon.current_dir(dir);
+        }
+        daemon
+    }
+}
+
 #[cfg(unix)]
 fn unix_stdio(target: &DaemonOutput) -> io::Result<Stdio> {
     Ok(match target {
@@ -392,15 +415,19 @@ fn unix_stdio(target: &DaemonOutput) -> io::Result<Stdio> {
 /// A daemon started by [`DaemonCommand::spawn`].
 ///
 /// Dropping it leaves the daemon running, as dropping a `std::process::Child`
-/// does. A caller that never waits should keep SIGCHLD reaping in mind on
-/// Unix, as with any child.
+/// does. On Unix the daemon is also reaped once it exits, so a launcher that
+/// gives up on it leaves no zombie: at once if it has exited, otherwise by a
+/// thread that waits for it while it runs. That thread is best effort: if it
+/// cannot be created, a running daemon becomes a zombie when it exits, as
+/// before. [`Candidate::from`](crate::Candidate)
+/// takes it as a candidate that is stopped unless selected.
 ///
 /// Its [`ProcessHandle`] is opened at spawn, before anything can reap the
 /// daemon, so it follows the daemon even in a process that ignores SIGCHLD.
 #[derive(Debug)]
 pub struct DaemonChild {
     #[cfg(unix)]
-    inner: Child,
+    inner: crate::candidate::Reaped,
     #[cfg(windows)]
     inner: crate::local::windows_spawn::WindowsChild,
     exit: ProcessHandle,
@@ -817,6 +844,31 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_command_takes_a_command_s_program_arguments_environment_and_directory() {
+        let mut command = Command::new("exampled");
+        command
+            .args(["serve", "--quiet"])
+            .env("KDAEMON_SET", "set-by-command")
+            .env_remove("KDAEMON_REMOVED")
+            .current_dir("daemon-dir");
+        let daemon = DaemonCommand::from(&command);
+        assert_eq!(daemon.program, Path::new("exampled"));
+        assert_eq!(daemon.args, ["serve", "--quiet"]);
+        // `Command` reports its changes by name, not in the order they were made.
+        assert_eq!(daemon.env.len(), 2);
+        assert!(daemon.env.contains(&EnvChange::Set(
+            "KDAEMON_SET".into(),
+            "set-by-command".into()
+        )));
+        assert!(
+            daemon
+                .env
+                .contains(&EnvChange::Remove("KDAEMON_REMOVED".into()))
+        );
+        assert_eq!(daemon.current_dir.as_deref(), Some(Path::new("daemon-dir")));
+    }
+
+    #[test]
     fn a_missing_daemon_binary_is_a_spawn_error() {
         let error = DaemonCommand::new("/this/does/not/exist-kunobi-daemon")
             .spawn()
@@ -953,6 +1005,79 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, Startup::Live);
         assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    /// True once no process, not even a zombie, has `pid`.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn reaped(pid: crate::ProcessId) -> bool {
+        let pid = libc::pid_t::try_from(pid.get()).unwrap();
+        // SAFETY: signal 0 delivers nothing; kill only checks that a process
+        // with this PID exists and may be signalled.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Whether `pid` is reaped within ten seconds.
+    #[cfg(unix)]
+    fn reaped_soon(pid: crate::ProcessId) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        crate::backoff::poll(|| Ok(reaped(pid)), Some(deadline)).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_daemon_keeps_running_and_is_reaped_once_it_exits() {
+        let (child, held) = held_daemon();
+        let pid = child.id();
+        let mut exit = ProcessHandle::open(pid).unwrap();
+        drop(child);
+        assert!(
+            !exit
+                .wait_until(Instant::now() + Duration::from_millis(200))
+                .unwrap(),
+            "dropping the daemon's handle stopped it"
+        );
+        held.release();
+        assert!(exit.wait_until(Instant::now() + SILENCE).unwrap());
+        assert!(reaped_soon(pid), "the exited daemon was left a zombie");
+    }
+
+    #[test]
+    fn a_daemon_taken_as_a_candidate_is_stopped_when_dropped_unselected() {
+        let child = silent_daemon().spawn().unwrap();
+        let pid = child.id();
+        let mut exit = ProcessHandle::open(pid).unwrap();
+        let mut candidate = crate::Candidate::from(child);
+        assert_eq!(candidate.id(), pid);
+        assert_eq!(candidate.exit_handle().unwrap().pid(), pid);
+        assert!(candidate.try_wait().unwrap().is_none());
+        assert!(candidate.wait_until(Instant::now()).unwrap().is_none());
+        drop(candidate);
+        assert!(
+            exit.has_exited().unwrap(),
+            "the unselected daemon was not stopped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_selected_daemon_candidate_keeps_running_and_is_reaped_once_it_exits() {
+        let (child, held) = held_daemon();
+        let pid = child.id();
+        let mut exit = ProcessHandle::open(pid).unwrap();
+        let mut candidate = crate::Candidate::from(child);
+        candidate.selected();
+        drop(candidate);
+        assert!(
+            !exit
+                .wait_until(Instant::now() + Duration::from_millis(200))
+                .unwrap(),
+            "dropping a selected candidate stopped it"
+        );
+        held.release();
+        assert!(exit.wait_until(Instant::now() + SILENCE).unwrap());
+        assert!(reaped_soon(pid), "the exited daemon was left a zombie");
     }
 
     #[cfg(unix)]
