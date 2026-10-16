@@ -28,6 +28,9 @@ const PUBLISHING: Duration = Duration::from_secs(2);
 /// A temporary file created longer ago than this is left over from a crash,
 /// not a publication in progress.
 const FRESH: Duration = Duration::from_secs(10);
+/// How far in the future a temporary's creation time may be and still count
+/// as recent.
+const AHEAD: Duration = Duration::from_secs(1);
 
 /// Open the record at `path`, retrying what a concurrent replacement causes.
 ///
@@ -70,6 +73,9 @@ fn retry_open<T>(
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         if publishing() {
+                            // The open after this publication ends must
+                            // stand on its own, not on a check made before it.
+                            rechecked = false;
                             missing = Some(error);
                             return Ok(false);
                         }
@@ -114,28 +120,61 @@ fn publishing(path: &Path) -> bool {
 }
 
 /// Whether a temporary created at `created` can belong to a publication in
-/// progress at `now`.
+/// progress at `now`. A creation time up to [`AHEAD`] in the future is clock
+/// granularity; further ahead, the clock has moved back since the temporary
+/// was made, and it is treated as left over.
 fn fresh(created: SystemTime, now: SystemTime) -> bool {
-    now.duration_since(created).unwrap_or_default() < FRESH
+    match now.duration_since(created) {
+        Ok(age) => age < FRESH,
+        Err(ahead) => ahead.duration() <= AHEAD,
+    }
 }
 
+/// Whether `name` is a temporary of `record`. The record's part compares as
+/// NTFS compares names: ordinal, ignoring case.
 fn is_temporary(name: &OsStr, record: &OsStr) -> bool {
-    let name = name.as_encoded_bytes();
-    let record = record.as_encoded_bytes();
-    let Some(rest) = name
-        .strip_prefix(b".")
-        .and_then(|rest| rest.strip_prefix(record))
-        .and_then(|rest| rest.strip_prefix(b"."))
-        .and_then(|rest| rest.strip_suffix(b".tmp"))
+    let name: Vec<u16> = name.encode_wide().collect();
+    let record: Vec<u16> = record.encode_wide().collect();
+    let Some(rest) = name.strip_prefix(&[u16::from(b'.')]) else {
+        return false;
+    };
+    let (Some(named), Some(rest)) = (rest.get(..record.len()), rest.get(record.len()..)) else {
+        return false;
+    };
+    // The rest is ASCII as `publish_record_with` writes it.
+    let Ok(rest) = String::from_utf16(rest) else {
+        return false;
+    };
+    let Some(numbers) = rest
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
     else {
         return false;
     };
-    let mut parts = rest.split(|byte| *byte == b'.');
-    let number = |part: Option<&[u8]>| {
-        part.is_some_and(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+    let mut parts = numbers.split('.');
+    let number = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
     };
-    number(parts.next()) && number(parts.next()) && parts.next().is_none()
+    number(parts.next())
+        && number(parts.next())
+        && parts.next().is_none()
+        && same_name(named, &record)
 }
+
+/// `CompareStringOrdinal` ignoring case, the closest documented match to the
+/// upcase table NTFS compares names with.
+fn same_name(a: &[u16], b: &[u16]) -> bool {
+    let (Ok(a_length), Ok(b_length)) = (i32::try_from(a.len()), i32::try_from(b.len())) else {
+        return false;
+    };
+    // SAFETY: each pointer and length describe a live slice of UTF-16 units,
+    // which the call only reads.
+    let compared = unsafe { CompareStringOrdinal(a.as_ptr(), a_length, b.as_ptr(), b_length, 1) };
+    compared == CSTR_EQUAL
+}
+
+/// `CompareStringOrdinal`'s result for equal strings.
+const CSTR_EQUAL: i32 = 2;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const DELETE: u32 = 0x0001_0000;
@@ -162,6 +201,13 @@ struct FileRenameInfo {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn CompareStringOrdinal(
+        first: *const u16,
+        first_length: i32,
+        second: *const u16,
+        second_length: i32,
+        ignore_case: i32,
+    ) -> i32;
     fn SetFileInformationByHandle(
         file: *mut c_void,
         class: i32,
