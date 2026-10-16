@@ -20,15 +20,17 @@ fn old_record_cleanup_preserves_a_new_publication_and_its_lock_inode() {
 
 #[test]
 fn concurrent_publishers_and_readers_only_observe_complete_records() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    // Probabilistic coverage: a reader reads without pause while two
-    // publishers replace the record, and the publishers keep going until it
-    // has read at least READS times, so those reads overlapped publication.
-    // One reader leaves moments with no handle open, which is when a
-    // replacement can leave the old record pending deletion on Windows.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Probabilistic coverage: readers read without pause while two
+    // publishers replace the record, and the publishers keep going until the
+    // readers have read at least READS times, so those reads overlapped
+    // publication. On Windows an open that races a replacement can be
+    // refused, or find the name missing while the rename is in progress;
+    // `RecordSlot::read` must ride out both.
     const PUBLISHERS: usize = 2;
-    const PUBLICATIONS: usize = 500;
-    const READS: usize = 200;
+    const READERS: usize = 4;
+    const PUBLICATIONS: usize = 1_000;
+    const READS: usize = 1_000;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("discovery");
     let a = Arc::new(vec![b'a'; 32_768]);
@@ -36,46 +38,100 @@ fn concurrent_publishers_and_readers_only_observe_complete_records() {
     publish_record(&path, &a).unwrap();
     let publishing = AtomicUsize::new(PUBLISHERS);
     let reads = AtomicUsize::new(0);
-    let reading = AtomicBool::new(true);
-    let barrier = std::sync::Barrier::new(PUBLISHERS + 1);
+    let reading = AtomicUsize::new(READERS);
+    let barrier = std::sync::Barrier::new(PUBLISHERS + READERS);
     std::thread::scope(|scope| {
         for bytes in [&a, &b] {
             let (barrier, publishing, reads, reading, path) =
                 (&barrier, &publishing, &reads, &reading, &path);
             scope.spawn(move || {
-                // Counts this publisher out even if it panics, so the reader stops.
+                // Counts this publisher out even if it panics, so the readers stop.
                 let _finished = OnDrop(|| {
                     publishing.fetch_sub(1, Ordering::Release);
                 });
                 barrier.wait();
                 for published in 1.. {
                     publish_record(path, bytes).unwrap();
-                    let enough_reads =
-                        reads.load(Ordering::Acquire) >= READS || !reading.load(Ordering::Acquire);
+                    // A reader that stopped early has panicked.
+                    let enough_reads = reads.load(Ordering::Acquire) >= READS
+                        || reading.load(Ordering::Acquire) < READERS;
                     if published >= PUBLICATIONS && enough_reads {
                         break;
                     }
                 }
             });
         }
-        let (barrier, publishing, reads, reading, path, a, b) =
-            (&barrier, &publishing, &reads, &reading, &path, &a, &b);
-        scope.spawn(move || {
-            // Lets the publishers stop even if a read panics.
-            let _finished = OnDrop(|| reading.store(false, Ordering::Release));
-            barrier.wait();
-            while publishing.load(Ordering::Acquire) > 0 {
-                let contents = std::fs::read(path).unwrap();
-                assert!(
-                    contents == **a || contents == **b,
-                    "reader saw a partial publication"
-                );
-                reads.fetch_add(1, Ordering::Release);
-            }
-        });
+        for _ in 0..READERS {
+            let (barrier, publishing, reads, reading, path, a, b) =
+                (&barrier, &publishing, &reads, &reading, &path, &a, &b);
+            scope.spawn(move || {
+                // Lets the publishers stop even if a read panics.
+                let _finished = OnDrop(|| {
+                    reading.fetch_sub(1, Ordering::Release);
+                });
+                let slot = kunobi_daemon::RecordSlot::new(path);
+                barrier.wait();
+                while publishing.load(Ordering::Acquire) > 0 {
+                    let contents = slot.read();
+                    if !matches!(&contents, Ok(Some(contents)) if contents == &**a || contents == &**b)
+                    {
+                        let length = contents.map(|record| record.map(|record| record.len()));
+                        panic!("a reader saw {length:?} instead of a complete record");
+                    }
+                    reads.fetch_add(1, Ordering::Release);
+                }
+            });
+        }
     });
     assert!(reads.into_inner() >= READS);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+/// On Windows a replacement can leave the record's name missing while the
+/// rename is in progress; the temporary file is still there. A read then
+/// waits for the publication, up to 2 s, instead of reporting no record.
+/// NTFS names ignore case, so a temporary of the same record under another
+/// case counts. The record appearing during the wait is covered step by
+/// step by the unit tests in `src/publication/windows.rs`.
+#[cfg(windows)]
+#[test]
+fn a_slot_read_waits_while_a_temporary_shows_a_publication() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path()
+            .join(format!(".DISCOVERY.{}.0.tmp", std::process::id())),
+        b"new",
+    )
+    .unwrap();
+    let slot = kunobi_daemon::RecordSlot::new(root.path().join("discovery"));
+    let start = Instant::now();
+    assert_eq!(slot.read().unwrap(), None);
+    assert!(start.elapsed() >= Duration::from_secs(2));
+}
+
+/// A missing record is reported at once when no publication is in progress,
+/// including when a crash left an old temporary file behind.
+#[cfg(windows)]
+#[test]
+fn a_slot_read_does_not_wait_for_a_stale_temporary() {
+    use std::os::windows::fs::FileTimesExt;
+    use std::time::{Duration, Instant, SystemTime};
+    let root = tempfile::tempdir().unwrap();
+    let slot = kunobi_daemon::RecordSlot::new(root.path().join("discovery"));
+    let start = Instant::now();
+    assert_eq!(slot.read().unwrap(), None);
+    assert!(start.elapsed() < Duration::from_secs(1));
+
+    let temporary = std::fs::File::create(root.path().join(".discovery.1.0.tmp")).unwrap();
+    let created = SystemTime::now() - Duration::from_secs(60);
+    temporary
+        .set_times(std::fs::FileTimes::new().set_created(created))
+        .unwrap();
+    drop(temporary);
+    let start = Instant::now();
+    assert_eq!(slot.read().unwrap(), None);
+    assert!(start.elapsed() < Duration::from_secs(1));
 }
 
 /// Runs a closure when dropped, including during a panic.

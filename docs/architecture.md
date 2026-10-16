@@ -324,6 +324,11 @@ are the original behaviour. A durable publication syncs the directory after the
 rename on Unix. Windows has no directory sync, so the record is flushed again
 after the rename. `replace_if` and `remove_if` read the record and decide under
 the slot lock, and `read` refuses anything but a regular file within the limit.
+On Windows no rename replaces a name atomically for an open running at the same
+time: the open can be refused, or find the name missing while a slow rename is
+in progress. The slot's reads retry a refused open and wait, briefly, while a
+recent temporary file of the record shows a publication in progress. Readers
+outside the crate must retry the same way.
 `ensure_private_dir` prepares the directory these records and their locks live in.
 Legacy binaries do not participate in newly introduced serialization locks; retain
 their original election locks and bound the supported transition in consumer tests.

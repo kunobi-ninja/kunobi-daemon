@@ -1,16 +1,180 @@
-//! Replacing a record through the temporary file's own handle. Built and
-//! tested by the Windows jobs.
+//! Replacing a record through the temporary file's own handle, and opening a
+//! record that may be being replaced. Built and tested by the Windows jobs.
 //!
 //! This is the crate's only FFI outside `local`: publication is always built,
-//! and `std::fs::rename` first tries `MoveFileExW`, whose replacement leaves
-//! the old record pending deletion for a moment. A reader that opens it then
-//! gets `ERROR_ACCESS_DENIED`.
+//! and `std::fs::rename` first tries `MoveFileExW`, a legacy replacement.
+//!
+//! No rename makes the replacement atomic for an open running at the same
+//! time. Measured on NTFS: an open that reached the old record as the rename
+//! deleted it fails with `ERROR_ACCESS_DENIED` (`STATUS_FILE_DELETED`), and
+//! while a slow rename is in progress the name can be missing for tens or
+//! hundreds of milliseconds, with the temporary file still under its own name.
+//! [`open_record`] retries both.
 
-use std::ffi::{OsString, c_void};
-use std::fs::File;
+use std::ffi::{OsStr, OsString, c_void};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Component, Path, Prefix};
+use std::time::{Duration, Instant, SystemTime};
+
+const ERROR_ACCESS_DENIED: i32 = 5;
+/// Opens refused with `ERROR_ACCESS_DENIED` that are retried at once. In CI
+/// measurements one retry found the new record; more cover replacements in
+/// a row.
+const DENIED_RETRIES: u32 = 8;
+/// How long a missing record is waited for while it is being published.
+const PUBLISHING: Duration = Duration::from_secs(2);
+/// A temporary file created longer ago than this is left over from a crash,
+/// not a publication in progress.
+const FRESH: Duration = Duration::from_secs(10);
+/// How far in the future a temporary's creation time may be and still count
+/// as recent.
+const AHEAD: Duration = Duration::from_secs(1);
+
+/// Open the record at `path`, retrying what a concurrent replacement causes.
+///
+/// `ERROR_ACCESS_DENIED` is retried a few times at once: a lasting denial
+/// still returns. `NotFound` is waited out, up to [`PUBLISHING`], only while a
+/// recent temporary file of this record shows a publication in progress;
+/// without one the record is opened once more and that answer stands.
+pub(super) fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
+    retry_open(
+        || open.open(path),
+        || publishing(path),
+        Instant::now() + PUBLISHING,
+    )
+}
+
+/// [`open_record`] with the open and the check for a publication in
+/// progress passed in, so tests can drive each step.
+fn retry_open<T>(
+    mut open: impl FnMut() -> io::Result<T>,
+    mut publishing: impl FnMut() -> bool,
+    deadline: Instant,
+) -> io::Result<T> {
+    let mut denied = 0;
+    let mut rechecked = false;
+    let mut opened = None;
+    let mut missing = None;
+    crate::backoff::poll(
+        || {
+            loop {
+                match open() {
+                    Ok(file) => {
+                        opened = Some(file);
+                        return Ok(true);
+                    }
+                    Err(error)
+                        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+                            && denied < DENIED_RETRIES =>
+                    {
+                        denied += 1;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        if publishing() {
+                            // The open after this publication ends must
+                            // stand on its own, not on a check made before it.
+                            rechecked = false;
+                            missing = Some(error);
+                            return Ok(false);
+                        }
+                        if rechecked {
+                            return Err(error);
+                        }
+                        rechecked = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        },
+        Some(deadline),
+    )?;
+    opened.ok_or_else(|| missing.unwrap_or_else(|| io::ErrorKind::NotFound.into()))
+}
+
+/// Whether a temporary file of `path`, named as `publish_record_with` names
+/// it (`.<record>.<pid>.<n>.tmp`), was created within [`FRESH`].
+fn publishing(path: &Path) -> bool {
+    let (Some(parent), Some(record)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    let now = SystemTime::now();
+    entries.flatten().any(|entry| {
+        is_temporary(&entry.file_name(), record)
+            // A directory entry carries its times: no open, so the
+            // publisher's rename is not disturbed.
+            && entry
+                .metadata()
+                .and_then(|metadata| metadata.created())
+                .is_ok_and(|created| fresh(created, now))
+    })
+}
+
+/// Whether a temporary created at `created` can belong to a publication in
+/// progress at `now`. A creation time up to [`AHEAD`] in the future is clock
+/// granularity; further ahead, the clock has moved back since the temporary
+/// was made, and it is treated as left over.
+fn fresh(created: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(created) {
+        Ok(age) => age < FRESH,
+        Err(ahead) => ahead.duration() <= AHEAD,
+    }
+}
+
+/// Whether `name` is a temporary of `record`. The record's part compares as
+/// NTFS compares names: ordinal, ignoring case.
+fn is_temporary(name: &OsStr, record: &OsStr) -> bool {
+    let name: Vec<u16> = name.encode_wide().collect();
+    let record: Vec<u16> = record.encode_wide().collect();
+    let Some(rest) = name.strip_prefix(&[u16::from(b'.')]) else {
+        return false;
+    };
+    let (Some(named), Some(rest)) = (rest.get(..record.len()), rest.get(record.len()..)) else {
+        return false;
+    };
+    // The rest is ASCII as `publish_record_with` writes it.
+    let Ok(rest) = String::from_utf16(rest) else {
+        return false;
+    };
+    let Some(numbers) = rest
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = numbers.split('.');
+    let number = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    number(parts.next())
+        && number(parts.next())
+        && parts.next().is_none()
+        && same_name(named, &record)
+}
+
+/// `CompareStringOrdinal` ignoring case, the closest documented match to the
+/// upcase table NTFS compares names with.
+fn same_name(a: &[u16], b: &[u16]) -> bool {
+    let (Ok(a_length), Ok(b_length)) = (i32::try_from(a.len()), i32::try_from(b.len())) else {
+        return false;
+    };
+    // SAFETY: each pointer and length describe a live slice of UTF-16 units,
+    // which the call only reads.
+    let compared = unsafe { CompareStringOrdinal(a.as_ptr(), a_length, b.as_ptr(), b_length, 1) };
+    compared == CSTR_EQUAL
+}
+
+/// `CompareStringOrdinal`'s result for equal strings.
+const CSTR_EQUAL: i32 = 2;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const DELETE: u32 = 0x0001_0000;
@@ -37,6 +201,13 @@ struct FileRenameInfo {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn CompareStringOrdinal(
+        first: *const u16,
+        first_length: i32,
+        second: *const u16,
+        second_length: i32,
+        ignore_case: i32,
+    ) -> i32;
     fn SetFileInformationByHandle(
         file: *mut c_void,
         class: i32,
@@ -130,8 +301,99 @@ fn verbatim(path: &Path) -> OsString {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// Drive `retry_open` through scripted opens and publication checks, and
+    /// return its result with what it did not use.
+    fn scripted(
+        opens: Vec<io::Result<u32>>,
+        publishing: Vec<bool>,
+    ) -> (io::Result<u32>, usize, usize) {
+        let mut opens = VecDeque::from(opens);
+        let mut publishing = VecDeque::from(publishing);
+        let result = super::retry_open(
+            || opens.pop_front().expect("one open too many"),
+            || publishing.pop_front().expect("one check too many"),
+            Instant::now() + Duration::from_secs(10),
+        );
+        (result, opens.len(), publishing.len())
+    }
+
+    fn missing() -> io::Result<u32> {
+        Err(io::ErrorKind::NotFound.into())
+    }
+
+    #[test]
+    fn a_missing_record_is_waited_for_while_it_is_published() {
+        let (opened, opens, checks) = scripted(vec![missing(), missing(), Ok(7)], vec![true, true]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    #[test]
+    fn without_a_publication_a_missing_record_is_opened_once_more() {
+        let (opened, opens, checks) = scripted(vec![missing(), Ok(7)], vec![false]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+
+        let (opened, opens, checks) = scripted(vec![missing(), missing()], vec![false, false]);
+        assert_eq!(opened.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    /// A publication ends between an open and the check, a second one
+    /// starts and is waited for, and it too ends between an open and the
+    /// check. The record is there by then, so it must be opened again.
+    #[test]
+    fn a_record_published_after_a_wait_is_opened_once_more() {
+        let (opened, opens, checks) = scripted(
+            vec![missing(), missing(), missing(), Ok(7)],
+            vec![false, true, false],
+        );
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!((opens, checks), (0, 0));
+    }
+
+    #[test]
+    fn a_publication_is_waited_for_only_until_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(20);
+        let opened: io::Result<u32> = super::retry_open(missing, || true, deadline);
+        assert_eq!(opened.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn a_refused_open_is_retried_a_few_times() {
+        let denied = || Err(io::Error::from_raw_os_error(super::ERROR_ACCESS_DENIED));
+        let (opened, opens, _) = scripted(vec![denied(), denied(), Ok(7)], vec![]);
+        assert_eq!(opened.unwrap(), 7);
+        assert_eq!(opens, 0);
+
+        let mut opens: Vec<_> = (0..=super::DENIED_RETRIES).map(|_| denied()).collect();
+        opens.push(Ok(7));
+        let (opened, opens, _) = scripted(opens, vec![]);
+        assert_eq!(
+            opened.unwrap_err().raw_os_error(),
+            Some(super::ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn only_a_recent_temporary_marks_a_publication() {
+        let now = SystemTime::now();
+        assert!(super::fresh(now, now));
+        assert!(super::fresh(now - Duration::from_secs(9), now));
+        assert!(!super::fresh(now - Duration::from_secs(11), now));
+        // A little ahead is clock granularity; far ahead is a clock that
+        // moved back since a crash left the temporary.
+        assert!(super::fresh(now + Duration::from_millis(500), now));
+        assert!(!super::fresh(now + Duration::from_secs(3600), now));
+    }
 
     #[test]
     fn a_record_another_handle_holds_open_is_replaced_in_one_step() {
@@ -156,6 +418,77 @@ mod tests {
         reader.read_to_end(&mut old).unwrap();
         assert_eq!(old, b"old");
     }
+
+    #[test]
+    fn only_this_records_temporaries_mark_a_publication() {
+        use std::ffi::OsStr;
+        let record = OsStr::new("discovery.json");
+        let temporary = |name: &str| super::is_temporary(OsStr::new(name), record);
+        assert!(temporary(".discovery.json.4321.0.tmp"));
+        assert!(temporary(".discovery.json.1.25.tmp"));
+        // NTFS names ignore case, beyond ASCII too.
+        assert!(temporary(".Discovery.JSON.1.0.tmp"));
+        assert!(super::is_temporary(
+            OsStr::new(".ÉTAT.1.0.tmp"),
+            OsStr::new("état")
+        ));
+        assert!(!super::is_temporary(
+            OsStr::new(".etat.1.0.tmp"),
+            OsStr::new("état")
+        ));
+        for other in [
+            "discovery.json",
+            "discovery.json.1.0.tmp",
+            ".discovery.json.tmp",
+            ".discovery.json.1.tmp",
+            ".discovery.json.1.2.3.tmp",
+            ".discovery.json.1..tmp",
+            ".discovery.json.x.0.tmp",
+            ".discovery.json.1.0.tmp.old",
+            ".discovery.jsonx.1.0.tmp",
+            ".other.1.0.tmp",
+        ] {
+            assert!(!temporary(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_lasting_denial_is_returned() {
+        use std::os::windows::io::AsRawHandle;
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("record");
+        std::fs::write(&record, b"old").unwrap();
+        // A legacy delete leaves the file pending deletion until this handle
+        // closes, and every open of it until then is ERROR_ACCESS_DENIED.
+        let holder = std::fs::OpenOptions::new()
+            .access_mode(super::DELETE)
+            .open(&record)
+            .unwrap();
+        let delete: u8 = 1;
+        // SAFETY: the handle is open with DELETE access, and `delete` is a
+        // FILE_DISPOSITION_INFO, a single BOOLEAN, that the call only reads.
+        let marked = unsafe {
+            super::SetFileInformationByHandle(
+                holder.as_raw_handle(),
+                FILE_DISPOSITION_INFO,
+                (&raw const delete).cast(),
+                1,
+            )
+        };
+        assert_ne!(marked, 0, "{}", std::io::Error::last_os_error());
+        let mut read = std::fs::OpenOptions::new();
+        read.read(true);
+        let start = std::time::Instant::now();
+        let refused = super::open_record(&read, &record).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(super::ERROR_ACCESS_DENIED));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        drop(holder);
+        let missing = super::open_record(&read, &record).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileDispositionInfo`.
+    const FILE_DISPOSITION_INFO: i32 = 4;
 
     #[test]
     fn a_file_system_without_posix_renames_gets_std_rename() {
