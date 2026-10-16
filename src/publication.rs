@@ -23,6 +23,61 @@ impl Drop for Temporary {
     }
 }
 
+/// How a record is written and read. The default is what [`publish_record`]
+/// and [`RecordSlot`] have always done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordOptions {
+    durable: bool,
+    #[cfg(unix)]
+    mode: u32,
+    read_limit: u64,
+}
+
+impl Default for RecordOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordOptions {
+    /// Not durable, mode 0600, and a 64 KiB read limit.
+    pub const fn new() -> Self {
+        Self {
+            durable: false,
+            #[cfg(unix)]
+            mode: 0o600,
+            read_limit: 64 * 1024,
+        }
+    }
+
+    /// Make the rename itself survive a crash, not only the contents.
+    ///
+    /// On Unix the parent directory is synced after the rename. Windows has no
+    /// directory sync, so the record is flushed again after the rename. An
+    /// error from that step means the record is in place but may not survive
+    /// a crash.
+    pub const fn durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Permission bits of a published record, set before any contents are
+    /// written. Choosing anything wider than 0600 is the caller's decision.
+    #[cfg(unix)]
+    pub const fn mode(mut self, mode: u32) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Largest record [`RecordSlot::read`], [`RecordSlot::replace_if`] and
+    /// [`RecordSlot::remove_if`] read, in bytes. A longer one is refused.
+    /// `repair` and `remove_if_matches` keep their original comparison.
+    pub const fn read_limit(mut self, bytes: u64) -> Self {
+        self.read_limit = bytes;
+        self
+    }
+}
+
 /// Replace a discovery record atomically, after syncing its complete contents.
 ///
 /// The parent directory must already exist and belong to the application.
@@ -31,6 +86,7 @@ impl Drop for Temporary {
 /// contents are written. The caller remains responsible for directory security,
 /// record format, ownership and eventual discovery repair after a crash. The
 /// directory is not synced; this does not promise survival across power loss.
+/// With `durable`, [`publish_record_with`] syncs it.
 ///
 /// A reader opens either the old record or the new one. On Windows the
 /// temporary file is renamed through its own handle with POSIX semantics, so
@@ -41,6 +97,11 @@ impl Drop for Temporary {
 /// write and delete access can get a sharing violation then. `File::open`
 /// shares both.
 pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
+    publish_record_with(path, contents, RecordOptions::new())
+}
+
+/// [`publish_record`] with a chosen mode and durability.
+pub fn publish_record_with(path: &Path, contents: &[u8], options: RecordOptions) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -60,19 +121,19 @@ pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let temporary = parent.join(name);
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
+        let mut open = OpenOptions::new();
+        open.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            open.mode(0o600);
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.access_mode(windows::ACCESS);
+            open.access_mode(windows::ACCESS);
         }
-        match options.open(&temporary) {
+        match open.open(&temporary) {
             Ok(file) => break (Temporary(temporary), file),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -81,11 +142,15 @@ pub fn publish_record(path: &Path, contents: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(options.mode))?;
     }
     file.write_all(contents)?;
     file.sync_all()?;
-    replace(file, &temporary.0, path)
+    replace(file, &temporary.0, path)?;
+    if options.durable {
+        sync_renamed(path, parent)?;
+    }
+    Ok(())
 }
 
 /// Close the written temporary file and rename it over the record.
@@ -95,14 +160,101 @@ fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// After the rename, flush what records the new name.
+fn sync_renamed(to: &Path, parent: &Path) -> io::Result<()> {
+    let synced = if cfg!(windows) {
+        OpenOptions::new().write(true).open(to)?
+    } else {
+        File::open(parent)?
+    };
+    synced.sync_all()
+}
+
+/// Read a record that must be a regular file no longer than `limit` bytes.
+/// Missing is `None`.
+///
+/// The record is opened first and checked through that handle, so what is
+/// read is the version that was opened. A symlink is not followed (Unix
+/// `O_NOFOLLOW`, Windows `FILE_FLAG_OPEN_REPARSE_POINT`), and on Unix the open
+/// does not wait for a writer if the record is a FIFO.
+fn read_regular(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let not_regular = || io::Error::new(io::ErrorKind::InvalidData, "record is not a regular file");
+    let mut open = OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x0020_0000) and
+        // FILE_FLAG_BACKUP_SEMANTICS (0x0200_0000): open a link itself, and a
+        // directory at all, so both are refused below.
+        open.custom_flags(0x0220_0000);
+    }
+    let file = match open.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // O_NOFOLLOW reports a symlink as ELOOP.
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Err(not_regular()),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    let mut contents = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record is longer than its read limit",
+        ));
+    }
+    Ok(Some(contents))
+}
+
+/// Create `dir` if needed and check that it is private to this user.
+///
+/// The directory itself must not be a symlink, or a junction on Windows. On
+/// Unix it must belong to the effective user, and its mode becomes 0700.
+/// Either refusal is `PermissionDenied`. Ancestors are not checked. On
+/// Windows, the ACL the directory inherits decides who else may use it.
+#[cfg(feature = "local")]
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != crate::local::unix::own_uid() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// A discovery slot whose publishers and conditional cleanup share a lock.
 /// Use the same slot path in every generation. Lock files remain persistent.
 #[derive(Clone, Debug)]
-pub struct RecordSlot(PathBuf);
+pub struct RecordSlot(PathBuf, RecordOptions);
 impl RecordSlot {
     /// Address an existing application-owned directory. This performs no I/O.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
+        Self(path.into(), RecordOptions::new())
+    }
+
+    /// Publish and read with `options` instead of the defaults.
+    pub fn options(mut self, options: RecordOptions) -> Self {
+        self.1 = options;
+        self
     }
 
     fn lock(&self) -> io::Result<crate::ProcessLock> {
@@ -118,7 +270,7 @@ impl RecordSlot {
     /// Atomically publish while excluding conditional cleanup by older owners.
     pub fn replace(&self, contents: &[u8]) -> io::Result<()> {
         let _lock = self.lock()?;
-        publish_record(&self.0, contents)
+        publish_record_with(&self.0, contents, self.1)
     }
 
     /// Restore an owned record only if its contents differ. The caller must
@@ -128,7 +280,25 @@ impl RecordSlot {
         if self.matches(contents)? {
             return Ok(false);
         }
-        publish_record(&self.0, contents)?;
+        publish_record_with(&self.0, contents, self.1)?;
+        Ok(true)
+    }
+
+    /// Publish `contents` only if `replace` accepts the current record, or
+    /// `None` when there is none. The record is read and the predicate runs
+    /// under the slot lock, so no other slot user changes it in between.
+    /// True if published.
+    pub fn replace_if(
+        &self,
+        contents: &[u8],
+        replace: impl FnOnce(Option<&[u8]>) -> bool,
+    ) -> io::Result<bool> {
+        let _lock = self.lock()?;
+        let current = read_regular(&self.0, self.1.read_limit)?;
+        if !replace(current.as_deref()) {
+            return Ok(false);
+        }
+        publish_record_with(&self.0, contents, self.1)?;
         Ok(true)
     }
 
@@ -141,6 +311,28 @@ impl RecordSlot {
         }
         std::fs::remove_file(&self.0)?;
         Ok(true)
+    }
+
+    /// Remove the record only if `remove` accepts its contents, under the
+    /// slot lock. A missing record is false, without calling the predicate.
+    pub fn remove_if(&self, remove: impl FnOnce(&[u8]) -> bool) -> io::Result<bool> {
+        let _lock = self.lock()?;
+        let Some(current) = read_regular(&self.0, self.1.read_limit)? else {
+            return Ok(false);
+        };
+        if !remove(&current) {
+            return Ok(false);
+        }
+        std::fs::remove_file(&self.0)?;
+        Ok(true)
+    }
+
+    /// Read the record without the slot lock: publication is atomic, so this
+    /// sees one complete version. `None` when there is none. A record that
+    /// is not a regular file, a symlink included, or that is longer than the
+    /// read limit is `InvalidData`.
+    pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
+        read_regular(&self.0, self.1.read_limit)
     }
 
     fn matches(&self, contents: &[u8]) -> io::Result<bool> {

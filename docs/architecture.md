@@ -315,6 +315,12 @@ name is checked against the 256-character pipe path when it is built.
 Use `RecordSlot` when a publication can race an older owner's cleanup. Every
 publisher and conditional remover of that slot must use it. `publish_record` is
 the lower-level atomic-write primitive for callers already holding shared ownership.
+`RecordOptions` sets the record mode, a read limit and durability; the defaults
+are the original behaviour. A durable publication syncs the directory after the
+rename on Unix. Windows has no directory sync, so the record is flushed again
+after the rename. `replace_if` and `remove_if` read the record and decide under
+the slot lock, and `read` refuses anything but a regular file within the limit.
+`ensure_private_dir` prepares the directory these records and their locks live in.
 Legacy binaries do not participate in newly introduced serialization locks; retain
 their original election locks and bound the supported transition in consumer tests.
 

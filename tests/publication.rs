@@ -138,3 +138,228 @@ fn a_slot_waits_for_its_lock_holder_and_times_out_while_it_stays() {
     release.join().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"after");
 }
+
+#[test]
+fn a_slot_reads_only_a_bounded_regular_file() {
+    use kunobi_daemon::{RecordOptions, RecordSlot};
+    use std::io::ErrorKind::InvalidData;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let slot = RecordSlot::new(&path).options(RecordOptions::new().read_limit(4));
+    assert_eq!(slot.read().unwrap(), None);
+    slot.replace(b"four").unwrap();
+    assert_eq!(slot.read().unwrap().as_deref(), Some(&b"four"[..]));
+    slot.replace(b"fives").unwrap();
+    assert_eq!(slot.read().unwrap_err().kind(), InvalidData);
+
+    // The default limit is 64 KiB.
+    let default = RecordSlot::new(&path);
+    assert_eq!(RecordOptions::default(), RecordOptions::new());
+    default.replace(&vec![b'x'; 64 * 1024]).unwrap();
+    assert_eq!(default.read().unwrap().unwrap().len(), 64 * 1024);
+    default.replace(&vec![b'x'; 64 * 1024 + 1]).unwrap();
+    assert_eq!(default.read().unwrap_err().kind(), InvalidData);
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(slot.read().unwrap_err().kind(), InvalidData);
+    // A path that cannot exist is an error, not a missing record. Windows
+    // reports it as not found.
+    #[cfg(unix)]
+    {
+        let below_a_file = RecordSlot::new(root.path().join("selected.record.lock/inner"));
+        assert_ne!(below_a_file.read().unwrap_err().kind(), InvalidData);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slot_does_not_read_through_a_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    std::fs::write(&target, b"elsewhere").unwrap();
+    let path = root.path().join("selected");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    assert_eq!(
+        slot.read().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(slot.remove_if(|_| true).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"elsewhere");
+}
+
+#[test]
+fn conditional_changes_decide_under_the_slot_lock() {
+    use kunobi_daemon::ProcessLock;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let lock = root.path().join("selected.record.lock");
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+
+    assert!(!slot.remove_if(|_| panic!("no record to judge")).unwrap());
+    assert!(
+        slot.replace_if(b"first", |current| {
+            assert!(ProcessLock::is_held(&lock).unwrap());
+            current.is_none()
+        })
+        .unwrap()
+    );
+    assert!(
+        !slot
+            .replace_if(b"second", |current| current.is_none())
+            .unwrap()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    assert!(
+        slot.replace_if(b"second", |current| current == Some(&b"first"[..]))
+            .unwrap()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+    assert!(!slot.remove_if(|current| current == b"first").unwrap());
+    assert!(path.exists());
+    assert!(
+        slot.remove_if(|current| {
+            assert!(ProcessLock::is_held(&lock).unwrap());
+            current == b"second"
+        })
+        .unwrap()
+    );
+    assert!(!path.exists());
+    assert!(!ProcessLock::is_held(&lock).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_options_set_the_mode_and_sync_the_directory() {
+    use kunobi_daemon::{RecordOptions, publish_record_with};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("discovery");
+    publish_record_with(&path, b"shared", RecordOptions::new().mode(0o640)).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640);
+
+    // A directory this user can write but not read: the rename succeeds, and
+    // only the directory sync, which opens it, fails.
+    let blind = root.path().join("blind");
+    std::fs::create_dir(&blind).unwrap();
+    std::fs::set_permissions(&blind, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(&blind).is_ok() {
+        return; // A privileged user reads it anyway; nothing to observe.
+    }
+    let record = blind.join("discovery");
+    publish_record(&record, b"plain").unwrap();
+    let durable = RecordOptions::new().durable(true);
+    let error = publish_record_with(&record, b"durable", durable).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    std::fs::set_permissions(&blind, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(std::fs::read(&record).unwrap(), b"durable");
+}
+
+#[test]
+fn a_durable_slot_replaces_its_record() {
+    use kunobi_daemon::{RecordOptions, RecordSlot};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let slot = RecordSlot::new(&path).options(RecordOptions::new().durable(true));
+    slot.replace(b"old").unwrap();
+    slot.replace(b"new").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+}
+
+#[cfg(feature = "local")]
+#[test]
+fn a_private_directory_is_created_and_must_be_a_real_directory() {
+    use kunobi_daemon::ensure_private_dir;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a/b");
+    ensure_private_dir(&dir).unwrap();
+    assert!(dir.is_dir());
+    let file = root.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    assert!(ensure_private_dir(&file).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = ensure_private_dir(&link).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(mode(&dir), 0o755, "a refused symlink changed its target");
+    }
+}
+
+#[test]
+fn repair_restores_a_record_that_differs() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    assert!(slot.repair(b"mine").unwrap());
+    std::fs::write(&path, b"stale").unwrap();
+    assert!(slot.repair(b"mine").unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"mine");
+}
+
+#[test]
+fn a_slot_reads_one_complete_version_while_records_are_replaced() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("discovery");
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    let a = vec![b'a'; 16_384];
+    let b = vec![b'b'; 32_768];
+    publish_record(&path, &a).unwrap();
+    let publishing = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Stops the reader even if publishing panics.
+            struct Finished<'a>(&'a AtomicBool);
+            impl Drop for Finished<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _finished = Finished(&publishing);
+            for bytes in [&a, &b].iter().cycle().take(400) {
+                publish_record(&path, bytes).unwrap();
+            }
+        });
+        // Probabilistic coverage: reads race the renames above for as long
+        // as they run. Each must return one version whole.
+        while publishing.load(Ordering::Acquire) {
+            let contents = slot.read().unwrap().expect("the record always exists");
+            assert!(contents == a || contents == b, "read a partial record");
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slot_refuses_a_fifo_without_waiting_for_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let slot = kunobi_daemon::RecordSlot::new(&path);
+    assert_eq!(
+        slot.read().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(slot.remove_if(|_| true).is_err());
+    assert!(path.exists());
+}
