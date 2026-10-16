@@ -173,14 +173,11 @@ impl super::peer::PeerCredentials for WindowsDuplex {
     }
 }
 
-/// Windows can report a busy named pipe outside the portable I/O categories.
-pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
+/// Every instance of the pipe is serving another client. The standard library
+/// maps this outside the portable I/O categories.
+pub(crate) fn busy_pipe(error: &io::Error) -> bool {
     const ERROR_PIPE_BUSY: i32 = 231;
-    if error.raw_os_error() == Some(ERROR_PIPE_BUSY) {
-        ConnectError::ConnectTimeout
-    } else {
-        super::connect_error(error)
-    }
+    error.raw_os_error() == Some(ERROR_PIPE_BUSY)
 }
 
 impl Duplex for WindowsDuplex {
@@ -204,7 +201,7 @@ impl Duplex for WindowsDuplex {
                 stream,
                 read_deadline: Cell::new(None),
             })
-            .map_err(|error| connect_error(&error))
+            .map_err(|error| super::connect_error(&error))
     }
 
     /// Arm an absolute deadline for reads performed during session setup.
@@ -571,9 +568,48 @@ pub fn install_session_end_handler() -> io::Result<()> {
     }
 }
 
-/// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran.
+/// True after CLOSE, LOGOFF or SHUTDOWN once [`install_session_end_handler`] ran,
+/// or once a `shutdown_signal` future completed on one of them.
 pub fn session_end_requested() -> bool {
     SESSION_END.load(Ordering::Acquire)
+}
+
+/// Wait for this process to be asked to stop: Ctrl+C, or the console closing,
+/// the user logging off or the system shutting down.
+///
+/// This listens to Tokio's console streams for those four events and creates
+/// them before it returns, so a request that arrives afterwards is not lost
+/// even if the future has not been polled yet. When it completes on a close,
+/// logoff or shutdown it also sets [`session_end_requested`].
+///
+/// Windows ends the process as soon as a console handler returns for close,
+/// logoff or shutdown. Tokio's handler does not return for an event that had
+/// a live listener, so the process keeps running until it exits on its own or
+/// until Windows' timeout for the event ends it. With no listener left, Tokio
+/// passes the event on and Windows ends the process as usual.
+///
+/// This does not use [`install_session_end_handler`]: Tokio's handler is the
+/// only one involved. Tokio registers it once per process and never again, so
+/// if a console change (`FreeConsole`, then `AllocConsole` or `AttachConsole`)
+/// drops it, these events no longer reach the future.
+///
+/// Call it inside a Tokio runtime.
+#[cfg(feature = "async")]
+pub fn shutdown_signal() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let mut interrupt = ctrl_c()?;
+    let mut close = ctrl_close()?;
+    let mut logoff = ctrl_logoff()?;
+    let mut shutdown = ctrl_shutdown()?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => return,
+            _ = close.recv() => {}
+            _ = logoff.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+        SESSION_END.store(true, Ordering::Release);
+    })
 }
 
 const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
