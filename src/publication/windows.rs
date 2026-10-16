@@ -221,14 +221,15 @@ unsafe extern "system" {
 /// POSIX semantics replace the name in one step, so a reader opens the old
 /// record or the new one and never one pending deletion. A file system that
 /// does not support them gets `std::fs::rename`, and with it the window.
-pub(super) fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
-    replace_with(file, from, to, rename_posix)
+pub(super) fn replace(file: File, from: &Path, to: &Path, durable: bool) -> io::Result<()> {
+    replace_with(file, from, to, durable, rename_posix)
 }
 
 fn replace_with(
     file: File,
     from: &Path,
     to: &Path,
+    durable: bool,
     rename: impl FnOnce(&File, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     match rename(&file, to) {
@@ -239,10 +240,14 @@ fn replace_with(
             ) =>
         {
             drop(file);
-            std::fs::rename(from, to)
+            std::fs::rename(from, to)?;
         }
-        result => result,
+        result => result?,
     }
+    if durable {
+        OpenOptions::new().write(true).open(to)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn rename_posix(file: &File, to: &Path) -> io::Result<()> {
@@ -503,15 +508,51 @@ mod tests {
                 super::ERROR_NOT_SUPPORTED,
             ))
         };
-        super::replace_with(file, &temporary, &record, unsupported).unwrap();
+        super::replace_with(file, &temporary, &record, false, unsupported).unwrap();
         assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        assert!(!temporary.exists());
+
+        // A durable fallback flushes the record it renamed by path.
+        std::fs::write(&temporary, b"durable").unwrap();
+        let file = std::fs::File::open(&temporary).unwrap();
+        super::replace_with(file, &temporary, &record, true, unsupported).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), b"durable");
         assert!(!temporary.exists());
 
         let denied =
             |_: &std::fs::File, _: &std::path::Path| Err(std::io::Error::from_raw_os_error(5));
         std::fs::write(&temporary, b"newer").unwrap();
         let file = std::fs::File::open(&temporary).unwrap();
-        assert!(super::replace_with(file, &temporary, &record, denied).is_err());
-        assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        assert!(super::replace_with(file, &temporary, &record, true, denied).is_err());
+        assert_eq!(std::fs::read(&record).unwrap(), b"durable");
+    }
+
+    /// While another publisher's rename of the same record is in progress,
+    /// the record's name can be missing. A durable replacement must not need
+    /// the name after its own rename succeeded. The rename here moves the
+    /// record away as soon as it is in place, so the name is missing when
+    /// the record is flushed.
+    #[test]
+    fn a_durable_replacement_does_not_reopen_the_record_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("record");
+        std::fs::write(&record, b"old").unwrap();
+        let temporary = root.path().join("temporary");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(super::ACCESS)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(b"new").unwrap();
+        let aside = root.path().join("aside");
+        let renamed_away = |file: &std::fs::File, to: &std::path::Path| {
+            super::rename_posix(file, to)?;
+            std::fs::rename(to, &aside)
+        };
+        super::replace_with(file, &temporary, &record, true, renamed_away).unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), b"new");
+        assert!(!record.exists());
+        assert!(!temporary.exists());
     }
 }

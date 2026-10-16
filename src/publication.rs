@@ -147,18 +147,21 @@ pub fn publish_record_with(path: &Path, contents: &[u8], options: RecordOptions)
     }
     file.write_all(contents)?;
     file.sync_all()?;
-    replace(file, &temporary.0, path)?;
-    if options.durable {
-        sync_renamed(path, parent)?;
-    }
-    Ok(())
+    replace(file, &temporary.0, path, options.durable)
 }
 
-/// Close the written temporary file and rename it over the record.
+/// Close the written temporary file and rename it over the record. With
+/// `durable`, sync the directory, so the rename survives a crash.
 #[cfg(not(windows))]
-fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
+fn replace(file: File, from: &Path, to: &Path, durable: bool) -> io::Result<()> {
     drop(file);
-    std::fs::rename(from, to)
+    std::fs::rename(from, to)?;
+    if durable {
+        // The temporary is named inside the record's directory.
+        let directory = from.parent().expect("a temporary has a directory");
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Open a record. A Unix rename replaces the name in one step, so an open
@@ -166,16 +169,6 @@ fn replace(file: File, from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 fn open_record(open: &OpenOptions, path: &Path) -> io::Result<File> {
     open.open(path)
-}
-
-/// After the rename, flush what records the new name.
-fn sync_renamed(to: &Path, parent: &Path) -> io::Result<()> {
-    let synced = if cfg!(windows) {
-        OpenOptions::new().write(true).open(to)?
-    } else {
-        File::open(parent)?
-    };
-    synced.sync_all()
 }
 
 /// Read a record that must be a regular file no longer than `limit` bytes.
