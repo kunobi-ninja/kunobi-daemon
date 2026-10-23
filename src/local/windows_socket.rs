@@ -287,6 +287,93 @@ mod tests {
         )
     }
 
+    /// Keep the only instance occupied until the probe returns. On failure,
+    /// drop both handles before reporting it so a broken connector can wake.
+    fn with_busy_pipe<T: Send + 'static>(
+        tag: &str,
+        probe: impl FnOnce(String) -> T + Send + 'static,
+    ) -> (T, Duration) {
+        use interprocess::local_socket::Stream;
+        use interprocess::local_socket::traits::Stream as _;
+
+        let name = unique_name(tag);
+        let listener = options(&name).unwrap().create_sync().unwrap();
+        let first = Stream::connect(name.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .expect("the first client takes the available instance");
+        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = probe(name);
+            let _ = done.send((result, started.elapsed()));
+        });
+        let observed = finished.recv_timeout(Duration::from_secs(3));
+        drop(first);
+        drop(listener);
+        if observed.is_ok() {
+            worker.join().unwrap();
+        }
+        observed.expect("a one-attempt connect or ownership probe waited on a busy pipe")
+    }
+
+    #[test]
+    fn a_one_attempt_connection_does_not_wait_for_a_busy_pipe() {
+        let (result, elapsed) = with_busy_pipe("busy-connect", |name| {
+            super::super::windows::WindowsDuplex::connect_once_until(
+                &name,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+            .map(|_| ())
+        });
+        assert_eq!(result, Err(super::super::ConnectError::ConnectTimeout));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_busy_owner_probe_fails_without_claiming_an_unverified_peer() {
+        let (result, elapsed) = with_busy_pipe("busy-owner", |name| {
+            acquire(Path::new(&name))
+                .map(|_| ())
+                .map_err(|BindError::Io(error)| error.raw_os_error())
+        });
+        assert_eq!(result, Err(Some(ERROR_ACCESS_DENIED)));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[cfg(feature = "local-async")]
+    #[test]
+    fn a_busy_tokio_owner_probe_releases_its_blocking_task_before_runtime_drop() {
+        let (result, elapsed) = with_busy_pipe("busy-tokio-owner", |name| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime
+                .block_on(acquire_tokio(Path::new(&name)))
+                .map(|_| ())
+                .map_err(|BindError::Io(error)| error.raw_os_error());
+            drop(runtime);
+            result
+        });
+        assert_eq!(result, Err(Some(ERROR_ACCESS_DENIED)));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn invalid_names_and_expired_deadlines_still_fail_before_connecting() {
+        use super::super::ConnectError;
+        use super::super::windows::WindowsDuplex;
+        let deadline = std::time::Instant::now();
+        assert!(matches!(
+            WindowsDuplex::connect_once_until("invalid\0endpoint", deadline),
+            Err(ConnectError::Failed(io::ErrorKind::InvalidInput))
+        ));
+        let name = unique_name("expired");
+        assert!(matches!(
+            WindowsDuplex::connect_once_until(&name, deadline),
+            Err(ConnectError::ConnectTimeout)
+        ));
+    }
+
     #[test]
     fn a_live_pipe_owner_excludes_another_listener_and_drop_releases_it() {
         let name = unique_name("owner");
