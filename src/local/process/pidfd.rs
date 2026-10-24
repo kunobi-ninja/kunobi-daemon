@@ -52,7 +52,10 @@ impl Event {
         if wait_readable(self.pidfd.as_raw_fd(), Some(Instant::now()))? {
             return Ok(());
         }
-        let registered = AsyncFd::with_interest(self.pidfd.as_fd(), Interest::READABLE)?;
+        // SAFETY: self owns this pidfd. Its mutable borrow keeps the descriptor
+        // open and unchanged until the registration is dropped.
+        let registered =
+            unsafe { AsyncFd::register_with_interest(self.pidfd.as_fd(), Interest::READABLE)? };
         loop {
             let mut ready = registered.readable().await?;
             if wait_readable(self.pidfd.as_raw_fd(), Some(Instant::now()))? {
