@@ -16,8 +16,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::Stream;
 use interprocess::local_socket::traits::Stream as _;
-use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream, ToNsName};
+use interprocess::os::windows::named_pipe::{DuplexPipeStream, local_socket, pipe_mode};
 
 use super::{ConnectError, Endpoint};
 use crate::local::Duplex;
@@ -300,22 +301,29 @@ impl Duplex for WindowsDuplex {
 
     fn connect_once_until(endpoint: &Endpoint, deadline: Instant) -> Result<Self, ConnectError> {
         // A malformed name can never connect, so it is not worth retrying.
-        let name = endpoint
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|error| ConnectError::Failed(error.kind()))?;
+        // Keep GenericNamespaced's local pipe prefix and UTF-16/NUL rules.
+        let path = widestring::U16CString::from_vec(
+            r"\\.\pipe\"
+                .encode_utf16()
+                .chain(endpoint.encode_utf16())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| ConnectError::Failed(io::ErrorKind::InvalidInput))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(ConnectError::ConnectTimeout);
         }
-        ConnectOptions::new()
-            .name(name)
-            .wait_mode(interprocess::ConnectWaitMode::Timeout(Duration::ZERO))
-            .connect_sync()
-            .map(|stream| Self {
-                stream,
-                read_deadline: Cell::new(None),
-            })
-            .map_err(|error| super::connect_error(&error))
+        // interprocess 2.4.x's local-socket constructor ignores wait_mode.
+        // The named-pipe constructor honors zero as one nonwaiting attempt.
+        DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+            path,
+            interprocess::ConnectWaitMode::Timeout(Duration::ZERO),
+        )
+        .map(|pipe| Self {
+            stream: local_socket::Stream::from(pipe).into(),
+            read_deadline: Cell::new(None),
+        })
+        .map_err(|error| super::connect_error(&error))
     }
 
     /// Arm an absolute deadline for reads performed during session setup.
@@ -1531,7 +1539,9 @@ mod server_end_evidence_tests {
         peer::{Credentials, UserEvidence},
     };
     use interprocess::local_socket::traits::Listener as _;
-    use interprocess::local_socket::{ListenerOptions, Stream as Client};
+    use interprocess::local_socket::{
+        GenericNamespaced, ListenerOptions, Stream as Client, ToNsName,
+    };
     use std::sync::mpsc;
 
     const BUDGET: Duration = Duration::from_secs(20);

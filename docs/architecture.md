@@ -316,6 +316,15 @@ Windows pipe name from the user SID in this process's token, never from the
 environment, and the service's UUID, profile, instance and endpoint name. The
 name is checked against the 256-character pipe path when it is built.
 
+Windows `Duplex::connect_once_until` makes one immediate named-pipe attempt;
+`connect_until` owns any retries within the caller's deadline. An occupied
+pipe does not leave a blocking task waiting for a free instance. The listener
+ownership probe uses the same one-attempt connector. After `ACCESS_DENIED`,
+an occupied pipe cannot authenticate its owner, so acquisition retains the
+closing-pipe backoff and then reports the denial instead of claiming a
+same-user peer. A connection that succeeds still undergoes the existing peer
+credential check.
+
 Use `RecordSlot` when a publication can race an older owner's cleanup. Every
 publisher and conditional remover of that slot must use it. `publish_record` is
 the lower-level atomic-write primitive for callers already holding shared ownership.
