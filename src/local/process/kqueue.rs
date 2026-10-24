@@ -79,7 +79,10 @@ impl Event {
         }
         // A kqueue is itself readable while it holds an event, so the
         // runtime's own kqueue can watch this one.
-        let registered = AsyncFd::with_interest(self.kqueue.as_fd(), Interest::READABLE)?;
+        // SAFETY: self owns this kqueue. Its mutable borrow keeps the descriptor
+        // open and unchanged until the registration is dropped.
+        let registered =
+            unsafe { AsyncFd::register_with_interest(self.kqueue.as_fd(), Interest::READABLE)? };
         loop {
             let mut ready = registered.readable().await?;
             if next_exit(self.kqueue.as_raw_fd(), Some(Instant::now()))? {

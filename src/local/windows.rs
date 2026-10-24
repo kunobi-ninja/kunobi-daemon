@@ -17,7 +17,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use interprocess::local_socket::Stream;
-use interprocess::local_socket::traits::Stream as _;
 use interprocess::os::windows::named_pipe::{DuplexPipeStream, local_socket, pipe_mode};
 
 use super::{ConnectError, Endpoint};
@@ -203,13 +202,13 @@ pub fn terminate_legacy_peer(pid: crate::ProcessId) -> io::Result<()> {
 
 /// Overlapped named-pipe receive half with a setup deadline.
 pub struct WindowsReader {
-    inner: interprocess::local_socket::RecvHalf,
+    inner: Arc<Stream>,
     read_deadline: Option<Instant>,
     setup: Arc<AtomicBool>,
 }
 /// Overlapped named-pipe send half with a shared setup deadline.
 pub struct WindowsWriter {
-    inner: interprocess::local_socket::SendHalf,
+    inner: Arc<Stream>,
     deadline: Option<Instant>,
     setup: Arc<AtomicBool>,
 }
@@ -223,10 +222,8 @@ impl WindowsReader {
     }
 
     fn raw_handle(&self) -> *mut c_void {
-        match &self.inner {
-            interprocess::local_socket::RecvHalf::NamedPipe(pipe) => {
-                pipe.as_handle().as_raw_handle()
-            }
+        match self.inner.as_ref() {
+            Stream::NamedPipe(pipe) => pipe.as_handle().as_raw_handle(),
         }
     }
 }
@@ -234,7 +231,7 @@ impl WindowsReader {
 impl Read for WindowsReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let Some(deadline) = self.read_deadline else {
-            return self.inner.read(buf);
+            return self.inner.as_ref().read(buf);
         };
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Err(io::Error::new(
@@ -253,18 +250,16 @@ impl Write for WindowsWriter {
                 .deadline
                 .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
                 .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-            let handle = match &self.inner {
-                interprocess::local_socket::SendHalf::NamedPipe(pipe) => {
-                    pipe.as_handle().as_raw_handle()
-                }
+            let handle = match self.inner.as_ref() {
+                Stream::NamedPipe(pipe) => pipe.as_handle().as_raw_handle(),
             };
             write_overlapped(handle, buf, remaining)
         } else {
-            self.inner.write(buf)
+            self.inner.as_ref().write(buf)
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        self.inner.as_ref().flush()
     }
 }
 
@@ -345,16 +340,17 @@ impl Duplex for WindowsDuplex {
 
     fn split(self) -> io::Result<(Self::Reader, Self::Writer)> {
         let deadline = self.read_deadline.get();
-        let (read, write) = self.stream.split();
+        // &Stream supports both directions without the deprecated split adapters.
+        let stream = Arc::new(self.stream);
         let setup = Arc::new(AtomicBool::new(deadline.is_some()));
         Ok((
             WindowsReader {
-                inner: read,
+                inner: Arc::clone(&stream),
                 read_deadline: deadline,
                 setup: Arc::clone(&setup),
             },
             WindowsWriter {
-                inner: write,
+                inner: stream,
                 deadline,
                 setup,
             },
@@ -1538,7 +1534,7 @@ mod server_end_evidence_tests {
         local::peer::PeerCredentials,
         peer::{Credentials, UserEvidence},
     };
-    use interprocess::local_socket::traits::Listener as _;
+    use interprocess::local_socket::traits::{Listener as _, Stream as _};
     use interprocess::local_socket::{
         GenericNamespaced, ListenerOptions, Stream as Client, ToNsName,
     };
