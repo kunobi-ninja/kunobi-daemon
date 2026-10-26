@@ -29,6 +29,9 @@ exclude_globs = [
     "src/local/windows_socket.rs",
     "src/local/windows_spawn.rs",
     "src/local/peer/windows.rs",
+    # Native token queries and comparisons run in the Windows job. Attribute
+    # decoding and generation classification remain mutation-tested on Linux.
+    "src/local/security/windows.rs",
     "src/serve/windows.rs",
     "src/publication/windows.rs",
     "src/local/process/windows.rs",

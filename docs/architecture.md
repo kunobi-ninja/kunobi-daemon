@@ -238,6 +238,18 @@ running as the same OS user can publish its own PID in that record, so a match
 does not authenticate the record's writer or the peer's executable. The
 consumer decides what a grant allows.
 
+Windows applications that delegate work can separately compare primary-token
+contexts with `local::security::compare_with_current_process`. The caller supplies
+a retained process handle obtained from its authenticated peer. The result
+distinguishes matching contexts, a known process-identity difference, and
+incompatible contexts. Failed queries return an error.
+
+Different `TSA://ProcUnique` values can still affect access rules. The shared
+comparison reports the difference; the application decides whether to trust the
+other process's access context. This helper does not change `SameUser`, connection
+admission or dispatch. It compares supported token fields, not arbitrary process
+sandboxes or mitigations, and callers must recheck before delegating work.
+
 `serve::serve` is the accept loop built on that flow. It authenticates each
 connection before taking an admission permit, so a rejected peer never holds
 capacity; picks the pool from the grant; pauses briefly when the process runs

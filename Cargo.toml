@@ -22,7 +22,7 @@ async = ["dep:tokio", "tokio/macros"]
 wire = ["dep:buffa"]
 # With `async`, `local::ProcessHandle` waits for an exit through Tokio's reactor
 # and `local::shutdown_signal` waits for a stop request.
-local = ["dep:interprocess", "dep:socket2", "dep:widestring", "tokio?/net", "tokio?/signal"]
+local = ["dep:interprocess", "dep:socket2", "dep:widestring", "dep:windows-sys", "tokio?/net", "tokio?/signal"]
 local-async = ["local", "async", "interprocess/tokio"]
 wire-async = ["wire", "async", "tokio/io-util"]
 # Stdio clients that may start the daemon. Off by default so a process that
@@ -41,6 +41,7 @@ socket2 = { version = "0.6", optional = true }
 [target.'cfg(windows)'.dependencies]
 widestring = { version = "1.2", optional = true }
 interprocess = { version = "2.4.3", optional = true, default-features = false }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 
 [target.'cfg(loom)'.dependencies]
 # Model-checked builds only: RUSTFLAGS="--cfg loom" with --no-default-features,
