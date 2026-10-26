@@ -256,6 +256,7 @@ pub(crate) fn connect_error(error: &io::Error) -> ConnectError {
 
 pub mod peer;
 mod process;
+pub mod security;
 #[cfg(unix)]
 pub mod unix;
 #[cfg(unix)]

@@ -261,6 +261,13 @@ for both reads and writes. Call authentication before sending protocol bytes. Cl
 and slow readers are application policy; observations never impose a job timeout
 or cancel work.
 
+With `local`, `local::security` provides evidence for applications that delegate
+work. On Windows, `compare_with_current_process` compares primary tokens through
+a retained process handle. It reports matching contexts, a known process-identity
+difference, or an incompatible context. Applications own the trust decision and
+fallback. `SameUser` authentication keeps its existing meaning. See the
+[security boundary](docs/architecture.md#platform-boundary-and-control-service).
+
 `warm_executable` faults a client shim into the OS page cache without running
 it. Call it when the daemon starts and after a replacement commit (drivers can
 list paths on `replacement::Driver::warmup_paths`; missing files do not fail

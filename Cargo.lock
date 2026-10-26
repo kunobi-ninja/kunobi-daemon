@@ -198,6 +198,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "widestring",
+ "windows-sys",
 ]
 
 [[package]]

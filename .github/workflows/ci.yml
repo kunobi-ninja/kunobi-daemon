@@ -92,6 +92,9 @@ jobs:
       - run: cargo +1.89.0 test --locked --all-features
       - run: cargo +1.89.0 test --locked --no-default-features --features wire
       - run: cargo +1.89.0 test --locked --no-default-features
+      # Linux-only MSRV tests do not compile the Windows token-query boundary.
+      - run: rustup target add --toolchain 1.89.0 x86_64-pc-windows-msvc
+      - run: cargo +1.89.0 check --locked --all-features --all-targets --target x86_64-pc-windows-msvc
 
   # Native windows-latest cannot see mixed-case .lib names. cargo check does
   # not link; this job is the cargo-xwin path Kunobi's sidecar uses.
