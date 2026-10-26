@@ -31,29 +31,10 @@ pub enum SecurityContextComparison {
     Incompatible,
 }
 
-/// Compare a process's primary token with this process's primary token.
-///
-/// The borrowed process handle must permit `PROCESS_QUERY_LIMITED_INFORMATION`.
-/// Obtain and retain it from an authenticated, pinned peer; a PID from an
-/// application message alone does not establish peer identity. This function
-/// performs Windows queries and must run outside `peer::Policy::grant`.
-///
-/// Compares user, logon session, owner, primary group, groups, restricted SIDs,
-/// device groups, privileges, integrity, elevation, session, UI access, mandatory
-/// policy, virtualization, default DACL, trust level and token type. AppContainer,
-/// claim-bearing and capability-bearing tokens return `Incompatible`.
-///
-/// Different opaque-attribute generations return `ProcessIdentityDiffers` only
-/// for matching empty lists or the known UINT64 `TSA://ProcUnique` shape (flags
-/// `0x41`, two values). Unknown shapes return `Incompatible`. Query or decoding
-/// failures return an error; callers must not turn that into an access grant.
-/// Recheck before delegating work because tokens can change after this snapshot.
+/// Compare a Windows process's primary token with this process's primary token.
 #[cfg(windows)]
-pub fn compare_with_current_process(
-    process: std::os::windows::io::BorrowedHandle<'_>,
-) -> std::io::Result<SecurityContextComparison> {
-    windows::compare_with_current_process(process)
-}
+#[doc(inline)]
+pub use windows::compare_with_current_process;
 
 #[cfg(any(windows, test))]
 fn compare_token_generations(
